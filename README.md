@@ -1,3 +1,281 @@
+# Player
+
+Implementation status: **installed personal-use app (0.4; Audio Bridge loaded and live-tested)**. The native player,
+Spotify PKCE login and Keychain storage, playback controls, now-playing artwork,
+seek, explicit Spotify-device selection, private audio routing, local volume,
+MCP diagnostics/control, playlist-link playback, and opt-in per-track WAV
+debug recording are implemented. The initial isolation, muting and
+quit/crash recovery gate passed on this Mac with wired headphones. The broader
+hardware, latency and endurance acceptance checks remain open; see
+[VALIDATION.md](VALIDATION.md).
+
+## Generic Audio Bridge endpoint
+
+The default path is now a standard Core Audio virtual endpoint, **Audio Bridge**.
+Any audio application with an output selector can send to it; any Core Audio
+input client can read its loopback. The driver has no Spotify, recording,
+network, headphone, or UI dependency.
+
+```text
+Application → Audio Bridge output → Audio Bridge input → raw Float32 WAV
+                                                      ↘ optional monitor → hardware
+```
+
+The small HAL plug-in exposes stable UID `se.lbsa71.AudioBridge.endpoint.v1`.
+It supports 1, 2, 4, 6, 8, 16 or 32 channels at 44.1, 48, 88.2, 96, 176.4 or
+192 kHz. Its standard stream-format properties select the format; HAL persists
+that choice. The first forwarding/recording service supports **stereo**. Wider
+clients can use the endpoint independently; future service extensions need no
+new driver interface. It is a user-space HAL plug-in, not a kernel extension.
+
+`AudioBridge.app` is a separate per-user LaunchAgent. It captures the endpoint,
+records WAVs, and optionally forwards to a selected physical stereo output.
+Monitoring has its own volume, bounded queue and clock-drift correction; WAV
+samples are copied before those operations. Unplugging the listening device
+stops monitoring while capture and WAV recording continue. A changed or stopped
+monitoring engine also stops listening rather than silently switching outputs;
+choose Listen again to reconnect the desired hardware. The service can run
+without Player or Spotify, with generic file labels supplied through local RPC.
+Player supplies optional track labels and a ten-second renewable metadata lease.
+If Player quits or metadata stops arriving, that recording is finalized to avoid
+mislabeling; generic recordings without a lease continue independently.
+
+Install the driver once, then update the apps separately:
+
+```sh
+./scripts/test-driver.sh
+./scripts/package-driver.sh
+open build/AudioBridge-1.0.0.pkg   # administrator authorization required
+./scripts/install-bridge-agent.sh
+./scripts/install-app.sh
+```
+
+The package writes only `/Library/Audio/Plug-Ins/HAL/AudioBridge.driver` and
+restarts Core Audio, briefly interrupting Mac audio. If macOS prevents the
+restart, reboot to load the endpoint. No SIP changes are required. App/agent
+install scripts never reinstall the driver. Future OS compatibility fixes or
+changes to the endpoint itself may still require a driver update; a literal
+“never reinstall” guarantee is not possible.
+
+Player uses Audio Bridge for capture. The main window shows the capture source,
+recording file/folder, and listening status separately. Use **Record playlist**
+or **Stop recording** for WAVs, and **Enable audio** if setup is inactive. The
+legacy process-tap path is no longer offered in the UI. macOS asks AudioBridge for Microphone
+permission because this is an input device; the code opens only the virtual
+endpoint, never the physical microphone. Recording is always opt-in and off
+after service restart. Capture and monitoring preferences survive restarts.
+
+**Use for Mac audio** explicitly makes Audio Bridge the regular default output.
+All apps following that default are included, not only Spotify. Default input
+and system-alert output are unchanged. Spotify's Web API does not select a
+local Core Audio device. Use **Restore Mac output** or **Stop capture** to
+restore the previous available physical output. If the saved output is absent,
+choose one in macOS Sound settings. With monitoring off, endpoint audio is
+recordable but inaudible. The LaunchAgent restarts a crashed service; sound may
+be interrupted during recovery. It does not resume recording automatically.
+
+For driver removal, restore a physical default output first, stop capture,
+then unload the agent with
+`launchctl bootout gui/$(id -u)/se.lbsa71.AudioBridge.agent`.
+Move its plist from `~/Library/LaunchAgents/` and its app from `~/Applications/`
+to Trash. An administrator can move only `AudioBridge.driver` out of the HAL
+folder and restart the Mac; leave other vendors' drivers alone. Recordings are
+independent files and are retained.
+
+## Build and install
+
+Requires macOS 14.4+, Xcode command-line tools, and Spotify desktop.
+
+```sh
+swift test
+./scripts/install-app.sh
+```
+
+The installer builds a release app, signs it locally, installs it in
+`~/Applications/Player.app`, and opens it. To build without installing, use
+`./scripts/build-app.sh`. Set `PLAYER_INSTALL_DIR` to choose another installation
+directory. Set `PLAYER_SIGNING_IDENTITY` to an available Developer ID identity
+for a distribution-signed build; notarization is a separate release step. The
+default ad-hoc signature is intended only for local testing.
+
+1. Open Spotify, sign in and play a track **on this Mac**.
+2. In Player’s connection settings, enter your Spotify developer application's
+   public client ID. Register `http://127.0.0.1:43871/callback` as its redirect
+   URI and select **Web API**. No client secret or Web Playback SDK is needed.
+3. Click **Connect Spotify** and complete browser sign-in (including **Continue
+   with Google** if that is how you use Spotify). Approve playback-state and
+   playback-control access. Refresh credentials are stored in macOS Keychain;
+   access tokens stay in memory. The loopback login listener closes after
+   completion or its three-minute timeout.
+4. Identify this Mac in the Spotify device picker. Use **Transfer playback
+   here** if another Spotify device is active. Playback controls operate on
+   your explicitly selected device; the device name alone is not proof of its
+   physical location.
+5. For the optional **Spotify process tap** path, select wired headphones and click **Route through Player**. Allow system
+   audio recording when macOS asks. If previously denied, enable Player under
+   System Settings → Privacy & Security → Screen & System Audio Recording,
+   then relaunch if requested. No microphone permission is needed.
+6. Player probes for a signal without rendering or muting, then starts the
+   private route with conditional source muting. **Routing active** requires
+   healthy callbacks. Local volume controls only this route. **Use Spotify
+   output** stops routing and restores ordinary playback.
+
+The legacy process-tap engine accepts output-only stereo devices and native Float32
+streams. Duplex USB interfaces and multichannel devices are rejected before
+capture. Device loss triggers a best-effort Spotify pause before bounded route
+teardown; network failure can allow ordinary Spotify playback to resume on
+another output. Source/configuration changes and sleep stop routing; after wake
+or reconnection, refresh/select the output and explicitly restart. The legacy tap never
+changes the global default output. The endpoint path changes it only through
+the explicit **Use for Mac audio** action described above.
+
+Use **Diagnostics…** to export bounded metadata and counters, never audio or
+credentials. `~/Applications/Player.app/Contents/MacOS/Player --inspect` prints
+available output devices and Spotify Core Audio process objects without starting
+capture. See [VALIDATION.md](VALIDATION.md) for the acceptance checklist and
+remaining work.
+
+To choose the initial folder for diagnostic exports, set
+`defaults write se.lbsa71.player debugOutputDirectory -string "$HOME/Documents/Audio"`.
+The export dialog opens there and still lets you choose a filename or cancel.
+
+## WAV debug recording
+
+This extension was explicitly requested after the original design below, which
+excluded recording. It saves endpoint input (or legacy rendered output) locally, only after **Record WAVs**
+is pressed or `player_record_start` is called. It never uploads audio.
+
+1. Play a playlist in Spotify, or paste its link into Player and use **Play
+   playlist**. Player requests shuffle/repeat off and checks those modes before
+   starting at the first item. Spotify owns queue advancement. Turn off Spotify
+   crossfade/Automix manually if distinct track transitions are needed.
+2. Start Audio Bridge capture and send playback to its endpoint. Monitoring
+   is optional. For the legacy process tap, start **Route through Player**.
+3. Click **Record WAVs**. Output goes to the configured debug folder (here,
+   `/Users/stefan/Documents/Audio`; default `~/Documents/Audio`).
+4. Click **Stop recording** to finalize files while playback continues. Stopping
+   capture also finalizes the current recording. Player quitting ends its track
+   metadata lease within ten seconds; a generic recording can continue. Legacy
+   tap recordings finalize when Player quits.
+
+Files use `<album> - <artist> - <track name>.wav`. Invalid filename characters
+are replaced and long names shortened. Repeated names get ` (2)`, ` (3)`, etc.;
+existing files are never overwritten. Active files end in `.partial.wav` and
+are renamed after finalization. Forced termination or a write/overflow error
+leaves an explicitly partial file. A JSON sidecar maps each file to its Spotify
+track ID, observed start position, sample rate, frame count and stop reason.
+
+WAVs contain **32-bit IEEE Float stereo at the negotiated sample rate**.
+Audio Bridge saves its raw input before monitoring gain or rate conversion.
+The legacy tap saves samples after Player's gain, before hardware processing. No lossy encoding is added. This does not undo
+Spotify's processing or HAL resampling and is not a bit-perfect original-track
+export. Starting midway records only the remaining segment. Playback is polled
+about once per second while recording (subject to latency and rate limits), so
+file boundaries follow observed metadata and can include part of the neighboring
+track. Pausing, metadata loss, or a backward seek/repeat can produce additional
+numbered segments. Brief unobserved track changes cannot be reconstructed.
+
+The callback only copies into a preallocated bounded ring. A separate worker
+writes and checkpoints WAV headers. Overflow, format faults, a full disk or the
+4 GB WAV size limit stops recording and reports an error without pretending the
+file is complete. It does not intentionally stop an otherwise healthy audio
+route. Normal quit releases audio before waiting for file finalization. Recording
+is off after app restart. Recording storage is approximately 1.27 GB/hour at
+44.1 kHz stereo or 1.38 GB/hour at 48 kHz; monitor available disk space.
+
+```sh
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_record_start
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_record_stop
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_status
+```
+
+In endpoint mode inspect `bridge_status.recording` (or `player_status.bridge.recording`).
+For the legacy path check `recording.enabled`, `recording.finishing`, `recording.file` and
+`recording.error`. Start/stop acknowledge requests; wait for the observed state.
+
+## Generic endpoint control
+
+The same MCP server exposes twelve `bridge_*` tools even when Player is closed.
+The independent CLI is also available:
+
+```sh
+~/Applications/AudioBridge.app/Contents/MacOS/AudioBridge --call bridge_status
+~/Applications/AudioBridge.app/Contents/MacOS/AudioBridge --call bridge_start
+~/Applications/AudioBridge.app/Contents/MacOS/AudioBridge --call bridge_devices
+~/Applications/AudioBridge.app/Contents/MacOS/AudioBridge --call bridge_monitor '{"outputUID":"BuiltInHeadphoneOutputDevice"}'
+~/Applications/AudioBridge.app/Contents/MacOS/AudioBridge --call bridge_record_start '{"directory":"/Users/stefan/Documents/Audio","album":"Debug","artist":"Input","track":"Session"}'
+~/Applications/AudioBridge.app/Contents/MacOS/AudioBridge --call bridge_record_stop
+```
+
+Other methods: `bridge_monitor_stop`, `bridge_gain`, `bridge_record_track`,
+`bridge_use_default`, `bridge_restore_default`, `bridge_stop`. Queued operations
+return `accepted`; poll `bridge_status.busy`, `controlError`, and observed state.
+Status includes capture counters, monitoring under/overflows, WAV state, and
+bounded event history. Versioned JSON API `apiVersion: 1` uses a same-user Unix
+socket at `~/Library/Application Support/AudioBridge/control.sock`, not a network
+listener. Both CLI and MCP are clients of that service. Neither the driver nor
+the service stores Spotify credentials.
+
+## Direct control and MCP
+
+The app contains a local control server. `PlayerMCP` bridges standard MCP stdio
+JSON-RPC to that running app, and also provides a one-shot CLI for diagnostics:
+
+```sh
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_status
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_devices
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_logs
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_start '{"outputUID":"BuiltInHeadphoneOutputDevice"}'
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_volume '{"gain":0.5}'
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_stop
+```
+
+Spotify tools are also available through MCP or the same CLI:
+
+```sh
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_login
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_spotify_devices
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_select_spotify_device '{"deviceID":"ID_CONFIRMED_AS_THIS_MAC"}'
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_transport '{"action":"pause"}'
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_transport '{"action":"seek","positionMs":30000}'
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_quit
+```
+
+Transport actions are `play`, `pause`, `next`, `previous`, `seek`, `transfer` and
+`playlist` (with a `playlist` URL or URI argument).
+Commands acknowledge queuing; inspect `player_status.spotify` for observed
+playback, stale state and errors. `player_spotify_devices` schedules a refresh;
+poll until `refreshingDevices` clears before using the refreshed list. Restart
+the MCP client connection after updating Player to discover added tools.
+
+Use a UID returned by `player_devices`. Start/stop responses acknowledge a
+request; poll `player_status` to observe its actual outcome. Status includes
+the route error, negotiated format, callbacks, nonzero frames and buffer faults.
+Logs contain at most 80 audio events and 80 Spotify events. Open Player before calling live tools.
+
+Register the installed server with Codex using its supported
+[MCP configuration command](https://learn.chatgpt.com/docs/extend/mcp?surface=cli):
+
+```sh
+codex mcp add player-local -- "$HOME/Applications/Player.app/Contents/MacOS/PlayerMCP"
+```
+
+For other MCP clients, configure that same absolute executable path as a stdio
+server with no arguments. The server implements MCP protocol version
+`2024-11-05`: initialize, notifications, ping, tools/list and tools/call. Run
+`python3 scripts/test-mcp.py` with Player open to test the protocol and live
+read-only tools. No audio starts during this smoke test.
+
+The app socket lives at `~/Library/Application Support/Player/control.sock`.
+The directory is mode 0700, the socket is 0600, and both peers verify the same
+macOS UID. The control server has no TCP listener, remote access or PCM in responses.
+Only browser sign-in temporarily listens on loopback TCP port 43871.
+Other programs running as your user can operate the same narrowly scoped
+controls. A process lock prevents a second app instance from replacing the
+active socket; stale sockets are replaced on launch after crashes.
+
+## Technical design
+
 Draft technical design · 6 November 2026
 
 Build a native macOS shell that controls the installed Spotify desktop application and routes its audio through a local playback engine. Spotify remains responsible for account access, streaming, decoding and track playback. The shell owns the interface, audio routing and output selection.

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>se.lbsa71.AudioBridge.driver</string>
+    <key>CFBundleName</key><string>AudioBridge</string>
+    <key>CFBundleExecutable</key><string>AudioBridge</string>
+    <key>CFBundlePackageType</key><string>BNDL</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.0.0</string>
+    <key>CFPlugInFactories</key><dict>
+        <key>A4DE239A-3EB0-4DE3-AFE5-65072F6C563E</key><string>AudioBridge_Create</string>
+    </dict>
+    <key>CFPlugInTypes</key><dict>
+        <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key><array>
+            <string>A4DE239A-3EB0-4DE3-AFE5-65072F6C563E</string>
+        </array>
+    </dict>
+</dict></plist>

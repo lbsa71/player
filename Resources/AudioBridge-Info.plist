@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>se.lbsa71.AudioBridge.agent</string>
+<key>CFBundleName</key><string>AudioBridge</string>
+<key>CFBundleDisplayName</key><string>Audio Bridge</string>
+<key>CFBundleExecutable</key><string>AudioBridge</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>1.0.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSMinimumSystemVersion</key><string>14.4</string>
+<key>LSUIElement</key><true/>
+<key>NSPrincipalClass</key><string>NSApplication</string>
+<key>NSMicrophoneUsageDescription</key><string>Audio Bridge reads its virtual audio input for local WAV debugging and optional speaker or headphone monitoring. It does not open your physical microphone. Recordings stay on this Mac.</string>
+</dict></plist>

@@ -1,0 +1,7 @@
+#!/bin/bash
+# Loading the new HAL plug-in briefly interrupts Mac audio. No default device changes.
+set -eu
+if ! /bin/launchctl kickstart -k system/com.apple.audio.coreaudiod; then
+    echo 'Audio Bridge installed. Restart this Mac to load the audio endpoint.' >&2
+fi
+exit 0

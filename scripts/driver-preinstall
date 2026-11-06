@@ -1,0 +1,7 @@
+#!/bin/bash
+set -eu
+destination='/Library/Audio/Plug-Ins/HAL/AudioBridge.driver'
+if [ -e "$destination" ]; then
+    installed_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$destination/Contents/Info.plist")
+    [ "$installed_id" = 'se.lbsa71.AudioBridge.driver' ] || { echo 'Refusing to replace a different HAL plug-in.' >&2; exit 1; }
+fi
