@@ -1,0 +1,23 @@
+[package]
+name = "mixlib-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mixlib-types.workspace = true
+mixlib-catalog.workspace = true
+mixlib-analysis.workspace = true
+mixlib-planner.workspace = true
+mixlib-audio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+
+tempfile.workspace = true
+
+[[bin]]
+name = "mixlib"
+path = "src/main.rs"

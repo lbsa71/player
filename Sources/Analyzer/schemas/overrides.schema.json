@@ -1,0 +1,259 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/HashAlgorithm"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "Correction": {
+      "oneOf": [
+        {
+          "properties": {
+            "operation": {
+              "const": "insert_beat",
+              "type": "string"
+            },
+            "source_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "source_frame"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "operation": {
+              "const": "delete_beat",
+              "type": "string"
+            },
+            "source_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "source_frame"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "operation": {
+              "const": "downbeat",
+              "type": "string"
+            },
+            "source_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "source_frame",
+            "enabled"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "end_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "operation": {
+              "const": "meter",
+              "type": "string"
+            },
+            "pulses_per_bar": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "start_frame",
+            "end_frame",
+            "pulses_per_bar"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "end_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "operation": {
+              "const": "unsuitable",
+              "type": "string"
+            },
+            "start_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "start_frame",
+            "end_frame"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "end_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "operation": {
+              "const": "cue",
+              "type": "string"
+            },
+            "region_id": {
+              "type": "string"
+            },
+            "start_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "region_id",
+            "start_frame",
+            "end_frame"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "operation": {
+              "const": "exclude_transition",
+              "type": "string"
+            },
+            "to_track_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "to_track_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "FileRef": {
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "HashAlgorithm": {
+      "enum": [
+        "sha256"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "base_analysis": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FileRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "base_audio_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "migration_status": {
+      "type": "string"
+    },
+    "operations": {
+      "items": {
+        "$ref": "#/$defs/Correction"
+      },
+      "type": "array"
+    },
+    "overrides_id": {
+      "type": "string"
+    },
+    "revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "user_preferences": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "overrides_id",
+    "revision",
+    "base_audio_hash",
+    "operations",
+    "user_preferences",
+    "migration_status"
+  ],
+  "title": "Overrides",
+  "type": "object"
+}

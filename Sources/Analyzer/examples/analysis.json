@@ -1,0 +1,107 @@
+{
+  "analysis_id": "77477fa8-1793-4099-b762-68ae3ffcadfa",
+  "artifacts": {
+    "beats": {
+      "hash": {
+        "algorithm": "sha256",
+        "digest": "49d9f049df45a23a1dff1683d6b3cc674226836da2b9101a26e6676f546f8b66"
+      },
+      "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/beats.json"
+    },
+    "harmony": {
+      "hash": {
+        "algorithm": "sha256",
+        "digest": "cda64269ad764dba1f876615067b6237e5bbff8983d0bcf200e401e446fef4f7"
+      },
+      "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/harmony.json"
+    },
+    "regions": {
+      "hash": {
+        "algorithm": "sha256",
+        "digest": "f0e1700de23ac3b7b03c6d49494e20aab227125fc5253a46fa7fde388c5e1d0c"
+      },
+      "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/regions.json"
+    }
+  },
+  "audio_hash": {
+    "algorithm": "sha256",
+    "digest": "32cd245aeb2e477ccb795cd3cdf9166e0126cd3dea8a6a34d7ee1e0dc2c36fb0"
+  },
+  "created_at": "2026-11-06T21:13:02.206Z",
+  "effective_key": {
+    "algorithm": "sha256",
+    "digest": "b2114de02797c2079c671477b0b9f48651a2c7cbe024766cc06de03c3ec42069"
+  },
+  "extensions": {},
+  "peak": 0.327056884765625,
+  "quality_flags": [
+    "key_estimator_baseline_unvalidated",
+    "lead_activity_unknown",
+    "loudness_is_uncalibrated_rms_not_lufs"
+  ],
+  "rms": 0.05268937112310247,
+  "schema_version": 1,
+  "stages": {
+    "features": {
+      "artifacts": {
+        "feature-000000": {
+          "hash": {
+            "algorithm": "sha256",
+            "digest": "e4ad1a72ab4d23469653e8a407559d370808c121ca61d9a0eee60e199d278ee7"
+          },
+          "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/features/000000.json"
+        },
+        "harmony": {
+          "hash": {
+            "algorithm": "sha256",
+            "digest": "cda64269ad764dba1f876615067b6237e5bbff8983d0bcf200e401e446fef4f7"
+          },
+          "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/harmony.json"
+        }
+      },
+      "dependencies": [],
+      "implementation": "fft-chroma-band-rms/1",
+      "input_hash": {
+        "algorithm": "sha256",
+        "digest": "bd264ec51b7d66fed3c11af4341429dcc3e05e42c3ee3a00a9a895d2efe49261"
+      }
+    },
+    "regions": {
+      "artifacts": {
+        "regions": {
+          "hash": {
+            "algorithm": "sha256",
+            "digest": "f0e1700de23ac3b7b03c6d49494e20aab227125fc5253a46fa7fde388c5e1d0c"
+          },
+          "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/regions.json"
+        }
+      },
+      "dependencies": [
+        "rhythm",
+        "features"
+      ],
+      "implementation": "novelty-regions/1",
+      "input_hash": {
+        "algorithm": "sha256",
+        "digest": "e9f50b1ddd7b1ad9e21c4501ac25ce4b993459970fc88edb42213b855d2473c3"
+      }
+    },
+    "rhythm": {
+      "artifacts": {
+        "beats": {
+          "hash": {
+            "algorithm": "sha256",
+            "digest": "49d9f049df45a23a1dff1683d6b3cc674226836da2b9101a26e6676f546f8b66"
+          },
+          "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/beats.json"
+        }
+      },
+      "dependencies": [],
+      "implementation": "beat-this-1.1.0-rten-peak-picker/1",
+      "input_hash": {
+        "algorithm": "sha256",
+        "digest": "4e31ab2d5ad6a8313aa1fd310a984c9287933f814ba3e9f91fee17fa609a0063"
+      }
+    }
+  }
+}

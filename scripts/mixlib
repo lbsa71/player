@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+analyzer_dir="$(CDPATH= cd "$(dirname "$0")/../Sources/Analyzer" && pwd)"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.4}"
+exec cargo +1.89.0 run --locked --release --manifest-path "$analyzer_dir/Cargo.toml" --bin mixlib -- "$@"

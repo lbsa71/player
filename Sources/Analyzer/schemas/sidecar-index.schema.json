@@ -1,0 +1,49 @@
+{
+  "$defs": {
+    "SidecarLocation": {
+      "properties": {
+        "relative_wav_path": {
+          "type": "string"
+        },
+        "root_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root_id",
+        "relative_wav_path"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "index_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "tracks": {
+      "additionalProperties": {
+        "$ref": "#/$defs/SidecarLocation"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "index_id",
+    "tracks"
+  ],
+  "title": "SidecarIndex",
+  "type": "object"
+}

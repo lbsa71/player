@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "MetadataLayout": {
+      "enum": [
+        "separate_v1",
+        "sidecar_v1"
+      ],
+      "type": "string"
+    },
+    "SourceRoot": {
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "location_kind": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "require_finalized_sidecar": {
+          "default": false,
+          "type": "boolean"
+        },
+        "root_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root_id",
+        "display_name",
+        "location_kind",
+        "path",
+        "available"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "configuration_refs": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "excluded_directories": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "library_id": {
+      "type": "string"
+    },
+    "metadata_layout": {
+      "$ref": "#/$defs/MetadataLayout",
+      "default": "separate_v1"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_roots": {
+      "items": {
+        "$ref": "#/$defs/SourceRoot"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "library_id",
+    "source_roots",
+    "configuration_refs",
+    "excluded_directories",
+    "created_at"
+  ],
+  "title": "Library",
+  "type": "object"
+}

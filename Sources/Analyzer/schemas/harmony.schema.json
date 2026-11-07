@@ -1,0 +1,174 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/HashAlgorithm"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "FileRef": {
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "HashAlgorithm": {
+      "enum": [
+        "sha256"
+      ],
+      "type": "string"
+    },
+    "KeyCandidate": {
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "score": {
+          "format": "double",
+          "type": "number"
+        },
+        "tonic": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tonic",
+        "mode",
+        "score"
+      ],
+      "type": "object"
+    },
+    "TonalWindow": {
+      "properties": {
+        "ambiguous": {
+          "type": "boolean"
+        },
+        "candidates": {
+          "items": {
+            "$ref": "#/$defs/KeyCandidate"
+          },
+          "type": "array"
+        },
+        "context_seconds": {
+          "format": "double",
+          "type": "number"
+        },
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_frame",
+        "end_frame",
+        "context_seconds",
+        "candidates",
+        "ambiguous"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "feature_chunks": {
+      "items": {
+        "$ref": "#/$defs/FileRef"
+      },
+      "type": "array"
+    },
+    "harmony_id": {
+      "type": "string"
+    },
+    "mode_vocabulary": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "score_semantics": {
+      "type": "string"
+    },
+    "source_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "tonic_encoding": {
+      "type": "string"
+    },
+    "tuning_cents": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tuning_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tuning_reference_hz": {
+      "format": "double",
+      "type": "number"
+    },
+    "windows": {
+      "items": {
+        "$ref": "#/$defs/TonalWindow"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "harmony_id",
+    "source_sample_rate_hz",
+    "tonic_encoding",
+    "mode_vocabulary",
+    "score_semantics",
+    "tuning_reference_hz",
+    "feature_chunks",
+    "windows"
+  ],
+  "title": "Harmony",
+  "type": "object"
+}

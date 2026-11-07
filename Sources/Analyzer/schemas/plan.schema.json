@@ -1,0 +1,502 @@
+{
+  "$defs": {
+    "Anchor": {
+      "properties": {
+        "output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_frame",
+        "output_frame"
+      ],
+      "type": "object"
+    },
+    "AutomationPoint": {
+      "properties": {
+        "bands_linear": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "gain_linear": {
+          "format": "double",
+          "type": "number"
+        },
+        "mute": {
+          "type": "boolean"
+        },
+        "output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "output_frame",
+        "gain_linear",
+        "bands_linear",
+        "mute"
+      ],
+      "type": "object"
+    },
+    "ContentHash": {
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/HashAlgorithm"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "Cost": {
+      "properties": {
+        "normalization": {
+          "type": "string"
+        },
+        "value": {
+          "format": "double",
+          "type": "number"
+        },
+        "weight": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "value",
+        "weight",
+        "normalization"
+      ],
+      "type": "object"
+    },
+    "FileRef": {
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "HashAlgorithm": {
+      "enum": [
+        "sha256"
+      ],
+      "type": "string"
+    },
+    "MixingConfig": {
+      "properties": {
+        "allow_fallback": {
+          "type": "boolean"
+        },
+        "beam_width": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "config_id": {
+          "type": "string"
+        },
+        "extensions": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        },
+        "max_expansions": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_speed_change_per_second": {
+          "format": "double",
+          "type": "number"
+        },
+        "max_speed_deviation": {
+          "format": "double",
+          "type": "number"
+        },
+        "min_played_seconds": {
+          "format": "double",
+          "type": "number"
+        },
+        "output_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "overlap_seconds": {
+          "format": "double",
+          "type": "number"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "template": {
+          "$ref": "#/$defs/Template"
+        }
+      },
+      "required": [
+        "schema_version",
+        "config_id",
+        "beam_width",
+        "max_expansions",
+        "max_speed_deviation",
+        "max_speed_change_per_second",
+        "overlap_seconds",
+        "min_played_seconds",
+        "allow_fallback",
+        "template",
+        "output_sample_rate_hz"
+      ],
+      "type": "object"
+    },
+    "OutputFormat": {
+      "properties": {
+        "channels": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dither": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sample_rate_hz",
+        "channels",
+        "encoding",
+        "dither"
+      ],
+      "type": "object"
+    },
+    "Placement": {
+      "properties": {
+        "analysis": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "audio_hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "audio_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "automation": {
+          "items": {
+            "$ref": "#/$defs/AutomationPoint"
+          },
+          "type": "array"
+        },
+        "override_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "time_map": {
+          "$ref": "#/$defs/TimeMap"
+        },
+        "track_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "track_id",
+        "audio_hash",
+        "audio_revision",
+        "analysis",
+        "override_revision",
+        "source_start_frame",
+        "source_end_frame",
+        "time_map",
+        "automation"
+      ],
+      "type": "object"
+    },
+    "Template": {
+      "enum": [
+        "short_crossfade",
+        "bass_handoff",
+        "three_band_exchange",
+        "boundary"
+      ],
+      "type": "string"
+    },
+    "TimeMap": {
+      "properties": {
+        "anchors": {
+          "items": {
+            "$ref": "#/$defs/Anchor"
+          },
+          "type": "array"
+        },
+        "extensions": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        },
+        "interpolation": {
+          "type": "string"
+        },
+        "map_id": {
+          "type": "string"
+        },
+        "max_speed_change_per_second": {
+          "format": "double",
+          "type": "number"
+        },
+        "output_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preserve_pitch": {
+          "type": "boolean"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "maximum": 1,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "source_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "speed_ratio_limits": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "map_id",
+        "source_sample_rate_hz",
+        "output_sample_rate_hz",
+        "interpolation",
+        "anchors",
+        "speed_ratio_limits",
+        "max_speed_change_per_second",
+        "preserve_pitch"
+      ],
+      "type": "object"
+    },
+    "Transition": {
+      "properties": {
+        "costs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Cost"
+          },
+          "type": "object"
+        },
+        "end_output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fallback_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from_track_id": {
+          "type": "string"
+        },
+        "incoming_region_id": {
+          "type": "string"
+        },
+        "outgoing_region_id": {
+          "type": "string"
+        },
+        "start_output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "template": {
+          "$ref": "#/$defs/Template"
+        },
+        "to_track_id": {
+          "type": "string"
+        },
+        "transition_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "transition_id",
+        "from_track_id",
+        "to_track_id",
+        "outgoing_region_id",
+        "incoming_region_id",
+        "start_output_frame",
+        "end_output_frame",
+        "template",
+        "costs"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "automation_interpolation": {
+      "type": "string"
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "crossover_design": {
+      "type": "string"
+    },
+    "crossover_hz": {
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "diagnostics": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "output": {
+      "$ref": "#/$defs/OutputFormat"
+    },
+    "placements": {
+      "items": {
+        "$ref": "#/$defs/Placement"
+      },
+      "type": "array"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "planner_version": {
+      "type": "string"
+    },
+    "policy": {
+      "$ref": "#/$defs/MixingConfig"
+    },
+    "policy_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "renderer_version": {
+      "type": "string"
+    },
+    "requested_duration_seconds": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "seed": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "total_output_frames": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "transitions": {
+      "items": {
+        "$ref": "#/$defs/Transition"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "plan_id",
+    "planner_version",
+    "renderer_version",
+    "policy_hash",
+    "policy",
+    "seed",
+    "objective",
+    "complete",
+    "output",
+    "placements",
+    "transitions",
+    "total_output_frames",
+    "crossover_hz",
+    "crossover_design",
+    "automation_interpolation",
+    "diagnostics"
+  ],
+  "title": "MixPlan",
+  "type": "object"
+}

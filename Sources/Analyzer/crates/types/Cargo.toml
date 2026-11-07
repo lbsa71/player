@@ -1,0 +1,19 @@
+[package]
+name = "mixlib-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde-value.workspace = true
+schemars.workspace = true
+jsonschema.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

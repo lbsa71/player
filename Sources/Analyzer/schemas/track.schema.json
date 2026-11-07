@@ -1,0 +1,227 @@
+{
+  "$defs": {
+    "AudioFormat": {
+      "properties": {
+        "channel_mask": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "channels": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "container_bits": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "encoding": {
+          "$ref": "#/$defs/Encoding"
+        },
+        "frames": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "valid_bits": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sample_rate_hz",
+        "channels",
+        "encoding",
+        "container_bits",
+        "valid_bits",
+        "channel_mask",
+        "frames"
+      ],
+      "type": "object"
+    },
+    "ContentHash": {
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/HashAlgorithm"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "Encoding": {
+      "enum": [
+        "pcm_integer",
+        "ieee_float"
+      ],
+      "type": "string"
+    },
+    "FileRef": {
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "Fingerprint": {
+      "properties": {
+        "file_identity": {
+          "type": "string"
+        },
+        "modified_ns": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "size",
+        "modified_ns",
+        "file_identity"
+      ],
+      "type": "object"
+    },
+    "HashAlgorithm": {
+      "enum": [
+        "sha256"
+      ],
+      "type": "string"
+    },
+    "Lifecycle": {
+      "enum": [
+        "available",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "SourceLocation": {
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "file_hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/Fingerprint"
+        },
+        "relative_path": {
+          "type": "string"
+        },
+        "root_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "root_id",
+        "relative_path",
+        "fingerprint",
+        "file_hash",
+        "available"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "active_analysis": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FileRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "active_overrides": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FileRef"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "audio_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "audio_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "format": {
+      "$ref": "#/$defs/AudioFormat"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/Lifecycle"
+    },
+    "override_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_locations": {
+      "items": {
+        "$ref": "#/$defs/SourceLocation"
+      },
+      "type": "array"
+    },
+    "track_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "track_id",
+    "audio_revision",
+    "audio_hash",
+    "format",
+    "source_locations",
+    "override_revision",
+    "lifecycle"
+  ],
+  "title": "Track",
+  "type": "object"
+}

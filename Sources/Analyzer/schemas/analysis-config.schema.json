@@ -1,0 +1,66 @@
+{
+  "$defs": {
+    "BeatBackend": {
+      "enum": [
+        "beat_this",
+        "unavailable"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "beat_backend": {
+      "$ref": "#/$defs/BeatBackend"
+    },
+    "config_id": {
+      "type": "string"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "feature_hop_ms": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "high_crossover_hz": {
+      "format": "double",
+      "type": "number"
+    },
+    "low_crossover_hz": {
+      "format": "double",
+      "type": "number"
+    },
+    "max_duration_seconds": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "settling_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "config_id",
+    "beat_backend",
+    "settling_ms",
+    "max_duration_seconds",
+    "feature_hop_ms",
+    "low_crossover_hz",
+    "high_crossover_hz"
+  ],
+  "title": "AnalysisConfig",
+  "type": "object"
+}

@@ -1,0 +1,152 @@
+{
+  "$defs": {
+    "Beat": {
+      "properties": {
+        "event_id": {
+          "type": "string"
+        },
+        "local_bpm": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "score": {
+          "format": "double",
+          "type": "number"
+        },
+        "source_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_id",
+        "source_frame",
+        "score"
+      ],
+      "type": "object"
+    },
+    "Interval": {
+      "properties": {
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_frame",
+        "end_frame",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "Meter": {
+      "properties": {
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pulse_unit": {
+          "type": "string"
+        },
+        "pulses_per_bar": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_frame",
+        "end_frame",
+        "pulses_per_bar",
+        "pulse_unit"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "beats_id": {
+      "type": "string"
+    },
+    "downbeat_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "events": {
+      "items": {
+        "$ref": "#/$defs/Beat"
+      },
+      "type": "array"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "meter_segments": {
+      "items": {
+        "$ref": "#/$defs/Meter"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "score_semantics": {
+      "type": "string"
+    },
+    "source_frames": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unreliable_intervals": {
+      "items": {
+        "$ref": "#/$defs/Interval"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "beats_id",
+    "source_sample_rate_hz",
+    "source_frames",
+    "events",
+    "downbeat_ids",
+    "meter_segments",
+    "unreliable_intervals",
+    "score_semantics"
+  ],
+  "title": "Beats",
+  "type": "object"
+}

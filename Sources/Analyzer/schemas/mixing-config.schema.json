@@ -1,0 +1,82 @@
+{
+  "$defs": {
+    "Template": {
+      "enum": [
+        "short_crossfade",
+        "bass_handoff",
+        "three_band_exchange",
+        "boundary"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "allow_fallback": {
+      "type": "boolean"
+    },
+    "beam_width": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "config_id": {
+      "type": "string"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "max_expansions": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "max_speed_change_per_second": {
+      "format": "double",
+      "type": "number"
+    },
+    "max_speed_deviation": {
+      "format": "double",
+      "type": "number"
+    },
+    "min_played_seconds": {
+      "format": "double",
+      "type": "number"
+    },
+    "output_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "overlap_seconds": {
+      "format": "double",
+      "type": "number"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "template": {
+      "$ref": "#/$defs/Template"
+    }
+  },
+  "required": [
+    "schema_version",
+    "config_id",
+    "beam_width",
+    "max_expansions",
+    "max_speed_deviation",
+    "max_speed_change_per_second",
+    "overlap_seconds",
+    "min_played_seconds",
+    "allow_fallback",
+    "template",
+    "output_sample_rate_hz"
+  ],
+  "title": "MixingConfig",
+  "type": "object"
+}

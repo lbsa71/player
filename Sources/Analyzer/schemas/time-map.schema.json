@@ -1,0 +1,88 @@
+{
+  "$defs": {
+    "Anchor": {
+      "properties": {
+        "output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_frame",
+        "output_frame"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "anchors": {
+      "items": {
+        "$ref": "#/$defs/Anchor"
+      },
+      "type": "array"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "interpolation": {
+      "type": "string"
+    },
+    "map_id": {
+      "type": "string"
+    },
+    "max_speed_change_per_second": {
+      "format": "double",
+      "type": "number"
+    },
+    "output_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "preserve_pitch": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "speed_ratio_limits": {
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "map_id",
+    "source_sample_rate_hz",
+    "output_sample_rate_hz",
+    "interpolation",
+    "anchors",
+    "speed_ratio_limits",
+    "max_speed_change_per_second",
+    "preserve_pitch"
+  ],
+  "title": "TimeMap",
+  "type": "object"
+}

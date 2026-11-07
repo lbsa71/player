@@ -1,0 +1,294 @@
+{
+  "beats_id": "2e69fb80-3656-41ed-a889-8df8a9a663c5",
+  "downbeat_ids": [
+    "beat-12480",
+    "beat-36480",
+    "beat-60480",
+    "beat-84480",
+    "beat-108480",
+    "beat-132480",
+    "beat-156480",
+    "beat-180480",
+    "beat-204480",
+    "beat-228480",
+    "beat-252480",
+    "beat-276480",
+    "beat-300480",
+    "beat-324480",
+    "beat-348480",
+    "beat-372480",
+    "beat-396480",
+    "beat-420480",
+    "beat-444480",
+    "beat-468480",
+    "beat-492480",
+    "beat-516480",
+    "beat-540480",
+    "beat-564480",
+    "beat-588480",
+    "beat-612480",
+    "beat-636480",
+    "beat-660480",
+    "beat-684480",
+    "beat-708480",
+    "beat-732480",
+    "beat-756480",
+    "beat-780480",
+    "beat-804480",
+    "beat-828480",
+    "beat-852480",
+    "beat-876480",
+    "beat-900480",
+    "beat-924480",
+    "beat-948480"
+  ],
+  "events": [
+    {
+      "event_id": "beat-12480",
+      "local_bpm": 120.0,
+      "score": 0.9969693597046895,
+      "source_frame": 12480
+    },
+    {
+      "event_id": "beat-36480",
+      "local_bpm": 120.0,
+      "score": 0.9968162726619992,
+      "source_frame": 36480
+    },
+    {
+      "event_id": "beat-60480",
+      "local_bpm": 120.0,
+      "score": 0.9976911618987754,
+      "source_frame": 60480
+    },
+    {
+      "event_id": "beat-84480",
+      "local_bpm": 120.0,
+      "score": 0.9963291934257404,
+      "source_frame": 84480
+    },
+    {
+      "event_id": "beat-108480",
+      "local_bpm": 120.0,
+      "score": 0.9972850765026632,
+      "source_frame": 108480
+    },
+    {
+      "event_id": "beat-132480",
+      "local_bpm": 120.0,
+      "score": 0.9967389735580391,
+      "source_frame": 132480
+    },
+    {
+      "event_id": "beat-156480",
+      "local_bpm": 120.0,
+      "score": 0.9977639445704144,
+      "source_frame": 156480
+    },
+    {
+      "event_id": "beat-180480",
+      "local_bpm": 120.0,
+      "score": 0.9976636639866812,
+      "source_frame": 180480
+    },
+    {
+      "event_id": "beat-204480",
+      "local_bpm": 120.0,
+      "score": 0.9979111830600131,
+      "source_frame": 204480
+    },
+    {
+      "event_id": "beat-228480",
+      "local_bpm": 120.0,
+      "score": 0.9970220920449718,
+      "source_frame": 228480
+    },
+    {
+      "event_id": "beat-252480",
+      "local_bpm": 120.0,
+      "score": 0.9975076528210273,
+      "source_frame": 252480
+    },
+    {
+      "event_id": "beat-276480",
+      "local_bpm": 120.0,
+      "score": 0.9976249174862126,
+      "source_frame": 276480
+    },
+    {
+      "event_id": "beat-300480",
+      "local_bpm": 120.0,
+      "score": 0.9969857169473967,
+      "source_frame": 300480
+    },
+    {
+      "event_id": "beat-324480",
+      "local_bpm": 120.0,
+      "score": 0.995532970957085,
+      "source_frame": 324480
+    },
+    {
+      "event_id": "beat-348480",
+      "local_bpm": 120.0,
+      "score": 0.9966111396472407,
+      "source_frame": 348480
+    },
+    {
+      "event_id": "beat-372480",
+      "local_bpm": 120.0,
+      "score": 0.9972982353743794,
+      "source_frame": 372480
+    },
+    {
+      "event_id": "beat-396480",
+      "local_bpm": 120.0,
+      "score": 0.9972030976465925,
+      "source_frame": 396480
+    },
+    {
+      "event_id": "beat-420480",
+      "local_bpm": 120.0,
+      "score": 0.9965618275888105,
+      "source_frame": 420480
+    },
+    {
+      "event_id": "beat-444480",
+      "local_bpm": 120.0,
+      "score": 0.997285551571923,
+      "source_frame": 444480
+    },
+    {
+      "event_id": "beat-468480",
+      "local_bpm": 120.0,
+      "score": 0.9974586218133084,
+      "source_frame": 468480
+    },
+    {
+      "event_id": "beat-492480",
+      "local_bpm": 120.0,
+      "score": 0.9970925421222645,
+      "source_frame": 492480
+    },
+    {
+      "event_id": "beat-516480",
+      "local_bpm": 120.0,
+      "score": 0.9957391824992671,
+      "source_frame": 516480
+    },
+    {
+      "event_id": "beat-540480",
+      "local_bpm": 120.0,
+      "score": 0.9963880955606711,
+      "source_frame": 540480
+    },
+    {
+      "event_id": "beat-564480",
+      "local_bpm": 120.0,
+      "score": 0.9962640651666097,
+      "source_frame": 564480
+    },
+    {
+      "event_id": "beat-588480",
+      "local_bpm": 120.0,
+      "score": 0.9966915013124907,
+      "source_frame": 588480
+    },
+    {
+      "event_id": "beat-612480",
+      "local_bpm": 120.0,
+      "score": 0.9959275034734454,
+      "source_frame": 612480
+    },
+    {
+      "event_id": "beat-636480",
+      "local_bpm": 120.0,
+      "score": 0.9961762175303346,
+      "source_frame": 636480
+    },
+    {
+      "event_id": "beat-660480",
+      "local_bpm": 120.0,
+      "score": 0.9948922084803171,
+      "source_frame": 660480
+    },
+    {
+      "event_id": "beat-684480",
+      "local_bpm": 120.0,
+      "score": 0.9956123465452204,
+      "source_frame": 684480
+    },
+    {
+      "event_id": "beat-708480",
+      "local_bpm": 120.0,
+      "score": 0.9944719570513374,
+      "source_frame": 708480
+    },
+    {
+      "event_id": "beat-732480",
+      "local_bpm": 120.0,
+      "score": 0.9946879359068471,
+      "source_frame": 732480
+    },
+    {
+      "event_id": "beat-756480",
+      "local_bpm": 120.0,
+      "score": 0.9930508860128269,
+      "source_frame": 756480
+    },
+    {
+      "event_id": "beat-780480",
+      "local_bpm": 120.0,
+      "score": 0.9946836761962556,
+      "source_frame": 780480
+    },
+    {
+      "event_id": "beat-804480",
+      "local_bpm": 120.0,
+      "score": 0.9932058382087869,
+      "source_frame": 804480
+    },
+    {
+      "event_id": "beat-828480",
+      "local_bpm": 120.0,
+      "score": 0.9919822018378416,
+      "source_frame": 828480
+    },
+    {
+      "event_id": "beat-852480",
+      "local_bpm": 120.0,
+      "score": 0.9891204535588942,
+      "source_frame": 852480
+    },
+    {
+      "event_id": "beat-876480",
+      "local_bpm": 120.0,
+      "score": 0.9891133597726502,
+      "source_frame": 876480
+    },
+    {
+      "event_id": "beat-900480",
+      "local_bpm": 120.0,
+      "score": 0.9817422783592785,
+      "source_frame": 900480
+    },
+    {
+      "event_id": "beat-924480",
+      "local_bpm": 120.0,
+      "score": 0.9638993688633094,
+      "source_frame": 924480
+    },
+    {
+      "event_id": "beat-948480",
+      "local_bpm": 120.0,
+      "score": 0.9804815640216362,
+      "source_frame": 948480
+    }
+  ],
+  "extensions": {},
+  "meter_segments": [],
+  "schema_version": 1,
+  "score_semantics": "sigmoid of raw model beat logit at nearest 50 Hz frame; uncalibrated",
+  "source_frames": 960000,
+  "source_sample_rate_hz": 48000,
+  "unreliable_intervals": []
+}

@@ -1,0 +1,125 @@
+{
+  "$defs": {
+    "Region": {
+      "properties": {
+        "available_overlap_frames": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "beat_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "chroma": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 12,
+          "minItems": 12,
+          "type": "array"
+        },
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "energy": {
+          "format": "double",
+          "type": "number"
+        },
+        "exclusion_reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "region_id": {
+          "type": "string"
+        },
+        "reliable": {
+          "type": "boolean"
+        },
+        "role": {
+          "$ref": "#/$defs/RegionRole"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tempo_range_bpm": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "region_id",
+        "role",
+        "start_frame",
+        "end_frame",
+        "beat_ids",
+        "chroma",
+        "energy",
+        "available_overlap_frames",
+        "reliable",
+        "exclusion_reasons"
+      ],
+      "type": "object"
+    },
+    "RegionRole": {
+      "enum": [
+        "entry",
+        "exit"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "regions": {
+      "items": {
+        "$ref": "#/$defs/Region"
+      },
+      "type": "array"
+    },
+    "regions_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_frames": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "regions_id",
+    "source_frames",
+    "regions"
+  ],
+  "title": "Regions",
+  "type": "object"
+}

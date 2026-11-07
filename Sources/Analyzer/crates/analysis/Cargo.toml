@@ -1,0 +1,18 @@
+[package]
+name = "mixlib-analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mixlib-types.workspace = true
+mixlib-catalog.workspace = true
+mixlib-audio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustfft.workspace = true
+beat-this.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

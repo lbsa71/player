@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "extensions": {},
+  "beats_id": "fixture",
+  "source_sample_rate_hz": 48000,
+  "source_frames": 96000,
+  "events": [
+    {
+      "event_id": "beat-0",
+      "source_frame": 0,
+      "score": 1,
+      "local_bpm": 120
+    },
+    {
+      "event_id": "beat-1",
+      "source_frame": 24000,
+      "score": 1,
+      "local_bpm": 120
+    }
+  ],
+  "downbeat_ids": [
+    "beat-0"
+  ],
+  "meter_segments": [],
+  "unreliable_intervals": [],
+  "score_semantics": "synthetic ground truth, not a model probability"
+}

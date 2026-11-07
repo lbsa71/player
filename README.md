@@ -9,6 +9,15 @@ quit/crash recovery gate passed on this Mac with wired headphones. The broader
 hardware, latency and endurance acceptance checks remain open; see
 [VALIDATION.md](VALIDATION.md).
 
+## Local WAV analysis and mixing
+
+`Sources/Analyzer` contains a separate Rust `mixlib` CLI for incremental JSON
+catalogues, local Beat This! analysis, playlist planning, transition previews and
+WAV export. Run `./scripts/mixlib --help` from this repository. Build instructions,
+model installation, recovery notes and the remaining product release gates are
+in [the analyzer implementation guide](Sources/Analyzer/IMPLEMENTATION.md).
+This engineering CLI is independent of the installed Swift Player and Audio Bridge.
+
 ## Generic Audio Bridge endpoint
 
 The default path is now a standard Core Audio virtual endpoint, **Audio Bridge**.
@@ -164,6 +173,14 @@ existing files are never overwritten. Active files end in `.partial.wav` and
 are renamed after finalization. Forced termination or a write/overflow error
 leaves an explicitly partial file. A JSON sidecar maps each file to its Spotify
 track ID, observed start position, sample rate, frame count and stop reason.
+
+The Rust analyzer uses this same `~/Documents/Audio` folder. Run
+`./scripts/mixlib scan` to register finalized recordings. It preserves the
+recorder's fields and adds an `analyzer` object inside each existing `.wav.json`,
+so there is one metadata file per WAV. Analysis results and corrections stay in
+that file. Shared configuration, models and mix plans live under
+`~/Library/Application Support/Player/Analyzer`. See
+[analyzer usage](Sources/Analyzer/IMPLEMENTATION.md).
 
 WAVs contain **32-bit IEEE Float stereo at the negotiated sample rate**.
 Audio Bridge saves its raw input before monitoring gain or rate conversion.

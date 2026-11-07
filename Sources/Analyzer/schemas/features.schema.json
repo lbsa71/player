@@ -1,0 +1,117 @@
+{
+  "$defs": {
+    "FeatureFrame": {
+      "properties": {
+        "band_energy": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "chroma": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 12,
+          "minItems": 12,
+          "type": "array"
+        },
+        "onset": {
+          "format": "double",
+          "type": "number"
+        },
+        "peak": {
+          "format": "double",
+          "type": "number"
+        },
+        "rms": {
+          "format": "double",
+          "type": "number"
+        },
+        "source_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_frame",
+        "chroma",
+        "band_energy",
+        "rms",
+        "peak",
+        "onset"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "chunk_id": {
+      "type": "string"
+    },
+    "dimensions": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "frames": {
+      "items": {
+        "$ref": "#/$defs/FeatureFrame"
+      },
+      "type": "array"
+    },
+    "hop_frames": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "method": {
+      "type": "string"
+    },
+    "normalization": {
+      "type": "string"
+    },
+    "pitch_class_order": {
+      "type": "string"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "tuning_reference_hz": {
+      "format": "double",
+      "type": "number"
+    }
+  },
+  "required": [
+    "schema_version",
+    "chunk_id",
+    "source_sample_rate_hz",
+    "hop_frames",
+    "dimensions",
+    "pitch_class_order",
+    "method",
+    "normalization",
+    "tuning_reference_hz",
+    "frames"
+  ],
+  "title": "FeatureChunk",
+  "type": "object"
+}

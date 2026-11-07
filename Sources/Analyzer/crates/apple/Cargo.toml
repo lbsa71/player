@@ -1,0 +1,20 @@
+[package]
+name = "mixlib-apple"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mixlib-types.workspace = true
+mixlib-catalog.workspace = true
+mixlib-analysis.workspace = true
+mixlib-planner.workspace = true
+mixlib-audio.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]

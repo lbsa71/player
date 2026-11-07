@@ -1,0 +1,135 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/HashAlgorithm"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "FileRef": {
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "HashAlgorithm": {
+      "enum": [
+        "sha256"
+      ],
+      "type": "string"
+    },
+    "Stage": {
+      "properties": {
+        "artifacts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/FileRef"
+          },
+          "type": "object"
+        },
+        "dependencies": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "implementation": {
+          "type": "string"
+        },
+        "input_hash": {
+          "$ref": "#/$defs/ContentHash"
+        }
+      },
+      "required": [
+        "implementation",
+        "input_hash",
+        "artifacts",
+        "dependencies"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "analysis_id": {
+      "type": "string"
+    },
+    "artifacts": {
+      "additionalProperties": {
+        "$ref": "#/$defs/FileRef"
+      },
+      "type": "object"
+    },
+    "audio_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "effective_key": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "peak": {
+      "format": "double",
+      "type": "number"
+    },
+    "quality_flags": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "rms": {
+      "format": "double",
+      "type": "number"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "stages": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Stage"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "analysis_id",
+    "audio_hash",
+    "effective_key",
+    "stages",
+    "artifacts",
+    "quality_flags",
+    "peak",
+    "rms",
+    "created_at"
+  ],
+  "title": "AnalysisManifest",
+  "type": "object"
+}

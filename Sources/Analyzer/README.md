@@ -1,3 +1,6 @@
+Implementation entry point: [CLI build, usage, tested behavior and remaining release gates](IMPLEMENTATION.md).
+The specification below remains the acceptance contract; the engineering CLI does not yet satisfy every release gate.
+
 Build a local music player that analyses a folder of WAV files, selects a suitable play order, and automatically performs reasonably smooth transitions. The application should retain the expressive timing of acoustic recordings while supporting music with a steady pulse. Its scope is playlist selection and automated mixing, with a small interface for reviewing and correcting results.
 
 The system has two computational passes: an incremental library analyser and a mix planner. A separate renderer executes the resulting plan for previews, continuous playback or WAV export. Rust owns the reusable core. macOS is the first delivery platform; the architecture must allow a later iOS client.
@@ -14,7 +17,7 @@ The first complete release MUST provide variable beat grids, local harmonic anal
 
 The first engineering milestone is a macOS command-line application. The macOS graphical client follows once the full analysis-to-render workflow is usable. iOS, stem-assisted mixing and learned transition ranking are later extensions. The initial release does not require streaming services, cloud analysis, controller support, scratching, a sampler, generative music or a general-purpose effects rack.
 
-Original WAVs MUST remain unchanged. Selecting a source directory authorises reading, not renaming, tagging, normalising or overwriting its files. Outputs belong in explicitly selected metadata and render directories.
+Original WAVs MUST remain unchanged. The default recording folder is `~/Documents/Audio`, using the recorder's `<album> - <artist> - <track name>.wav` naming. Each WAV MUST have only one JSON sidecar, `<filename>.wav.json`. Preserve the recorder's existing top-level fields and add analyzer metadata under `analyzer`. Shared library records and rendered audio belong outside the source folder. Partial recordings and recordings awaiting finalized recorder metadata MUST be deferred.
 
 # Architecture and execution boundaries
 
@@ -36,37 +39,50 @@ Each algorithm MUST sit behind a versioned interface. Replacing beat decoding, h
 
 ## Directory layout
 
-Use a user-selected metadata directory separate from the music directories. Relative paths are relative to this directory unless the record explicitly identifies a source root. The name `mix-library` below is illustrative.
+The storage revision of 7 November 2026 fuses per-track records into the existing
+recorder sidecar. This supersedes the original separate-file layout. The default
+shared metadata directory is `~/Library/Application Support/Player/Analyzer`;
+`--library` or `MIXLIB_LIBRARY` can select another directory.
 
-| Path | Contents and authority |
+| Physical path | Contents and authority |
 | - | - |
-| `mix-library/library.json` | Library UUID, schema version, source roots and active configuration |
-| `mix-library/config/analysis.json` | Analysis profiles, resource limits and algorithm selections |
-| `mix-library/config/mixing.json` | Planner constraints, scoring configuration and transition policies |
-| `mix-library/models/manifest.json` | Model identifiers, checksums, provenance and licence references |
-| `mix-library/tracks/<shard>/<track_id>/track.json` | Track identity, audio revision, source locations and active analysis reference |
-| `mix-library/tracks/<shard>/<track_id>/analysis/<analysis_id>/manifest.json` | Stage versions, input hashes, output references, checksums and quality flags |
-| `mix-library/tracks/<shard>/<track_id>/analysis/<analysis_id>/beats.json` | Beat events, downbeat events, meter hypotheses and unreliable intervals |
-| `mix-library/tracks/<shard>/<track_id>/analysis/<analysis_id>/harmony.json` | Tuning, local key candidates and references to harmonic feature chunks |
-| `mix-library/tracks/<shard>/<track_id>/analysis/<analysis_id>/regions.json` | Structural boundaries and entry/exit region candidates |
-| `mix-library/tracks/<shard>/<track_id>/analysis/<analysis_id>/features/<chunk_id>.json` | Chunked numeric features, with explicit timing and dimensionality |
-| `mix-library/tracks/<shard>/<track_id>/overrides.json` | Manual beat, harmonic and cue corrections, plus planning preferences |
-| `mix-library/catalog/manifest.json` | Active generation of derived catalogue summaries |
-| `mix-library/catalog/<generation>/<shard>.json` | Small track summaries for browsing and coarse candidate retrieval |
-| `mix-library/transitions/<shard>/<cache_key>.json` | Rebuildable candidate transition evaluations |
-| `mix-library/plans/<plan_id>.json` | Complete playback order and rendering instructions |
-| `mix-library/jobs/<job_id>.json` | Resumable analysis or render job state |
-| `mix-library/reports/<report_id>.json` | Scan results, validation results and render diagnostics |
-| `mix-library/locks/writer.lock.json` | Stable lock-file inode and diagnostic owner metadata |
-| `mix-library/staging/<job_id>/` | Unpublished work and temporary JSON files |
+| `<source>/<filename>.wav.json` | Recorder fields plus the authoritative `analyzer` bundle |
+| `<library>/library.json` | Library UUID, source roots and metadata layout version |
+| `<library>/config/{analysis,mixing}.json` | Analysis and planner configuration |
+| `<library>/models/manifest.json` | Model identifiers, checksums, provenance and licences |
+| `<library>/catalog/sidecars.json` | Rebuildable track-to-sidecar location index |
+| `<library>/catalog/manifest.json` and generation shards | Rebuildable catalogue summaries |
+| `<library>/plans/<plan_id>.json` | Complete playback order and rendering instructions |
+| `<library>/reports/<report_id>.json` | Scan, validation and render diagnostics |
+| `<library>/locks/writer.lock.json` | Stable shared writer lock and owner diagnostics |
 
-Shards SHOULD use two hexadecimal characters derived from the record ID. There must be no giant JSON file containing every track's full analysis. Numeric feature arrays MUST be chunked; the initial maximum uncompressed feature-file size is 8 MiB. Audio previews, stems and downloaded model weights may occupy separate binary asset directories referenced by JSON manifests.
+The `analyzer` object has its own schema version, library/track/bundle IDs, an
+optional `shared_from` location for identical audio, and a `records` map. Existing
+recorder fields retain their camelCase names; analyzer fields use snake_case.
+An identical WAV at another location keeps its own recorder metadata and a
+reference to the primary sidecar that owns the shared analysis.
+
+Record keys such as `tracks/<shard>/<track_id>/track.json`,
+`tracks/<shard>/<track_id>/analysis/<analysis_id>/beats.json`,
+`tracks/<shard>/<track_id>/overrides/<revision>.json`, `jobs/<track_id>.json` and
+`staging/<track_id>/checkpoint.json` are **logical keys inside `analyzer.records`**,
+not extra physical files. References and checksums resolve these embedded
+records through the catalogue storage adapter. All historical generations,
+feature chunks, corrections and job checkpoints stay in that single sidecar.
+
+Shards use two hexadecimal characters derived from record IDs. Numeric features
+remain chunked into logical records of at most 8 MiB; the complete sidecar is
+limited to 256 MiB. Exceeding either limit fails while retaining the previous
+valid sidecar. Publishing a record atomically replaces the whole sidecar, so
+large analyses incur more write traffic. There is no giant JSON file containing
+every track's full analysis. Models, previews and rendered audio remain separate
+binary assets.
 
 Catalogue summaries and transition caches are disposable accelerators. Authoritative track manifests, analysis generations, corrections and plans MUST be sufficient to reconstruct them. Searching may build an in-memory index. A persistent vector database or opaque binary metadata index is not part of this design.
 
 ## JSON conventions and schemas
 
-FS-01. Metadata MUST be UTF-8 JSON with a top-level `schema_version` and a stable record identifier. Use JSON Schema Draft 2020-12 and typed Rust serialization. Validate semantic constraints in Rust as well as structural schemas.
+FS-01. Analyzer records MUST be UTF-8 JSON with a `schema_version` and a stable record identifier. In a fused recorder sidecar these fields belong to the nested `analyzer` object and its records, leaving the recorder envelope intact. Use JSON Schema Draft 2020-12 and typed Rust serialization. Validate semantic constraints in Rust as well as structural schemas.
 
 FS-02. Keys and enum values MUST use a documented naming convention. Human-edited configuration and summaries SHOULD be pretty-printed. Dense numeric arrays may be compact JSON. NaN and infinity are forbidden; unavailable values use `null` with a reason where needed.
 
@@ -80,7 +96,7 @@ FS-06. Hash inputs MUST use a documented canonical JSON representation and rejec
 
 ## Core record contracts
 
-The following fields form the minimum logical contracts. Published JSON schemas must define their exact required/optional status, enums, dimensions and cross-field constraints. IDs are strings; content hashes declare their algorithm; frame positions are integers; scores and gains are finite numbers. File references are relative paths paired with content hashes.
+The following fields form the minimum logical contracts. Published JSON schemas must define their exact required/optional status, enums, dimensions and cross-field constraints. IDs are strings; content hashes declare their algorithm; frame positions are integers; scores and gains are finite numbers. File references pair logical record keys (or shared-library relative paths) with content hashes.
 
 | Record | Required field groups |
 | - | - |
@@ -119,7 +135,7 @@ FS-08. Acquire an operating-system advisory lock on the stable lock-file inode. 
 
 FS-09. Write each file to a unique temporary path on the same filesystem, flush it, validate it, and atomically rename it into place. Synchronise file and directory state as supported by the platform. Disk-full, permission and cancellation errors must leave the previous committed record readable.
 
-FS-10. Analysis generations are immutable after publication. Write and validate all referenced files before atomically replacing the small `track.json` reference to the new generation. Readers retain a snapshot reference and therefore see either the old complete generation or the new complete generation. A catalogue update can lag behind; it must never be required to recover authoritative track state.
+FS-10. Analysis generations are immutable after publication. Write and validate all referenced logical records before atomically replacing the sidecar with an updated `track.json` record selecting the new generation. Readers retain a snapshot reference and therefore see either the old complete generation or the new complete generation. A catalogue update can lag behind; it must never be required to recover authoritative track state.
 
 FS-11. Completed stages in staging MUST carry checksums and input/version identities so an interrupted job can reuse them safely. On restart, validate before reuse. Corrupt or incomplete work is isolated and regenerated without deleting a last-known-good analysis.
 

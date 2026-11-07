@@ -1,0 +1,409 @@
+{
+  "automation_interpolation": "smoothstep_linear_amplitude",
+  "complete": true,
+  "crossover_design": "complementary_one_pole_v1",
+  "crossover_hz": [
+    200.0,
+    2500.0
+  ],
+  "diagnostics": [
+    "f4e8434a-7948-4552-9ded-a2c4e8168184 \u2192 719f644a-8279-4fa0-9098-9f039a0b9634: no accepted beat/meter/time-map candidate; explicit short crossfade fallback",
+    "719f644a-8279-4fa0-9098-9f039a0b9634 \u2192 d8f16b22-9ac5-430e-a036-906daced8b4f: no accepted beat/meter/time-map candidate; explicit short crossfade fallback",
+    "2 directed expansions; beam width 32; costs are unvalidated heuristics; vocal activity unknown"
+  ],
+  "extensions": {},
+  "objective": "order_all",
+  "output": {
+    "channels": 2,
+    "dither": "seeded_tpdf_1_lsb",
+    "encoding": "float32",
+    "sample_rate_hz": 48000
+  },
+  "placements": [
+    {
+      "analysis": {
+        "hash": {
+          "algorithm": "sha256",
+          "digest": "68adc3411972f8f4b55bb4ef1da4271956b67f1678c9c55f3a5d1f3b9ec21888"
+        },
+        "path": "tracks/90/f4e8434a-7948-4552-9ded-a2c4e8168184/analysis/77477fa8-1793-4099-b762-68ae3ffcadfa/manifest.json"
+      },
+      "audio_hash": {
+        "algorithm": "sha256",
+        "digest": "32cd245aeb2e477ccb795cd3cdf9166e0126cd3dea8a6a34d7ee1e0dc2c36fb0"
+      },
+      "audio_revision": 1,
+      "automation": [
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.0,
+          "mute": true,
+          "output_frame": 0
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 1.0701502286087523,
+          "mute": false,
+          "output_frame": 480
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 1.0701502286087523,
+          "mute": false,
+          "output_frame": 864000
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.0,
+          "mute": true,
+          "output_frame": 960000
+        }
+      ],
+      "override_revision": 0,
+      "source_end_frame": 960000,
+      "source_start_frame": 0,
+      "time_map": {
+        "anchors": [
+          {
+            "output_frame": 0,
+            "source_frame": 0
+          },
+          {
+            "output_frame": 960000,
+            "source_frame": 960000
+          }
+        ],
+        "extensions": {},
+        "interpolation": "monotone_cubic",
+        "map_id": "map-f4e8434a-7948-4552-9ded-a2c4e8168184-0",
+        "max_speed_change_per_second": 0.02,
+        "output_sample_rate_hz": 48000,
+        "preserve_pitch": true,
+        "schema_version": 1,
+        "source_sample_rate_hz": 48000,
+        "speed_ratio_limits": [
+          0.94,
+          1.06
+        ]
+      },
+      "track_id": "f4e8434a-7948-4552-9ded-a2c4e8168184"
+    },
+    {
+      "analysis": {
+        "hash": {
+          "algorithm": "sha256",
+          "digest": "70a0523dcdfcc3df59d057c19a7ab20937de535b58334c811187bbdf04ad04bf"
+        },
+        "path": "tracks/65/719f644a-8279-4fa0-9098-9f039a0b9634/analysis/d4a29bd9-b7f8-4c7c-aa94-1824a3b88f7c/manifest.json"
+      },
+      "audio_hash": {
+        "algorithm": "sha256",
+        "digest": "82205b7ab0ae58a3037ba2aa2edb1b87b716e6334892307705f07ec86334efd7"
+      },
+      "audio_revision": 1,
+      "automation": [
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.0,
+          "mute": true,
+          "output_frame": 864000
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.887471949237793,
+          "mute": false,
+          "output_frame": 960000
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.887471949237793,
+          "mute": false,
+          "output_frame": 1728000
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.0,
+          "mute": true,
+          "output_frame": 1824000
+        }
+      ],
+      "override_revision": 0,
+      "source_end_frame": 960000,
+      "source_start_frame": 0,
+      "time_map": {
+        "anchors": [
+          {
+            "output_frame": 864000,
+            "source_frame": 0
+          },
+          {
+            "output_frame": 1824000,
+            "source_frame": 960000
+          }
+        ],
+        "extensions": {},
+        "interpolation": "monotone_cubic",
+        "map_id": "map-719f644a-8279-4fa0-9098-9f039a0b9634-864000",
+        "max_speed_change_per_second": 0.02,
+        "output_sample_rate_hz": 48000,
+        "preserve_pitch": true,
+        "schema_version": 1,
+        "source_sample_rate_hz": 48000,
+        "speed_ratio_limits": [
+          0.94,
+          1.06
+        ]
+      },
+      "track_id": "719f644a-8279-4fa0-9098-9f039a0b9634"
+    },
+    {
+      "analysis": {
+        "hash": {
+          "algorithm": "sha256",
+          "digest": "c5e2b6149d5545033948930a9badd9ce199d3099844c90991aeee677bc65ff25"
+        },
+        "path": "tracks/30/d8f16b22-9ac5-430e-a036-906daced8b4f/analysis/c795231e-c817-4fd2-8e7e-ad78ea18105d/manifest.json"
+      },
+      "audio_hash": {
+        "algorithm": "sha256",
+        "digest": "7afc573424744d764f714c4e80f1d274c0d42f4de4f7a724712a8aebf7ee8af8"
+      },
+      "audio_revision": 1,
+      "automation": [
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.0,
+          "mute": true,
+          "output_frame": 1728000
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 2.0,
+          "mute": false,
+          "output_frame": 1824000
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 2.0,
+          "mute": false,
+          "output_frame": 2687520
+        },
+        {
+          "bands_linear": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "gain_linear": 0.0,
+          "mute": true,
+          "output_frame": 2688000
+        }
+      ],
+      "override_revision": 0,
+      "source_end_frame": 960000,
+      "source_start_frame": 0,
+      "time_map": {
+        "anchors": [
+          {
+            "output_frame": 1728000,
+            "source_frame": 0
+          },
+          {
+            "output_frame": 2688000,
+            "source_frame": 960000
+          }
+        ],
+        "extensions": {},
+        "interpolation": "monotone_cubic",
+        "map_id": "map-d8f16b22-9ac5-430e-a036-906daced8b4f-1728000",
+        "max_speed_change_per_second": 0.02,
+        "output_sample_rate_hz": 48000,
+        "preserve_pitch": true,
+        "schema_version": 1,
+        "source_sample_rate_hz": 48000,
+        "speed_ratio_limits": [
+          0.94,
+          1.06
+        ]
+      },
+      "track_id": "d8f16b22-9ac5-430e-a036-906daced8b4f"
+    }
+  ],
+  "plan_id": "3c003b55-b534-47a8-81b1-ce18355fbdff",
+  "planner_version": "region-beam/1",
+  "policy": {
+    "allow_fallback": true,
+    "beam_width": 32,
+    "config_id": "mixing",
+    "extensions": {},
+    "max_expansions": 100000,
+    "max_speed_change_per_second": 0.02,
+    "max_speed_deviation": 0.06,
+    "min_played_seconds": 5.0,
+    "output_sample_rate_hz": 48000,
+    "overlap_seconds": 8.0,
+    "schema_version": 1,
+    "template": "bass_handoff"
+  },
+  "policy_hash": {
+    "algorithm": "sha256",
+    "digest": "6790904450be9fb09397a00aa2ecc154ba9f51c3c28855f081b8a14747b60512"
+  },
+  "renderer_version": "signalsmith-0.1.3-sinc32-eq1/1",
+  "requested_duration_seconds": null,
+  "schema_version": 1,
+  "seed": 42,
+  "total_output_frames": 2688000,
+  "transitions": [
+    {
+      "costs": {
+        "bass_collision": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.25,
+          "weight": 0.5
+        },
+        "energy_discontinuity": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.02657225882227884,
+          "weight": 1.0
+        },
+        "harmonic_conflict": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.8073557821342299,
+          "weight": 1.0
+        },
+        "phrase_disruption": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.5,
+          "weight": 0.5
+        },
+        "processing_artifacts": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.0,
+          "weight": 1.0
+        },
+        "spectral_crowding": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.5,
+          "weight": 0.5
+        },
+        "timing_groove": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.0,
+          "weight": 2.0
+        },
+        "uncertainty": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 1.0,
+          "weight": 2.0
+        }
+      },
+      "end_output_frame": 960000,
+      "fallback_reason": "no accepted beat/meter/time-map candidate; explicit short crossfade fallback",
+      "from_track_id": "f4e8434a-7948-4552-9ded-a2c4e8168184",
+      "incoming_region_id": "region-0-entry",
+      "outgoing_region_id": "region-1-exit",
+      "start_output_frame": 864000,
+      "template": "short_crossfade",
+      "to_track_id": "719f644a-8279-4fa0-9098-9f039a0b9634",
+      "transition_id": "f4e8434a-7948-4552-9ded-a2c4e8168184-719f644a-8279-4fa0-9098-9f039a0b9634-fade"
+    },
+    {
+      "costs": {
+        "bass_collision": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.25,
+          "weight": 0.5
+        },
+        "energy_discontinuity": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.5396146900516982,
+          "weight": 1.0
+        },
+        "harmonic_conflict": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.9248740001572372,
+          "weight": 1.0
+        },
+        "phrase_disruption": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.5,
+          "weight": 0.5
+        },
+        "processing_artifacts": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.0,
+          "weight": 1.0
+        },
+        "spectral_crowding": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.5,
+          "weight": 0.5
+        },
+        "timing_groove": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 0.0,
+          "weight": 2.0
+        },
+        "uncertainty": {
+          "normalization": "bounded heuristic cost 0..1, uncalibrated; spectral/phrase terms are conservative unknown priors",
+          "value": 1.0,
+          "weight": 2.0
+        }
+      },
+      "end_output_frame": 1824000,
+      "fallback_reason": "no accepted beat/meter/time-map candidate; explicit short crossfade fallback",
+      "from_track_id": "719f644a-8279-4fa0-9098-9f039a0b9634",
+      "incoming_region_id": "region-0-entry",
+      "outgoing_region_id": "region-1-exit",
+      "start_output_frame": 1728000,
+      "template": "short_crossfade",
+      "to_track_id": "d8f16b22-9ac5-430e-a036-906daced8b4f",
+      "transition_id": "719f644a-8279-4fa0-9098-9f039a0b9634-d8f16b22-9ac5-430e-a036-906daced8b4f-fade"
+    }
+  ]
+}

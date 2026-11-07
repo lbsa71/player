@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/types", "crates/catalog", "crates/audio", "crates/analysis", "crates/planner", "crates/cli", "crates/apple"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+mixlib-types = { path = "crates/types" }
+mixlib-audio = { path = "crates/audio" }
+mixlib-catalog = { path = "crates/catalog" }
+mixlib-analysis = { path = "crates/analysis" }
+mixlib-planner = { path = "crates/planner" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.145", features = ["float_roundtrip"] }
+serde-value = "=0.7.0"
+schemars = "=1.0.4"
+jsonschema = { version = "=0.33.0", default-features = false }
+sha2 = "=0.10.9"
+uuid = { version = "=1.18.1", features = ["v4"] }
+chrono = { version = "=0.4.42", default-features = false, features = ["clock"] }
+fs2 = "=0.4.3"
+walkdir = "=2.5.0"
+tempfile = "=3.23.0"
+clap = { version = "=4.5.50", features = ["derive", "env"] }
+ctrlc = "=3.5.1"
+rustfft = "=6.4.1"
+beat-this = { version = "=1.1.0", default-features = false }
+signalsmith-stretch = "=0.1.3"
+
+[profile.release]
+lto = "thin"
+
