@@ -1,3 +1,7 @@
+mod chain;
+mod tactic_analysis;
+mod tactics;
+
 use clap::{Parser, Subcommand};
 use mixlib_catalog::*;
 use mixlib_types::*;
@@ -43,9 +47,19 @@ enum Command {
         )]
         dsp_only: bool,
     },
+    /// Cache full-track stems, vocal phrases and signal evidence for tactic selection.
+    AnalyzeTactics {
+        #[arg(long)]
+        track: Vec<String>,
+        #[arg(long, env = "MIXLIB_SEPARATOR_PYTHON")]
+        separator_python: PathBuf,
+    },
     Inspect {
         #[arg(long)]
         track: Option<String>,
+        /// Include one- to four-bar texture and timing descriptions.
+        #[arg(long, requires = "track")]
+        bars: bool,
     },
     Plan {
         #[arg(long, conflicts_with = "duration")]
@@ -83,19 +97,67 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
-    /// Stretch two short excerpts to a shared tempo and render their beat-matched crossfade.
+    /// Inspect measured eligibility for all mixing tactics, or save a selected schedule.
+    Tactics {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        allow_expressive: bool,
+        #[arg(long, value_parser=parse_tactic, requires="apply")]
+        tactic: Option<TacticId>,
+    },
+    /// Choose cues and mixing tactics for two to eight tracks, then render a combined WAV.
     Stitch {
+        /// Choose and order four tracks from the analyzed library.
+        #[arg(long, conflicts_with_all = ["from", "to", "then", "overlap_beats", "beat_return_near", "drum_lead_bars"])]
+        pick_four: bool,
+        /// Choose and order eight tracks from the analyzed library.
+        #[arg(long, conflicts_with_all = ["pick_four", "from", "to", "then", "overlap_beats", "beat_return_near", "drum_lead_bars"])]
+        pick_eight: bool,
+        #[arg(long, required_unless_present_any = ["pick_four", "pick_eight"])]
+        from: Option<String>,
+        #[arg(long, required_unless_present_any = ["pick_four", "pick_eight"])]
+        to: Option<String>,
+        /// Add another track after --to. Repeat for up to eight tracks.
+        #[arg(long, conflicts_with_all = ["overlap_beats", "beat_return_near", "drum_lead_bars"])]
+        then: Vec<String>,
+        /// Require a three-band exchange at this numbered join. Repeat to select more joins.
+        #[arg(long, requires = "then")]
+        band_join: Vec<usize>,
         #[arg(long)]
-        from: String,
+        overlap_beats: Option<usize>,
         #[arg(long)]
-        to: String,
-        #[arg(long, default_value_t = 8)]
-        overlap_beats: usize,
-        #[arg(long, default_value_t = 8)]
-        context_beats: usize,
+        context_beats: Option<usize>,
         /// Maximum fractional speed change per recording (e.g. 0.10 for 10%).
         #[arg(long)]
         max_stretch: Option<f64>,
+        /// Permit expressive transitions when their measured constraints pass.
+        #[arg(long)]
+        allow_expressive: bool,
+        /// Lead with this many bars of separated drums during a quiet outgoing passage.
+        #[arg(long, requires = "separator_python")]
+        drum_lead_bars: Option<usize>,
+        /// Find a returning beat near this outgoing source time, then cut at the next bar.
+        #[arg(long, requires = "separator_python", conflicts_with = "drum_lead_bars")]
+        beat_return_near: Option<f64>,
+        /// Use an incoming downbeat near this source time for the full-mix cut.
+        #[arg(long, requires = "beat_return_near")]
+        incoming_cut_near: Option<f64>,
+        /// Keep outgoing non-drum layers through this source time, then fade over one beat.
+        #[arg(long, requires = "beat_return_near")]
+        vocal_tail_until: Option<f64>,
+        /// Stage the accompaniment over four bars and detect a gap for the vocal handoff.
+        #[arg(
+            long,
+            requires = "beat_return_near",
+            conflicts_with = "vocal_tail_until"
+        )]
+        auto_vocal_handoff: bool,
+        /// Python environment for local stem, vocal-phrase and tactic analysis.
+        #[arg(long, env = "MIXLIB_SEPARATOR_PYTHON")]
+        separator_python: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -139,6 +201,10 @@ fn parse_duration(s: &str) -> std::result::Result<f64, String> {
     } else {
         Err("duration must be positive and finite".into())
     }
+}
+fn parse_tactic(s: &str) -> std::result::Result<TacticId, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_ascii_uppercase()))
+        .map_err(|_| "unknown tactic ID; see MIXING_TACTICS.md".into())
 }
 fn main() {
     let args = Args::parse();
@@ -205,8 +271,10 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
         args.command,
         Command::Scan { .. }
             | Command::Analyze { .. }
+            | Command::AnalyzeTactics { .. }
             | Command::Plan { .. }
             | Command::Stitch { .. }
+            | Command::Tactics { apply: true, .. }
             | Command::RebuildCatalog
             | Command::FuseSidecars
             | Command::Correct { .. }
@@ -243,7 +311,16 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
         } => serde_json::to_value(mixlib_analysis::analyze_selected(
             &store, *resume, *dsp_only, track, cancel,
         )?)?,
-        Command::Inspect { track } => {
+        Command::AnalyzeTactics {
+            track,
+            separator_python,
+        } => serde_json::to_value(tactic_analysis::ensure_tactic_analysis(
+            &store,
+            track,
+            separator_python,
+            cancel,
+        )?)?,
+        Command::Inspect { track, bars } => {
             if let Some(id) = track {
                 let t = store.track(id)?;
                 let analysis = t
@@ -258,7 +335,21 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                     .transpose()?;
                 let overrides = store.overrides(&t)?;
                 let recording = store.recording_metadata(&t)?;
-                serde_json::json!({"track":t,"recording":recording,"analysis":analysis,"regions":regions,"overrides":overrides})
+                let mut result = serde_json::json!({"track":t,"recording":recording,"analysis":analysis,"regions":regions,"overrides":overrides});
+                if *bars {
+                    result["segments"] = analysis
+                        .as_ref()
+                        .and_then(|a| a.artifacts.get("segments"))
+                        .map(|reference| store.read_ref::<SegmentAnalysis>(reference))
+                        .transpose()?
+                        .map(serde_json::to_value)
+                        .transpose()?
+                        .unwrap_or(serde_json::Value::Null);
+                    result["bar_tiles"] = serde_json::to_value(
+                        mixlib_planner::describe_bar_tiles(&store, t, cancel)?,
+                    )?;
+                }
+                result
             } else {
                 serde_json::to_value(store.tracks()?)?
             }
@@ -290,6 +381,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                 cancel,
             )?;
             p.output.encoding = encoding.clone();
+            tactics::automatic(&store, &mut p, cancel)?;
             store.write(&format!("plans/{}.json", p.plan_id), &p)?;
             serde_json::to_value(p)?
         }
@@ -305,12 +397,46 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             store.report(&r)?;
             serde_json::to_value(r)?
         }
+        Command::Tactics {
+            plan,
+            apply,
+            allow_expressive,
+            tactic,
+        } => {
+            let mut proposed = load_plan(&store, plan)?;
+            if *apply {
+                proposed.plan_id = id();
+            }
+            let result = tactics::select(
+                &store,
+                &mut proposed,
+                *apply,
+                *allow_expressive,
+                *tactic,
+                cancel,
+            )?;
+            if *apply {
+                store.write(&format!("plans/{}.json", proposed.plan_id), &proposed)?;
+            }
+            serde_json::json!({"plan_id":proposed.plan_id,"result":result})
+        }
         Command::Stitch {
+            pick_four,
+            pick_eight,
             from,
             to,
+            then,
+            band_join,
             overlap_beats,
             context_beats,
             max_stretch,
+            allow_expressive,
+            drum_lead_bars,
+            beat_return_near,
+            incoming_cut_near,
+            vocal_tail_until,
+            auto_vocal_handoff,
+            separator_python,
             output,
             overwrite,
         } => {
@@ -319,22 +445,192 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             if let Some(limit) = max_stretch {
                 policy.max_speed_deviation = *limit;
             }
-            let plan = mixlib_planner::stitch(
-                &store,
-                &mixlib_planner::StitchRequest {
-                    from,
-                    to,
-                    overlap_beats: *overlap_beats,
-                    context_beats: *context_beats,
-                },
-                &policy,
-                cancel,
-            )?;
-            let sources = verify_plan(&store, &plan, cancel)?;
-            let report = mixlib_audio::render(&plan, &sources, output, *overwrite, None, cancel)?;
-            store.write(&format!("plans/{}.json", plan.plan_id), &plan)?;
-            store.report(&report)?;
-            serde_json::json!({"output": output, "plan": plan, "report": report})
+            if *allow_expressive {
+                policy
+                    .header
+                    .extensions
+                    .insert("allow_expressive_tactics".into(), serde_json::json!(true));
+            }
+            if *pick_four || *pick_eight {
+                let count = if *pick_eight { 8 } else { 4 };
+                let plan = chain::pick_chain(
+                    &store,
+                    &policy,
+                    context_beats.unwrap_or(12),
+                    count,
+                    separator_python.as_deref(),
+                    max_stretch.is_none(),
+                    cancel,
+                )?;
+                return render_stitch(&store, plan, output, *overwrite, cancel);
+            }
+            let from = from.as_ref().expect("from required for explicit stitch");
+            let to = to.as_ref().expect("to required for explicit stitch");
+            if !then.is_empty() {
+                let tracks: Vec<_> = [from.as_str(), to.as_str()]
+                    .into_iter()
+                    .chain(then.iter().map(String::as_str))
+                    .collect();
+                let plan = chain::stitch_chain(
+                    &store,
+                    &tracks,
+                    &policy,
+                    context_beats.unwrap_or(12),
+                    separator_python.as_deref(),
+                    max_stretch.is_none(),
+                    band_join,
+                    cancel,
+                )?;
+                return render_stitch(&store, plan, output, *overwrite, cancel);
+            }
+            let automatic_python = separator_python.as_deref().filter(|_| {
+                beat_return_near.is_none() && drum_lead_bars.is_none() && overlap_beats.is_none()
+            });
+            let request = mixlib_planner::StitchRequest {
+                from,
+                to,
+                overlap_beats: overlap_beats.unwrap_or(8),
+                context_beats: context_beats.unwrap_or(if automatic_python.is_some() {
+                    12
+                } else {
+                    8
+                }),
+                outgoing_after_frame: 0,
+            };
+            let (mut plan, handoff) = match (beat_return_near, drum_lead_bars) {
+                (Some(near), _) => {
+                    let (plan, handoff) = mixlib_planner::beat_return_stitch(
+                        &store,
+                        &request,
+                        &policy,
+                        mixlib_planner::BeatReturnCue {
+                            outgoing_near: *near,
+                            incoming_cut_near: *incoming_cut_near,
+                            vocal_tail_until: *vocal_tail_until,
+                            auto_vocal_handoff: *auto_vocal_handoff,
+                        },
+                        cancel,
+                    )?;
+                    (plan, Some(handoff))
+                }
+                (None, Some(bars)) => {
+                    let (plan, handoff) =
+                        mixlib_planner::drum_stitch(&store, &request, &policy, *bars, cancel)?;
+                    (plan, Some(handoff))
+                }
+                (None, None) if automatic_python.is_some() => {
+                    let python = automatic_python.unwrap();
+                    let analysis = tactic_analysis::ensure_tactic_analysis(
+                        &store,
+                        &[from.clone(), to.clone()],
+                        python,
+                        cancel,
+                    )?;
+                    require(
+                        analysis.counts.get("failed").copied().unwrap_or(0) == 0,
+                        "TACTIC_ANALYSIS",
+                        "tactic analysis failed; inspect its saved report",
+                    )?;
+                    let choice = tactics::choose_pair(&store, &request, &policy, None, cancel)?;
+                    let mut plan = if let Some(plan) = choice.selected {
+                        plan
+                    } else {
+                        match chain::try_quiet_linger(
+                            &store, &request, None, &policy, python, cancel,
+                        )? {
+                            Some(plan) => plan,
+                            None => automatic_stitch(
+                                &store,
+                                &request,
+                                &policy,
+                                max_stretch.is_none(),
+                                python,
+                                cancel,
+                            )?,
+                        }
+                    };
+                    plan.header.extensions.insert(
+                        "joint_tactic_search".into(),
+                        serde_json::json!(choice.examined),
+                    );
+                    (plan, None)
+                }
+                (None, None) if overlap_beats.is_none() => {
+                    let choice = tactics::choose_pair(&store, &request, &policy, None, cancel)?;
+                    (
+                        match choice.selected {
+                            Some(plan) => plan,
+                            None => return Err(Error::new("TACTIC_ANALYSIS_REQUIRED",
+                                "automatic stitching requires full tactic analysis; run analyze-tactics or configure MIXLIB_SEPARATOR_PYTHON")),
+                        },
+                        None,
+                    )
+                }
+                (None, None) => (
+                    mixlib_planner::stitch(&store, &request, &policy, cancel)?,
+                    None,
+                ),
+            };
+            let mut sources = verify_plan(&store, &plan, cancel)?;
+            if let (Some(handoff), Some(python)) = (handoff, separator_python) {
+                let swap = beat_return_near.is_some();
+                let intro = if let Some(bars) = handoff.vocal_bars {
+                    prepare_vocal_handoff(
+                        &store,
+                        &mut plan,
+                        [&sources[from], &sources[to]],
+                        &bars,
+                        python,
+                        cancel,
+                    )?
+                } else {
+                    let incoming = prepare_drum_clip(
+                        &store,
+                        &plan,
+                        &sources[to],
+                        if vocal_tail_until.is_some() {
+                            "fade"
+                        } else if swap {
+                            "cut"
+                        } else {
+                            "bands"
+                        },
+                        handoff.source_frame,
+                        python,
+                        cancel,
+                    )?;
+                    let outgoing = if swap {
+                        Some(prepare_drum_clip(
+                            &store,
+                            &plan,
+                            &sources[from],
+                            "remove",
+                            plan.placements[0].time_map.anchors[1].source_frame,
+                            python,
+                            cancel,
+                        )?)
+                    } else {
+                        None
+                    };
+                    DrumIntro {
+                        audio: incoming.audio,
+                        source_offset: incoming.source_offset,
+                        accompaniment_start_frame: handoff.output_frame,
+                        outgoing,
+                    }
+                };
+                for (key, _, audio, _) in intro.assets() {
+                    sources.insert(key.into(), store.path(&audio.path)?);
+                }
+                plan.drum_intro = Some(intro);
+                plan.renderer_version = if swap {
+                    mixlib_audio::DRUM_SWAP_RENDERER
+                } else {
+                    mixlib_audio::DRUM_INTRO_RENDERER
+                }
+                .into();
+            }
+            render_stitch(&store, plan, output, *overwrite, cancel)?
         }
         Command::Preview {
             plan,
@@ -432,6 +728,421 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
     };
     Ok(result)
 }
+fn render_stitch(
+    store: &Store,
+    mut plan: MixPlan,
+    output: &Path,
+    overwrite: bool,
+    cancel: &Cancellation,
+) -> Result<serde_json::Value> {
+    tactics::automatic(store, &mut plan, cancel)?;
+    let sources = verify_plan(store, &plan, cancel)?;
+    let report = mixlib_audio::render(&plan, &sources, output, overwrite, None, cancel)?;
+    store.write(&format!("plans/{}.json", plan.plan_id), &plan)?;
+    store.report(&report)?;
+    Ok(serde_json::json!({"output": output, "plan": plan, "report": report}))
+}
+
+fn prepare_drum_clip(
+    store: &Store,
+    plan: &MixPlan,
+    source: &Path,
+    mode: &str,
+    handoff_frame: u64,
+    python: &Path,
+    cancel: &Cancellation,
+) -> Result<DrumRemoval> {
+    let outgoing = mode == "remove";
+    let incoming = &plan.placements[usize::from(!outgoing)];
+    let bounds = ClipBounds::new(source, incoming)?;
+    let ClipBounds { offset, end, .. } = bounds;
+    let crossfade_end = incoming.time_map.anchors[1].source_frame;
+    let directory = store.directory("stems")?;
+    let temp = tempfile::tempdir_in(directory)?;
+    let prepared = temp.path().join("prepared.wav");
+    let mut command = std::process::Command::new(python);
+    command
+        .arg("-c")
+        .arg(include_str!("../../../scripts/prepare-drum-intro.py"))
+        .arg(source)
+        .arg(&prepared)
+        .arg(mode)
+        .args([offset, end, handoff_frame, crossfade_end].map(|v| v.to_string()));
+    run_separator(&mut command, cancel)?;
+    publish_drum_clip(store, plan, &prepared, bounds, outgoing, cancel)
+}
+
+fn run_separator(command: &mut std::process::Command, cancel: &Cancellation) -> Result<()> {
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| Error::new("DRUM_SEPARATOR", e.to_string()))?;
+    loop {
+        if let Err(error) = cancel.check() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Some(status) = child.try_wait()? {
+            require(
+                status.success(),
+                "DRUM_SEPARATOR",
+                format!("local separation exited with {status}"),
+            )?;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ClipBounds {
+    offset: u64,
+    end: u64,
+    rate: u32,
+}
+
+impl ClipBounds {
+    fn new(source: &Path, placement: &Placement) -> Result<Self> {
+        let wav = mixlib_audio::WavReader::open(source)?;
+        let rate = wav.format.sample_rate_hz;
+        let padding = u64::from(rate) * 2;
+        Ok(Self {
+            offset: placement.source_start_frame.saturating_sub(padding),
+            end: (placement.source_end_frame + padding).min(wav.format.frames),
+            rate,
+        })
+    }
+}
+
+fn publish_drum_clip(
+    store: &Store,
+    plan: &MixPlan,
+    prepared: &Path,
+    bounds: ClipBounds,
+    outgoing: bool,
+    cancel: &Cancellation,
+) -> Result<DrumRemoval> {
+    let ClipBounds { offset, end, rate } = bounds;
+    let mut wav = mixlib_audio::WavReader::open(prepared)?;
+    require(
+        wav.format.sample_rate_hz == rate
+            && wav.format.channels == 2
+            && wav.format.frames == end - offset,
+        "DRUM_INTRO_FORMAT",
+        "prepared excerpt must preserve the source timebase and length",
+    )?;
+    let suffix = if outgoing { "-outgoing" } else { "" };
+    let key = format!("stems/{}{suffix}.wav", plan.plan_id);
+    let hash = wav.hashes(cancel)?.0;
+    let destination = store.path(&key)?;
+    std::fs::File::open(prepared)?.sync_all()?;
+    std::fs::rename(prepared, &destination)?;
+    std::fs::File::open(destination.parent().unwrap())?.sync_all()?;
+    Ok(DrumRemoval {
+        audio: FileRef { path: key, hash },
+        source_offset: offset,
+    })
+}
+
+fn automatic_stitch(
+    store: &Store,
+    request: &mixlib_planner::StitchRequest<'_>,
+    policy: &MixingConfig,
+    use_default_stretch: bool,
+    python: &Path,
+    cancel: &Cancellation,
+) -> Result<MixPlan> {
+    let mut stem_policy = policy.clone();
+    if use_default_stretch {
+        stem_policy.max_speed_deviation = stem_policy.max_speed_deviation.max(0.10);
+    }
+    let candidates = mixlib_planner::automatic_cues(store, request, &stem_policy, cancel)?;
+    let sources = [
+        store.source(&store.track(request.from)?)?,
+        store.source(&store.track(request.to)?)?,
+    ];
+    let mut rejected = 0;
+    for cue in candidates {
+        let (mut plan, handoff) =
+            mixlib_planner::beat_return_stitch(store, request, &stem_policy, cue, cancel)?;
+        match prepare_vocal_handoff(
+            store,
+            &mut plan,
+            [&sources[0], &sources[1]],
+            handoff
+                .vocal_bars
+                .as_deref()
+                .expect("automatic cue has a vocal window"),
+            python,
+            cancel,
+        ) {
+            Ok(intro) => {
+                plan.drum_intro = Some(intro);
+                plan.renderer_version = mixlib_audio::DRUM_SWAP_RENDERER.into();
+                plan.diagnostics.push(format!(
+                    "automatic selection: quiet break and returning drums, stable incoming intro, safe vocal gap; {rejected} candidates rejected"
+                ));
+                return Ok(plan);
+            }
+            Err(error) if error.code == "STITCH_VOCAL_GAP" => rejected += 1,
+            Err(error) => return Err(error),
+        }
+    }
+    require(
+        policy.allow_fallback,
+        "STITCH_AUTO_INFEASIBLE",
+        "no automatic vocal handoff and fallback is disabled",
+    )?;
+    let mut plan = mixlib_planner::stitch(store, request, policy, cancel)?;
+    plan.diagnostics.push(format!(
+        "automatic selection: beat-matched crossfade; no eligible drum and vocal handoff ({rejected} vocal gaps rejected)"
+    ));
+    Ok(plan)
+}
+
+fn prepare_vocal_handoff(
+    store: &Store,
+    plan: &mut MixPlan,
+    sources: [&Path; 2],
+    bars: &[u64],
+    python: &Path,
+    cancel: &Cancellation,
+) -> Result<DrumIntro> {
+    let transition = &plan.transitions[0];
+    let swap = transition.start_output_frame;
+    let rate = f64::from(plan.output.sample_rate_hz);
+    let mut mashup = plan.header.extensions.get("mashup").cloned();
+    let first_vocal_search_bar = mashup
+        .as_ref()
+        .and_then(|metadata| metadata.get("hold_bars"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(4) as usize;
+    require(
+        bars.len() >= 7
+            && first_vocal_search_bar >= 4
+            && first_vocal_search_bar < bars.len() - 1
+            && bars[0] >= swap
+            && bars.windows(2).all(|pair| pair[0] < pair[1]),
+        "STITCH_VOCAL_WINDOW",
+        "invalid vocal handoff bar boundaries",
+    )?;
+    let mut drum_lead_bars = match plan.objective.as_str() {
+        "drum_mashup" => first_vocal_search_bar,
+        "quiet_drum_linger" => 2,
+        _ => 0,
+    };
+    let relative_bars: Vec<_> = bars
+        .iter()
+        .map(|frame| (frame - swap) as f64 / rate)
+        .collect();
+    let overlap_seconds = *relative_bars.last().unwrap();
+    let exit_seconds =
+        relative_bars[first_vocal_search_bar + 1] - relative_bars[first_vocal_search_bar];
+    let bounds = [
+        ClipBounds::new(sources[0], &plan.placements[0])?,
+        ClipBounds::new(sources[1], &plan.placements[1])?,
+    ];
+    let temp = tempfile::tempdir_in(store.directory("stems")?)?;
+    let vocal_provider = if let Some(metadata) = mashup.as_mut() {
+        let manifest: ModelManifest = store.read("models/manifest.json")?;
+        if let Some(model) = manifest
+            .models
+            .iter()
+            .find(|model| model.model_id == "vocal_phrase_whisper")
+        {
+            let model_path = store.path(&model.file.path)?;
+            require(
+                std::fs::metadata(&model_path)?.len() <= 512 * 1024 * 1024,
+                "MODEL_SIZE",
+                "vocal phrase model exceeds 512 MiB",
+            )?;
+            require(
+                hash_bytes(&std::fs::read(&model_path)?) == model.file.hash,
+                "MODEL_CHECKSUM",
+                "vocal phrase model changed",
+            )?;
+            let script = temp.path().join("vocal-phrase-evidence.py");
+            std::fs::write(
+                &script,
+                include_str!("../../../scripts/vocal-phrase-evidence.py"),
+            )?;
+            metadata["exit_policy"] = serde_json::json!("adaptive");
+            Some(serde_json::json!({
+                "script": script, "model_path": model_path,
+                "model_sha256": model.file.hash.digest
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let prepared = [temp.path().join("out.wav"), temp.path().join("in.wav")];
+    let decision = temp.path().join("decision.json");
+    let clips: Vec<_> = (0..2)
+        .map(|i| {
+            let anchors = &plan.placements[i].time_map.anchors;
+            let from = anchors.iter().find(|a| a.output_frame == swap).unwrap();
+            let end = anchors
+                .iter()
+                .find(|a| a.output_frame == transition.end_output_frame)
+                .unwrap();
+            let warp = plan.header.extensions.contains_key("bar_bpm").then(|| {
+                let map = &plan.placements[i].time_map;
+                (swap..end.output_frame)
+                    .step_by(128)
+                    .chain(std::iter::once(end.output_frame))
+                    .map(|output| [map.source_at(output as f64), (output - swap) as f64 / rate])
+                    .collect::<Vec<_>>()
+            });
+            serde_json::json!({
+                "source": sources[i], "prepared": prepared[i], "offset": bounds[i].offset,
+                "end": bounds[i].end, "swap": from.source_frame, "overlap_end": end.source_frame,
+                "warp": warp
+            })
+        })
+        .collect();
+    let input = temp.path().join("request.json");
+    std::fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "bars": relative_bars, "clips": clips, "decision": decision,
+            "drum_lead_bars": drum_lead_bars, "first_vocal_search_bar": first_vocal_search_bar,
+            "mashup": mashup, "vocal_phrase_provider": vocal_provider
+        }))?,
+    )?;
+    run_separator(
+        std::process::Command::new(python)
+            .arg("-c")
+            .arg(include_str!("../../../scripts/prepare-drum-intro.py"))
+            .arg("vocal-handoff")
+            .arg(input),
+        cancel,
+    )?;
+    #[derive(serde::Deserialize)]
+    struct MashupDecision {
+        hold_until: f64,
+        exit_end: f64,
+        #[serde(default)]
+        exit_policy: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum Decision {
+        Found {
+            outgoing_vocals_off: f64,
+            incoming_vocals_on: f64,
+            mashup: Option<MashupDecision>,
+            #[serde(default)]
+            evidence: serde_json::Value,
+            #[serde(default)]
+            tactic_id: Option<String>,
+        },
+        NoGap {
+            reason: String,
+        },
+    }
+    let result: Decision = serde_json::from_slice(&std::fs::read(&decision)?)?;
+    let (off_seconds, on_seconds, mashup_decision, evidence, tactic_id) = match result {
+        Decision::Found {
+            outgoing_vocals_off,
+            incoming_vocals_on,
+            mashup,
+            evidence,
+            tactic_id,
+        } => (
+            outgoing_vocals_off,
+            incoming_vocals_on,
+            mashup,
+            evidence,
+            tactic_id,
+        ),
+        Decision::NoGap { reason } => return Err(Error::new("STITCH_VOCAL_GAP", reason)),
+    };
+    require(
+        off_seconds >= relative_bars[first_vocal_search_bar] + 0.05
+            && on_seconds >= off_seconds + 0.29
+            && on_seconds + 0.08 <= overlap_seconds,
+        "STITCH_VOCAL_WINDOW",
+        "separator returned an invalid vocal handoff",
+    )?;
+    let mut accompaniment_start = bars[drum_lead_bars];
+    if let Some(decision) = mashup_decision {
+        let fixed_two_bar_exit = decision.exit_policy == "six_plus_two";
+        let valid_exit = if fixed_two_bar_exit {
+            relative_bars.len() == 9
+                && (decision.hold_until - relative_bars[6]).abs() < 1e-6
+                && (decision.exit_end - relative_bars[8]).abs() < 1e-6
+                && tactic_id.as_deref() == Some("M01")
+                && evidence.is_object()
+        } else {
+            (decision.hold_until - off_seconds).abs() < 1e-6
+                && decision.exit_end - decision.hold_until <= exit_seconds + 1e-6
+        };
+        require(
+            mashup.is_some()
+                && valid_exit
+                && decision.exit_end > decision.hold_until
+                && decision.exit_end <= overlap_seconds,
+            "STITCH_MASHUP_WINDOW",
+            "separator returned an invalid mashup hold or exit",
+        )?;
+        let metadata = plan.header.extensions.get_mut("mashup").unwrap();
+        metadata["hold_end_output_frame"] =
+            serde_json::json!(swap + (decision.hold_until * rate).round() as u64);
+        metadata["exit_end_output_frame"] =
+            serde_json::json!(swap + (decision.exit_end * rate).round() as u64);
+        metadata["exit_policy"] = serde_json::json!(decision.exit_policy);
+        metadata["exit_bars"] = serde_json::json!(if fixed_two_bar_exit { 2 } else { 1 });
+        accompaniment_start = swap + (decision.hold_until * rate).round() as u64;
+        plan.diagnostics.push(format!(
+            "{first_vocal_search_bar}-bar mashup hold followed by a {}-bar layer exchange with independent vocal gates",
+            if fixed_two_bar_exit { 2 } else { 1 }
+        ));
+    } else if mashup.is_some() {
+        plan.objective = "quiet_drum_linger".into();
+        plan.header.extensions.remove("mashup");
+        drum_lead_bars = 2;
+        accompaniment_start = bars[drum_lead_bars];
+        plan.diagnostics.push(
+            "vocal pocket leaves insufficient room for a brisk mashup exit; use the gradual handoff".into(),
+        );
+    }
+    let off = swap + (off_seconds * rate).round() as u64;
+    let on = swap + (on_seconds * rate).round() as u64;
+    if !evidence.is_null() {
+        plan.header
+            .extensions
+            .insert("stem_evidence".into(), evidence);
+    }
+    if let Some(tactic_id) = tactic_id {
+        plan.header
+            .extensions
+            .insert("prepared_tactic_id".into(), serde_json::json!(tactic_id));
+    }
+    let outgoing = publish_drum_clip(store, plan, &prepared[0], bounds[0], true, cancel)?;
+    let incoming = publish_drum_clip(store, plan, &prepared[1], bounds[1], false, cancel)?;
+    plan.header.extensions.insert(
+        "vocal_handoff".into(),
+        serde_json::json!({
+            "bar_frames": bars, "outgoing_vocals_off": off, "incoming_vocals_on": on,
+            "accompaniment_start_frame": accompaniment_start
+        }),
+    );
+    plan.diagnostics.push(format!(
+        "estimated outgoing vocals end at {:.3}s output; incoming vocal gate opens at {:.3}s output",
+        off as f64 / rate, on as f64 / rate
+    ));
+    Ok(DrumIntro {
+        audio: incoming.audio,
+        source_offset: incoming.source_offset,
+        accompaniment_start_frame: accompaniment_start,
+        outgoing: Some(outgoing),
+    })
+}
+
 fn load_plan(store: &Store, id: &str) -> Result<MixPlan> {
     valid_id(id)?;
     store.read(&format!("plans/{id}.json"))
@@ -506,6 +1217,9 @@ fn schemas(output: &Path) -> Result<()> {
     emit!("analysis-config", AnalysisConfig);
     emit!("mixing-config", MixingConfig);
     emit!("models", ModelManifest);
+    emit!("segments", SegmentAnalysis);
+    emit!("mixing-tactic", TacticPlan);
+    emit!("tactic-analysis", TacticTrackAnalysis);
     std::fs::write(
         output.join("analysis.example.json"),
         encode(&AnalysisConfig::default())?,

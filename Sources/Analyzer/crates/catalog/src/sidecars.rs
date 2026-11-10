@@ -132,7 +132,7 @@ impl Store {
     pub fn sidecar_index(&self) -> Result<SidecarIndex> {
         let path = self.path(INDEX)?;
         if path.exists() {
-            let index: SidecarIndex = read_record(&path)?;
+            let index: SidecarIndex = self.read(INDEX)?;
             for (track, loc) in &index.tracks {
                 if !self.resolve_location(loc)?.exists() {
                     let recovered = self.discover_sidecars()?;
@@ -245,6 +245,7 @@ impl Store {
     }
 
     pub(crate) fn write_sidecar_record(&self, owner: &str, key: &str, bytes: &[u8]) -> Result<()> {
+        require(self.read_cache.is_none(), "READ_SNAPSHOT_WRITE", "metadata snapshot cannot publish sidecar records")?;
         let path = self.sidecar_for_track(owner)?;
         // Directory advisory lock coordinates sidecar writers across library instances,
         // without adding another file alongside every WAV. The recorder writes once,
@@ -275,6 +276,7 @@ impl Store {
     /// Attach a discovered WAV to one canonical bundle. Duplicate audio has one
     /// analysis owner and a lightweight shared_from reference in its own sidecar.
     pub(crate) fn attach_sidecar(&self, track: &Track, location: &SidecarLocation) -> Result<()> {
+        require(self.read_cache.is_none(), "READ_SNAPSHOT_WRITE", "metadata snapshot cannot attach sidecars")?;
         if !self.uses_sidecars()? {
             return Ok(());
         }
@@ -354,6 +356,7 @@ impl Store {
     /// Preserve exact record hashes and saved-plan references when fusing a v1
     /// separate-file library. Publication precedes removal of legacy JSON files.
     pub fn fuse_sidecars(&self) -> Result<Report> {
+        require(self.read_cache.is_none(), "READ_SNAPSHOT_WRITE", "metadata snapshot cannot migrate sidecars")?;
         let mut library: Library = self.read("library.json")?;
         if library.metadata_layout == MetadataLayout::SidecarV1 {
             return self.finish_fusion();

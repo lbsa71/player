@@ -1,4 +1,11 @@
 //! Portable contracts. JSON authority, schema validation and semantic invariants live here.
+mod tactics;
+pub use tactics::*;
+mod segments;
+pub use segments::*;
+mod tactic_analysis;
+pub use tactic_analysis::*;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1133,6 +1140,44 @@ pub struct OutputFormat {
     pub encoding: String,
     pub dither: String,
 }
+/// Prepared incoming excerpt with a drum-only lead and a band handoff.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DrumIntro {
+    pub audio: FileRef,
+    pub source_offset: u64,
+    pub accompaniment_start_frame: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outgoing: Option<DrumRemoval>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DrumRemoval {
+    pub audio: FileRef,
+    pub source_offset: u64,
+}
+
+impl DrumIntro {
+    pub fn assets(&self) -> impl Iterator<Item = (&'static str, usize, &FileRef, u64)> {
+        std::iter::once((DRUM_INTRO_SOURCE, 1, &self.audio, self.source_offset)).chain(
+            self.outgoing
+                .iter()
+                .map(|clip| (DRUM_REMOVAL_SOURCE, 0, &clip.audio, clip.source_offset)),
+        )
+    }
+}
+
+pub const DRUM_INTRO_SOURCE: &str = "@drum-intro";
+pub const DRUM_REMOVAL_SOURCE: &str = "@drum-removal";
+
+/// A prepared excerpt that replaces a bounded range of a placement's source frames.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PreparedPatch {
+    pub placement: usize,
+    pub audio: FileRef,
+    pub source_offset: u64,
+    pub source_end: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct MixPlan {
     #[serde(flatten)]
@@ -1147,6 +1192,10 @@ pub struct MixPlan {
     pub requested_duration_seconds: Option<f64>,
     pub complete: bool,
     pub output: OutputFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drum_intro: Option<DrumIntro>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_patches: Vec<PreparedPatch>,
     pub placements: Vec<Placement>,
     pub transitions: Vec<Transition>,
     pub total_output_frames: u64,
@@ -1155,8 +1204,23 @@ pub struct MixPlan {
     pub automation_interpolation: String,
     pub diagnostics: Vec<String>,
 }
+impl MixPlan {
+    pub fn prepared_assets(&self) -> impl Iterator<Item = (&str, &FileRef)> {
+        self.drum_intro
+            .iter()
+            .flat_map(DrumIntro::assets)
+            .map(|(key, _, audio, _)| (key, audio))
+            .chain(
+                self.prepared_patches
+                    .iter()
+                    .map(|p| (p.audio.path.as_str(), &p.audio)),
+            )
+    }
+}
+
 impl Record for MixPlan {
     fn validate(&self) -> Result<()> {
+        read_tactics(self)?;
         valid_id(&self.plan_id)?;
         self.policy.validate()?;
         require(
@@ -1189,6 +1253,48 @@ impl Record for MixPlan {
             "CROSSOVER",
             "invalid crossover",
         )?;
+        if let Some(intro) = &self.drum_intro {
+            require(
+                self.placements.len() == 2
+                    && self.transitions[0].start_output_frame < intro.accompaniment_start_frame
+                    && match &intro.outgoing {
+                        Some(clip) => {
+                            intro.accompaniment_start_frame <= self.transitions[0].end_output_frame
+                                && clip.source_offset <= self.placements[0].source_start_frame
+                                && clip.audio.path == format!("stems/{}-outgoing.wav", self.plan_id)
+                        }
+                        None => {
+                            intro.accompaniment_start_frame < self.transitions[0].end_output_frame
+                        }
+                    }
+                    && intro.source_offset <= self.placements[1].source_start_frame
+                    && intro.audio.path == format!("stems/{}.wav", self.plan_id),
+                "DRUM_INTRO",
+                "invalid prepared incoming excerpt or handoff bounds",
+            )?;
+        }
+        let mut patch_ends = BTreeMap::new();
+        for patch in &self.prepared_patches {
+            let placement = self.placements.get(patch.placement).ok_or_else(|| {
+                Error::new(
+                    "PLAN_PATCH",
+                    "prepared patch references an unknown placement",
+                )
+            })?;
+            require(
+                self.drum_intro.is_none()
+                    && patch.audio.path.starts_with("stems/")
+                    && patch.source_offset < patch.source_end
+                    && patch.source_offset < placement.source_end_frame
+                    && patch.source_end > placement.source_start_frame
+                    && patch_ends
+                        .get(&patch.placement)
+                        .is_none_or(|end| patch.source_offset >= *end),
+                "PLAN_PATCH",
+                "invalid or overlapping prepared source patch",
+            )?;
+            patch_ends.insert(patch.placement, patch.source_end);
+        }
         let mut ids = BTreeSet::new();
         let mut hashes = BTreeSet::new();
         let mut end = 0;

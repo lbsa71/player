@@ -5,8 +5,22 @@ use mixlib_catalog::{validate_analysis, Store};
 use mixlib_types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod phrase;
 mod stitch;
-pub use stitch::{stitch, StitchRequest};
+mod tactic_cues;
+mod tactics;
+mod tactic_pair_evidence;
+pub use tactics::*;
+mod tactic_evidence;
+pub use tactic_evidence::{candidate_facts,CandidateEvidenceCache};
+mod cached_tactic_evidence;
+pub use cached_tactic_evidence::load_tactic_track_analysis;
+pub use stitch::{
+    automatic_cues, band_stitch, beat_return_stitch, choose_chain_bookends, describe_bar_tiles,
+    drum_stitch, pick_four_tracks, pick_tracks, preferred_band_stitch, quiet_linger_candidates,
+    quiet_linger_stitch, stitch, tactic_stitch_candidates, BeatReturnCue, ChainPick, DrumHandoff, StitchRequest,
+    CHAIN_SOLO_SECONDS,
+};
 
 pub const PLANNER: &str = "region-beam/1";
 #[derive(Clone, Default)]
@@ -731,6 +745,8 @@ pub fn plan(
             encoding: "float32".into(),
             dither: "seeded_tpdf_1_lsb".into(),
         },
+        drum_intro: None,
+        prepared_patches: vec![],
         placements: best.placements,
         transitions: best.transitions,
         total_output_frames: duration,

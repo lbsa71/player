@@ -10,22 +10,53 @@ use std::{
 use tempfile::NamedTempFile;
 
 pub const RENDERER: &str = "signalsmith-0.1.3-sinc32-eq1/1";
+pub const CHAIN_RENDERER: &str = "signalsmith-0.1.3-sinc32-eq1-chain/1";
+pub const DRUM_SWAP_RENDERER: &str = "signalsmith-0.1.3-sinc32-eq1-drum-swap/1";
+pub const DRUM_INTRO_RENDERER: &str = "signalsmith-0.1.3-sinc32-eq1-drum-intro/1";
+pub const TACTIC_RENDERER: &str = "signalsmith-0.1.3-tactic-lanes-fx-edits/1";
 /// Random-access, bounded resampling cache. 32-tap Hann-windowed sinc, explicit anti-alias cutoff.
+pub(crate) struct SourcePatch {
+    offset: u64,
+    end: u64,
+    wav: WavReader,
+}
+
 struct Resampled {
     wav: WavReader,
+    source_offset: u64,
     output_rate: u32,
     start: i64,
     cache: Vec<[f32; 2]>,
+    patches: Vec<SourcePatch>,
 }
 impl Resampled {
     fn at(&mut self, frame: i64) -> Result<[f32; 2]> {
-        if frame < 0 || frame >= self.wav.format.frames as i64 {
+        if frame < self.source_offset as i64
+            || frame >= (self.source_offset + self.wav.format.frames) as i64
+        {
             return Ok([0.; 2]);
         }
         if frame < self.start || frame >= self.start + self.cache.len() as i64 {
-            self.start = frame.saturating_sub(32).max(0);
-            self.wav.seek_frame(self.start as u64)?;
+            self.start = frame.saturating_sub(32).max(self.source_offset as i64);
+            self.wav
+                .seek_frame(self.start as u64 - self.source_offset)?;
             self.cache = self.wav.read_frames(16384)?;
+            let start = self.start as u64;
+            for patch in &mut self.patches {
+                let first = start.max(patch.offset);
+                let last = (start + self.cache.len() as u64).min(patch.end);
+                if first < last {
+                    patch.wav.seek_frame(first - patch.offset)?;
+                    let frames = patch.wav.read_frames((last - first) as usize)?;
+                    require(
+                        frames.len() as u64 == last - first,
+                        "SOURCE_FORMAT",
+                        "prepared patch ended during render",
+                    )?;
+                    self.cache[(first - start) as usize..(last - start) as usize]
+                        .copy_from_slice(&frames);
+                }
+            }
         }
         Ok(self.cache[(frame - self.start) as usize])
     }
@@ -66,7 +97,7 @@ fn sinc(x: f64) -> f64 {
         (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
     }
 }
-struct Voice {
+pub(crate) struct Voice {
     placement: Placement,
     source: Resampled,
     stretch: Option<Stretch>,
@@ -78,21 +109,55 @@ struct Voice {
     upper: [f64; 2],
     alpha: [f64; 2],
     rate: u32,
+    start_output: u64,
 }
 impl Voice {
-    fn new(p: &Placement, path: &Path, rate: u32, crossovers: [f64; 2]) -> Result<Self> {
+    fn new(
+        p: &Placement,
+        path: &Path,
+        rate: u32,
+        crossovers: [f64; 2],
+        patches: Vec<SourcePatch>,
+    ) -> Result<Self> {
+        Self::new_at(
+            p,
+            path,
+            rate,
+            crossovers,
+            patches,
+            0,
+            p.time_map.anchors[0].output_frame,
+            false,
+        )
+    }
+
+    /// Isolated assets retain the original source timebase. Missing samples
+    /// outside the declared capture are zero, never shifted to another cue.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_at(
+        p: &Placement,
+        path: &Path,
+        rate: u32,
+        crossovers: [f64; 2],
+        patches: Vec<SourcePatch>,
+        source_offset: u64,
+        start_output: u64,
+        bounded_asset: bool,
+    ) -> Result<Self> {
         let wav = WavReader::open(path)?;
         require(
             wav.format.sample_rate_hz == p.time_map.source_sample_rate_hz
-                && p.source_end_frame <= wav.format.frames,
+                && (bounded_asset || p.source_end_frame <= wav.format.frames + source_offset),
             "SOURCE_FORMAT",
             "source does not match plan timebase",
         )?;
         let source = Resampled {
             wav,
+            source_offset,
             output_rate: rate,
             start: -1,
             cache: vec![],
+            patches,
         };
         let native = p.time_map.slopes().iter().all(|s| (s - 1.).abs() < 1e-8);
         let stretch = if native {
@@ -112,8 +177,10 @@ impl Voice {
             upper: [0.; 2],
             alpha: crossovers.map(|f| 1. - (-2. * std::f64::consts::PI * f / rate as f64).exp()),
             rate,
+            start_output,
         };
-        v.input_cursor = (p.source_start_frame as f64 / p.time_map.source_sample_rate_hz as f64
+        v.input_cursor = (p.time_map.source_at(start_output as f64)
+            / p.time_map.source_sample_rate_hz as f64
             * rate as f64)
             .round() as i64;
         if let Some(stretch) = v.stretch.as_mut() {
@@ -127,7 +194,7 @@ impl Voice {
     }
     fn fill(&mut self) -> Result<()> {
         let p = &self.placement;
-        let start = p.time_map.anchors[0].output_frame;
+        let start = self.start_output;
         let end = p.time_map.anchors.last().unwrap().output_frame;
         let mut output = vec![0f32; 512];
         if let Some(s) = self.stretch.as_mut() {
@@ -162,15 +229,18 @@ impl Voice {
         self.pending_offset = discard * 2;
         Ok(())
     }
-    fn next(&mut self, frame: u64) -> Result<[f32; 2]> {
+    pub(crate) fn next_raw(&mut self) -> Result<[f32; 2]> {
         while self.pending_offset >= self.pending.len() {
             self.fill()?;
         }
-        let mut sample = [
+        let sample = [
             self.pending[self.pending_offset],
             self.pending[self.pending_offset + 1],
         ];
         self.pending_offset += 2;
+        Ok(sample)
+    }
+    pub(crate) fn automated(&mut self, frame: u64, mut sample: [f32; 2]) -> [f32; 2] {
         let (gain, bands) = automation(&self.placement.automation, frame);
         for (c, sample) in sample.iter_mut().enumerate() {
             let x = *sample as f64;
@@ -181,7 +251,7 @@ impl Voice {
                 + (x - self.upper[c]) * bands[2];
             *sample = (y * gain) as f32;
         }
-        Ok(sample)
+        sample
     }
 }
 pub fn automation(points: &[AutomationPoint], frame: u64) -> (f64, [f64; 3]) {
@@ -255,6 +325,36 @@ impl PeakMeter {
     }
 }
 
+fn verify_drum_intro(
+    plan: &MixPlan,
+    sources: &BTreeMap<String, PathBuf>,
+    cancel: &Cancellation,
+) -> Result<()> {
+    for (key, audio) in plan.prepared_assets() {
+        let path = sources
+            .get(key)
+            .ok_or_else(|| Error::new("DRUM_INTRO_MISSING", &audio.path))?;
+        require(
+            WavReader::open(path)?.hashes(cancel)?.0 == audio.hash,
+            "DRUM_INTRO_CHANGED",
+            &audio.path,
+        )?;
+    }
+    for tactic in read_tactics(plan)? {
+        for asset in tactic.stem_assets {
+            let path = sources
+                .get(&asset.audio.path)
+                .ok_or_else(|| Error::new("TACTIC_STEM", &asset.audio.path))?;
+            require(
+                WavReader::open(path)?.hashes(cancel)?.0 == asset.audio.hash,
+                "TACTIC_STEM_CHANGED",
+                &asset.audio.path,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolving and verifying pinned catalogue/analysis revisions is the caller's responsibility.
 /// Audio hashes are independently verified here before output creation. All outputs are atomic.
 pub fn render(
@@ -266,8 +366,26 @@ pub fn render(
     cancel: &Cancellation,
 ) -> Result<Report> {
     plan.validate()?;
+    let tactics = read_tactics(plan)?;
     require(
-        plan.renderer_version == RENDERER,
+        tactics
+            .iter()
+            .all(|t| t.permission != TacticPermission::EmergencyOnly),
+        "TACTIC_EMERGENCY",
+        "offline export cannot activate a runtime emergency tactic",
+    )?;
+    require(
+        plan.renderer_version
+            == if !tactics.is_empty() {
+                TACTIC_RENDERER
+            } else {
+                match &plan.drum_intro {
+                    Some(intro) if intro.outgoing.is_some() => DRUM_SWAP_RENDERER,
+                    Some(_) => DRUM_INTRO_RENDERER,
+                    None if !plan.prepared_patches.is_empty() => CHAIN_RENDERER,
+                    None => RENDERER,
+                }
+            },
         "RENDERER_VERSION",
         "plan requires another renderer; replan",
     )?;
@@ -310,6 +428,24 @@ pub fn render(
             format!("{} audio changed; replan", p.track_id),
         )?;
     }
+    verify_drum_intro(plan, sources, cancel)?;
+    for (key, _) in plan.prepared_assets().filter(|_| output.exists()) {
+        require(
+            std::fs::canonicalize(output)? != std::fs::canonicalize(&sources[key])?,
+            "SOURCE_OVERWRITE",
+            "render output cannot replace the prepared drum excerpt",
+        )?;
+    }
+    if output.exists() {
+        for asset in tactics.iter().flat_map(|t| &t.stem_assets) {
+            require(
+                std::fs::canonicalize(output)?
+                    != std::fs::canonicalize(&sources[&asset.audio.path])?,
+                "SOURCE_OVERWRITE",
+                "render output cannot replace an isolated stem",
+            )?;
+        }
+    }
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -322,7 +458,7 @@ pub fn render(
         plan.output.encoding.as_str(),
         bytes as u32,
     )?;
-    let mut active: Vec<(usize, Voice)> = vec![];
+    let mut active: Vec<crate::tactic_render::TacticVoice> = vec![];
     let mut next = 0;
     let mut meter = PeakMeter::default();
     let mut rng = plan.seed ^ 0x9e3779b97f4a7c15;
@@ -336,28 +472,61 @@ pub fn render(
             && plan.placements[next].time_map.anchors[0].output_frame <= frame
         {
             let p = &plan.placements[next];
-            active.push((
-                next,
+            let voice = if let Some((key, _, _, offset)) = plan
+                .drum_intro
+                .iter()
+                .flat_map(DrumIntro::assets)
+                .find(|&(_, index, _, _)| index == next)
+            {
+                let mut prepared = p.clone();
+                prepared.source_start_frame -= offset;
+                prepared.source_end_frame -= offset;
+                for anchor in &mut prepared.time_map.anchors {
+                    anchor.source_frame -= offset;
+                }
+                Voice::new(
+                    &prepared,
+                    &sources[key],
+                    plan.output.sample_rate_hz,
+                    plan.crossover_hz,
+                    vec![],
+                )?
+            } else {
+                let mut patches = vec![];
+                for patch in plan
+                    .prepared_patches
+                    .iter()
+                    .filter(|patch| patch.placement == next)
+                {
+                    let wav = WavReader::open(&sources[&patch.audio.path])?;
+                    require(
+                        wav.format.sample_rate_hz == p.time_map.source_sample_rate_hz
+                            && wav.format.frames >= patch.source_end - patch.source_offset,
+                        "SOURCE_FORMAT",
+                        "prepared patch does not match source timebase or bounds",
+                    )?;
+                    patches.push(SourcePatch {
+                        offset: patch.source_offset,
+                        end: patch.source_end,
+                        wav,
+                    });
+                }
                 Voice::new(
                     p,
                     &sources[&p.track_id],
                     plan.output.sample_rate_hz,
                     plan.crossover_hz,
-                )?,
-            ));
+                    patches,
+                )?
+            };
+            active.push(crate::tactic_render::TacticVoice::new(
+                voice, next, plan, &tactics, sources, cancel,
+            )?);
             next += 1;
         }
-        active.retain(|(i, _)| {
-            frame
-                < plan.placements[*i]
-                    .time_map
-                    .anchors
-                    .last()
-                    .unwrap()
-                    .output_frame
-        });
+        active.retain(|voice| frame < voice.end_frame());
         let mut sum = [0f32; 2];
-        for (_, v) in &mut active {
+        for v in &mut active {
             let sample = v.next(frame)?;
             for c in 0..2 {
                 sum[c] += sample[c];
@@ -368,11 +537,17 @@ pub fn render(
             "DSP_NON_FINITE",
             "non-finite render output",
         )?;
+        // Dither belongs to absolute output time, including discarded preview
+        // pre-roll, so a preview is the exact PCM slice of the full export.
+        let dither: [f64; 2] = if plan.output.encoding == "pcm24" {
+            std::array::from_fn(|_| (random(&mut rng) - random(&mut rng)) / 8388608.)
+        } else {
+            [0.; 2]
+        };
         if frame >= first {
             meter.push(sum);
-            for s in sum {
+            for (s, noise) in sum.into_iter().zip(dither) {
                 if plan.output.encoding == "pcm24" {
-                    let noise = (random(&mut rng) - random(&mut rng)) / 8388608.;
                     let v = ((s as f64 + noise) * 8388608.)
                         .round()
                         .clamp(-8388608., 8388607.) as i32;
@@ -409,6 +584,7 @@ pub fn render(
             format!("{} changed during render", p.track_id),
         )?;
     }
+    verify_drum_intro(plan, sources, cancel)?;
     temp.as_file().sync_all()?;
     let check = WavReader::open(temp.path())?;
     require(

@@ -1,0 +1,193 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/HashAlgorithm"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "FileRef": {
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "HashAlgorithm": {
+      "enum": [
+        "sha256"
+      ],
+      "type": "string"
+    },
+    "ModelAsset": {
+      "properties": {
+        "attribution": {
+          "type": "string"
+        },
+        "code_license": {
+          "type": "string"
+        },
+        "file": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "redistribution": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "upstream_url": {
+          "type": "string"
+        },
+        "weight_license": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_id",
+        "file",
+        "upstream_url",
+        "revision",
+        "code_license",
+        "weight_license",
+        "attribution",
+        "redistribution"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "audio_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "audio_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "base_analysis": {
+      "$ref": "#/$defs/FileRef",
+      "description": "Original generation used for analysis, before this supplementary record."
+    },
+    "beat_artifact": {
+      "$ref": "#/$defs/FileRef"
+    },
+    "cache_key": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "component_hashes": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ContentHash"
+      },
+      "default": {},
+      "description": "Script and pipeline hashes allow dependency-specific reuse. Missing on\nthe first implementation; legacy reuse requires its exact aggregate hash.",
+      "type": "object"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "implementation_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "method": {
+      "type": "string"
+    },
+    "models": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelAsset"
+      },
+      "type": "object"
+    },
+    "override_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "signal_evidence": true,
+    "source_frames": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stems": {
+      "additionalProperties": {
+        "$ref": "#/$defs/FileRef"
+      },
+      "description": "All stems retain original frame zero, full length and source sample rate.",
+      "type": "object"
+    },
+    "tactic_analysis_id": {
+      "type": "string"
+    },
+    "track_id": {
+      "type": "string"
+    },
+    "vocal_evidence": true
+  },
+  "required": [
+    "schema_version",
+    "tactic_analysis_id",
+    "track_id",
+    "audio_hash",
+    "audio_revision",
+    "source_sample_rate_hz",
+    "source_frames",
+    "base_analysis",
+    "beat_artifact",
+    "override_revision",
+    "method",
+    "implementation_hash",
+    "cache_key",
+    "models",
+    "stems",
+    "vocal_evidence",
+    "signal_evidence",
+    "limitations",
+    "created_at"
+  ],
+  "title": "TacticTrackAnalysis",
+  "type": "object"
+}

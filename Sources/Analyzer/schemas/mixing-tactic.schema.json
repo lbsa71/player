@@ -1,0 +1,1050 @@
+{
+  "$defs": {
+    "BandGainPoint": {
+      "additionalProperties": false,
+      "properties": {
+        "gains": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "output_frame",
+        "gains"
+      ],
+      "type": "object"
+    },
+    "ContentHash": {
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/HashAlgorithm"
+        },
+        "digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "EffectKind": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cutoff_hz": {
+              "items": {
+                "$ref": "#/$defs/ScalarPoint"
+              },
+              "type": "array"
+            },
+            "mode": {
+              "$ref": "#/$defs/FilterMode"
+            },
+            "resonance": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "filter",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "mode",
+            "cutoff_hz",
+            "resonance"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "delay_frames": {
+              "items": {
+                "$ref": "#/$defs/ScalarPoint"
+              },
+              "type": "array"
+            },
+            "feedback": {
+              "format": "double",
+              "type": "number"
+            },
+            "freeze_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "high_pass_hz": {
+              "format": "double",
+              "type": "number"
+            },
+            "low_pass_hz": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "delay",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "delay_frames",
+            "feedback",
+            "high_pass_hz",
+            "low_pass_hz"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "decay_seconds": {
+              "format": "double",
+              "type": "number"
+            },
+            "freeze_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "high_pass_hz": {
+              "format": "double",
+              "type": "number"
+            },
+            "low_pass_hz": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "reverb",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "decay_seconds",
+            "high_pass_hz",
+            "low_pass_hz"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "duty_cycle": {
+              "format": "double",
+              "type": "number"
+            },
+            "period_frames": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "phase_frames": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "smoothing_frames": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "gate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "period_frames",
+            "phase_frames",
+            "duty_cycle",
+            "smoothing_frames"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "gain": {
+              "format": "double",
+              "type": "number"
+            },
+            "seed": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "noise",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "seed",
+            "gain"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "delay_frames": {
+              "format": "double",
+              "type": "number"
+            },
+            "feedback": {
+              "format": "double",
+              "type": "number"
+            },
+            "pitch_semitones": {
+              "items": {
+                "$ref": "#/$defs/ScalarPoint"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "spiral",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "delay_frames",
+            "feedback",
+            "pitch_semitones"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "EffectSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "input_end_frame": {
+          "description": "Input and dry audio stop here; stored wet audio can continue to end_frame.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/EffectKind"
+        },
+        "lane": {
+          "$ref": "#/$defs/StemLane"
+        },
+        "placement": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wet": {
+          "items": {
+            "$ref": "#/$defs/ScalarPoint"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "placement",
+        "lane",
+        "start_frame",
+        "input_end_frame",
+        "end_frame",
+        "wet",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "EmergencyActivation": {
+      "additionalProperties": false,
+      "properties": {
+        "activated_output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed_condition": {
+          "type": "string"
+        },
+        "healthy_buffer_frames": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "next_source_verified": {
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/EmergencyReason"
+        },
+        "rejected_safe_recoveries": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "reason",
+        "activated_output_frame",
+        "failed_condition",
+        "rejected_safe_recoveries",
+        "next_source_verified",
+        "healthy_buffer_frames"
+      ],
+      "type": "object"
+    },
+    "EmergencyReason": {
+      "enum": [
+        "unexpected_source_loss",
+        "unexpected_decode_failure"
+      ],
+      "type": "string"
+    },
+    "FileRef": {
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "hash"
+      ],
+      "type": "object"
+    },
+    "FilterMode": {
+      "enum": [
+        "high_pass",
+        "low_pass"
+      ],
+      "type": "string"
+    },
+    "HashAlgorithm": {
+      "enum": [
+        "sha256"
+      ],
+      "type": "string"
+    },
+    "LaneSchedule": {
+      "additionalProperties": false,
+      "properties": {
+        "eq": {
+          "description": "Empty means unity. Ordered low/mid/high band gains use the plan crossovers.",
+          "items": {
+            "$ref": "#/$defs/BandGainPoint"
+          },
+          "type": "array"
+        },
+        "gain": {
+          "items": {
+            "$ref": "#/$defs/ScalarPoint"
+          },
+          "type": "array"
+        },
+        "lane": {
+          "$ref": "#/$defs/StemLane"
+        },
+        "placement": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "placement",
+        "lane",
+        "gain"
+      ],
+      "type": "object"
+    },
+    "PitchNote": {
+      "additionalProperties": false,
+      "properties": {
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "gain": {
+          "format": "double",
+          "type": "number"
+        },
+        "semitones": {
+          "format": "double",
+          "type": "number"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_frame",
+        "end_frame",
+        "semitones",
+        "gain"
+      ],
+      "type": "object"
+    },
+    "ScalarPoint": {
+      "additionalProperties": false,
+      "properties": {
+        "output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "value": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "output_frame",
+        "value"
+      ],
+      "type": "object"
+    },
+    "SourceEditKind": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One captured source cycle stretched to period_frames output frames and repeated.",
+          "properties": {
+            "period_frames": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "loop",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "period_frames"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Target output period evaluated at each repetition boundary.",
+          "properties": {
+            "periods": {
+              "items": {
+                "$ref": "#/$defs/ScalarPoint"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "loop_sequence",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "periods"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "reverse",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "slip_reverse",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "initial_speed": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "brake",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "initial_speed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "initial_speed": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "backspin",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "initial_speed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "positions": {
+              "items": {
+                "$ref": "#/$defs/SourcePositionPoint"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "scratch",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "positions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Sample retriggers; resampling changes pitch and sample duration intentionally.",
+          "properties": {
+            "notes": {
+              "items": {
+                "$ref": "#/$defs/PitchNote"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "pitch_sequence",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "notes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SourceEditSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "declick_frames": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/SourceEditKind"
+        },
+        "lane": {
+          "$ref": "#/$defs/StemLane"
+        },
+        "output_end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "placement": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/SourceTransport"
+        }
+      },
+      "required": [
+        "placement",
+        "lane",
+        "source_sample_rate_hz",
+        "source_start_frame",
+        "source_end_frame",
+        "output_start_frame",
+        "output_end_frame",
+        "declick_frames",
+        "transport",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "SourcePositionPoint": {
+      "additionalProperties": false,
+      "properties": {
+        "output_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_frame": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "output_frame",
+        "source_frame"
+      ],
+      "type": "object"
+    },
+    "SourceTransport": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "continue_underlying",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "source_frame": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "resume_at",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "source_frame"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StemAsset": {
+      "additionalProperties": false,
+      "properties": {
+        "audio": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "lane": {
+          "$ref": "#/$defs/StemLane"
+        },
+        "placement": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_offset_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "placement",
+        "lane",
+        "audio",
+        "source_offset_frame",
+        "source_end_frame"
+      ],
+      "type": "object"
+    },
+    "StemLane": {
+      "enum": [
+        "stereo",
+        "drums",
+        "bass",
+        "other",
+        "vocals"
+      ],
+      "type": "string"
+    },
+    "TacticArrangement": {
+      "enum": [
+        "mashup",
+        "blend",
+        "handoff",
+        "bridge",
+        "replacement",
+        "reset"
+      ],
+      "type": "string"
+    },
+    "TacticCharacter": {
+      "enum": [
+        "subtle",
+        "sudden",
+        "abrupt"
+      ],
+      "type": "string"
+    },
+    "TacticId": {
+      "enum": [
+        "M01",
+        "M02",
+        "M03",
+        "M04",
+        "M05",
+        "M06",
+        "S01",
+        "S02",
+        "S03",
+        "S04",
+        "S05",
+        "S06",
+        "S07",
+        "S08",
+        "S09",
+        "S10",
+        "S11",
+        "S12",
+        "D01",
+        "D02",
+        "C01",
+        "C02",
+        "C03",
+        "C04",
+        "C05",
+        "C06",
+        "C07",
+        "C08",
+        "C09",
+        "C10",
+        "C11",
+        "C12",
+        "C13",
+        "C14",
+        "E01",
+        "E02",
+        "E03",
+        "E04"
+      ],
+      "type": "string"
+    },
+    "TacticPermission": {
+      "enum": [
+        "normal",
+        "expressive_opt_in",
+        "emergency_only"
+      ],
+      "type": "string"
+    },
+    "TacticTimingBasis": {
+      "enum": [
+        "bars",
+        "structural",
+        "independent_pulses"
+      ],
+      "type": "string"
+    },
+    "VocalOccupancy": {
+      "additionalProperties": false,
+      "properties": {
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "placement": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "supported_entry": {
+          "type": "boolean"
+        },
+        "supported_exit": {
+          "type": "boolean"
+        },
+        "tail_end_frame": {
+          "description": "Includes intelligible leakage and every effect tail.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "placement",
+        "start_frame",
+        "end_frame",
+        "tail_end_frame",
+        "supported_entry",
+        "supported_exit"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "arrangement": {
+      "$ref": "#/$defs/TacticArrangement"
+    },
+    "bar_bpm": {
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "bar_frames": {
+      "items": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "type": "array"
+    },
+    "character": {
+      "$ref": "#/$defs/TacticCharacter"
+    },
+    "edit_speed_ratio_limits": {
+      "description": "Absolute playback-speed magnitudes for pitch-preserving repeat/reverse edits.",
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "effects": {
+      "items": {
+        "$ref": "#/$defs/EffectSpec"
+      },
+      "type": "array"
+    },
+    "emergency": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EmergencyActivation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "end_frame": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "evidence": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "exit_start_frame": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "hold_end_frame": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "incoming_placement": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "lanes": {
+      "items": {
+        "$ref": "#/$defs/LaneSchedule"
+      },
+      "type": "array"
+    },
+    "modifiers": {
+      "items": {
+        "$ref": "#/$defs/TacticId"
+      },
+      "type": "array"
+    },
+    "outgoing_placement": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "permission": {
+      "$ref": "#/$defs/TacticPermission"
+    },
+    "policy_version": {
+      "type": "string"
+    },
+    "pulse_ratio": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "selection_reason": {
+      "type": "string"
+    },
+    "source_edits": {
+      "items": {
+        "$ref": "#/$defs/SourceEditSpec"
+      },
+      "type": "array"
+    },
+    "start_frame": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stem_assets": {
+      "items": {
+        "$ref": "#/$defs/StemAsset"
+      },
+      "type": "array"
+    },
+    "tactic_id": {
+      "$ref": "#/$defs/TacticId"
+    },
+    "timing_basis": {
+      "$ref": "#/$defs/TacticTimingBasis",
+      "default": "bars"
+    },
+    "vocal_guard_frames": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "vocal_occupancy": {
+      "items": {
+        "$ref": "#/$defs/VocalOccupancy"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "policy_version",
+    "tactic_id",
+    "modifiers",
+    "arrangement",
+    "character",
+    "permission",
+    "outgoing_placement",
+    "incoming_placement",
+    "start_frame",
+    "hold_end_frame",
+    "exit_start_frame",
+    "end_frame",
+    "bar_frames",
+    "lanes",
+    "stem_assets",
+    "effects",
+    "source_edits",
+    "edit_speed_ratio_limits",
+    "vocal_occupancy",
+    "vocal_guard_frames",
+    "evidence",
+    "selection_reason"
+  ],
+  "title": "TacticPlan",
+  "type": "object"
+}

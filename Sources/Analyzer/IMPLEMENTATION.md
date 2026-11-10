@@ -1,8 +1,10 @@
 # mixlib engineering CLI
 
 The Rust CLI now implements the scan → analysis → planning → WAV-render workflow.
-This is an engineering implementation of the first four milestones, **not a
-completed first release**. The product specification remains in [README.md](README.md).
+It also implements the 38-ID mixing-tactic contract, measured cue/tactic
+selection, stem/effect/source-edit rendering, and a separate live recovery API.
+This remains an engineering implementation, **not a completed first release**.
+The product specification remains in [README.md](README.md).
 The release gates and remaining work are listed below so successful synthetic
 tests are not mistaken for musical validation.
 
@@ -71,8 +73,8 @@ metadata writes atomically replace its JSON sidecar. Render outputs must be outs
 It stores an unknown grid and requires visible fallback transitions. It is
 useful for storage/DSP smoke tests; it is **not** a substitute beat detector.
 Subsequent analysis without this flag selects the configured neural backend.
-The core never makes network requests. Python is used only by optional developer
-and model-install helpers, not by the shipped analysis/render executable.
+The Rust core runs locally. Python supports the optional model installer,
+developer helpers, and drum separation workflow.
 
 Planning accepts repeated `--track`, `--start`, `--end`, `--duration 60m`,
 `--no-fallback`, and `--encoding pcm24`. With no duration, every eligible selected
@@ -95,6 +97,188 @@ both excerpts, and rejects pairs whose predicted beat skew exceeds 30 ms.
 `--max-stretch 0.10` allows up to 10% speed change per source for that run.
 The saved mix plan includes the chosen source ranges, speed maps and crossfade.
 
+## Automatic mixing tactics
+
+[MIXING_TACTICS.md](MIXING_TACTICS.md) defines the 38 IDs, A/B conditions and
+musical rules. All IDs have executable contracts, eligibility checks and
+schedules: M01–M06 mashups, S01–S12 blends/bridges, D01–D02 tempo modifiers,
+C01–C14 structural/performance transitions, and E01–E04 runtime recovery.
+Implementation means the planner and renderer can represent and execute an
+admitted schedule. It does **not** mean every tactic has been auditioned,
+every song provides the required evidence, or every numerical threshold has
+been tuned on a representative collection.
+
+Full tactic analysis uses a local Python 3.12 environment. The tested package
+versions are Demucs 4.0.1, PyTorch/torchaudio 2.5.1, NumPy 1.26.4, SciPy 1.15.3,
+SoundFile 0.14.0 and `openai-whisper` 20250625. From the repository root:
+
+```sh
+python3.12 -m venv build/drum-separation-venv
+build/drum-separation-venv/bin/python -m pip install \
+  demucs==4.0.1 torch==2.5.1 torchaudio==2.5.1 numpy==1.26.4 \
+  scipy==1.15.3 soundfile==0.14.0 openai-whisper==20250625
+
+python3 Sources/Analyzer/scripts/install-models.py \
+  --library "$HOME/Library/Application Support/Player/Analyzer"
+python3 Sources/Analyzer/scripts/install-stem-model.py \
+  --library "$HOME/Library/Application Support/Player/Analyzer" \
+  --checkpoint /path/to/955717e8-8726e21a.th
+python3 Sources/Analyzer/scripts/install-vocal-model.py \
+  --library "$HOME/Library/Application Support/Player/Analyzer"
+
+export MIXLIB_SEPARATOR_PYTHON="$PWD/build/drum-separation-venv/bin/python"
+./scripts/mixlib analyze --resume --track FIRST_TRACK_ID --track SECOND_TRACK_ID
+./scripts/mixlib analyze-tactics --track FIRST_TRACK_ID --track SECOND_TRACK_ID
+./scripts/mixlib stitch --from FIRST_TRACK_ID --to SECOND_TRACK_ID \
+  --output ./renders/automatic.wav
+```
+
+The stem installer registers an existing checksum-pinned HTDemucs checkpoint;
+it does not download one. The vocal installer downloads the pinned Whisper
+`small` model. Both record provenance in the library model manifest and use its
+writer lock. Full tactic analysis loads those explicit local files, verifies
+their hashes, and does not silently fetch replacement models. Beat-model setup
+is separate from stem/vocal-model setup. Rendering an already saved plan uses
+its pinned audio assets and does not require Python or model inference.
+
+`analyze-tactics` accepts repeated `--track`; omitting them selects the scanned
+catalogue. It requires ordinary analysis first. `--separator-python PATH` can
+replace the environment variable. Automatic `stitch` with that interpreter
+ensures full tactic analysis for its selected tracks before choosing cues.
+Without an interpreter, existing valid full-track evidence can still be used.
+
+The automatic search enumerates cues and durations together, then evaluates
+concrete schedules against selected-layer harmony, lead/bass/drum ownership,
+headroom, phrase completion, vocal guards, loop seams and effect tails. A poor
+candidate is recorded and skipped. Once full tactic evidence is available,
+failing its constraints cannot silently fall back to an unvalidated legacy
+crossfade. The command reports infeasibility and retains the previous output.
+Automatic `stitch` and chain selection require that evidence; without it they
+request `analyze-tactics` or a configured interpreter. Explicit legacy cue modes
+and older general-planner schedules retain their labelled legacy behavior;
+they do not constitute full tactic admission.
+
+The bounded cue budget preserves short and long durations before admission.
+Each search shares a read-only metadata snapshot and decoded source-evidence
+cache. Cue-specific timing, ownership and pair measurements are still recomputed.
+Before publishing a decision, the engine checks that every metadata file read
+by the snapshot is unchanged; rendering independently verifies pinned source
+and stem content. This reduces repeated sidecar parsing without making stale
+evidence authoritative.
+
+M01 holds the selected mashup for six complete bars and crossfades accompaniment
+from elapsed bar 6 to bar 8. B drums stay steady, A drums stay absent, bass has
+an explicit exchange, and vocal gates follow independent supported phrases
+with at least a 300 ms guard. M02 retains the spacious bed and brisk exit.
+Density and compatibility are measured after choosing the audible lanes; loud
+source files alone do not establish a mashup. Uncertain vocals or separation
+can reject both choices. Local Whisper timing and acoustic support are evidence
+for sung phrases, not a guarantee that the transcription or phrase is correct.
+
+To inspect or apply tactics to a saved plan:
+
+```sh
+./scripts/mixlib tactics --plan PLAN_ID --json
+./scripts/mixlib tactics --plan PLAN_ID --apply --json
+# Request one tactic; this still must pass all eligibility checks:
+./scripts/mixlib tactics --plan PLAN_ID --apply --tactic M01 --json
+# Render the new plan_id returned by --apply:
+./scripts/mixlib render --plan NEW_PLAN_ID --output ./renders/selected.wav
+```
+
+Inspection includes evidence and rejection reasons. `--apply` writes a new
+plan ID; it does not overwrite the original plan or automatically render it.
+A requested tactic is a constraint, not permission to bypass evidence.
+`--allow-expressive` enables the opt-in performance family for `stitch` or
+`tactics`; it never enables emergency recovery during offline synthesis.
+D01 and D02 attach to a primary tactic rather than being standalone `--tactic`
+choices. Legacy prepared stereo handoffs cannot be rescheduled as independent
+stems without their original lane assets.
+
+For a chain, repeat `--then`, or use `--pick-four` / `--pick-eight`:
+
+```sh
+./scripts/mixlib stitch --from FIRST_TRACK_ID --to SECOND_TRACK_ID \
+  --then THIRD_TRACK_ID --then FOURTH_TRACK_ID --output ./renders/chain.wav
+./scripts/mixlib stitch --pick-eight --output ./renders/eight-tracks.wav
+```
+
+Route ranking considers local beat windows, stretch, chroma, energy, remaining
+runway and the next join. Each admitted join retains its own tactic and evidence.
+Middle tracks remain continuous in source time, with a 45-second solo reserve
+between joins and a checked outgoing continuation. Opening and closing cues
+seek an intentional entry and a supported ending. Those are conservative
+planning heuristics, not proof that a whole route is musically complete.
+
+`inspect --track TRACK_ID --bars` exposes one- to four-bar segment roles and
+measurements. Reliable downbeats/meter determine bars; the engine does not
+invent 4/4 for missing rhythm. Separate `unmetered_windows` describe beatless
+recordings and uncovered source spans before/after the reliable grid. They can
+support structural bridges or natural endings without becoming artificial
+bars. D02 requires measured pulse/accent compatibility, not a 2:1 BPM label.
+C14 has an explicit independent-pulse path and separate expressive loop-speed
+limits; it does not enlarge normal D01 stretch limits.
+
+The earlier manual preparation controls remain available: `--drum-lead-bars`,
+`--beat-return-near`, `--incoming-cut-near`, `--vocal-tail-until`,
+`--auto-vocal-handoff`, and chain `--band-join`. They constrain specific existing
+preparation paths. Prepared excerpts and the new full-track stem schedules
+are distinct saved representations; the renderer avoids applying both to the
+same audio. A quiet RMS gap alone does not prove a completed lyric.
+
+## Tactic analysis storage and reuse
+
+The `TacticTrackAnalysis` logical record is stored inside the existing WAV
+sidecar, alongside the immutable analysis generation. It pins source audio
+hash/revision, exact frame count/rate, beat artifact and correction revision,
+model provenance, script/pipeline hashes, four full-length stereo stem refs,
+source-time vocal evidence, and signal descriptors. Stem WAVs live under
+`<library>/stems/tracks/...`, retain original frame zero, and are checksum-pinned.
+There is no additional permanent JSON file per WAV, stem, segment or bar.
+
+Signal records keep canonical per-bar measurements and compact references for
+overlapping aggregates. Evidence includes reconstruction error, separation
+artifact/leakage proxies, local pitch and onset measurements, loop seams,
+structural events, and measured vocal absence/presence. Scores are uncalibrated
+engineering evidence. A quiet estimated vocal lane plus an affirmative provider
+span can establish estimated absence; blank ASR by itself cannot. Unknown or
+contradictory evidence remains unknown and can make a tactic ineligible.
+
+Cache reuse follows component dependencies. A signal-only change reuses verified
+stems and vocal evidence; a phrase-provider/model change can reuse the stems.
+A separator change invalidates both. Source, rate/frame count, beat artifact and
+correction-generation checks remain mandatory. A matching ordinary feature
+refresh retains the exact supplementary reference. Saved plans can use newer
+supplementary evidence only when those pinned identities still match.
+
+Expensive intermediate results stay in a temporary recovery directory until
+publication completes. Failures can resume from verified stems/ASR rather than
+rerun both models. Publication preserves the original base-analysis reference,
+checks immutable asset collisions, atomically updates the active manifest,
+and removes completed staging files. Staging JSON is temporary recovery state,
+not another authoritative per-WAV metadata file.
+
+The persisted logical-record limit remains **8 MiB**, and a fused sidecar is
+bounded at 256 MiB. Staging results have a separate 64 MiB read bound. Selected
+song records have passed these limits; long-form recordings may still exceed
+them. No automatic record sharding or garbage collection is implemented.
+
+## Live recovery boundary
+
+Offline exports reject E01–E04 rather than using effects to hide an infeasible
+join. The separate [`live_recovery`](crates/audio/src/live_recovery.rs) API accepts
+an actual source failure, immutable PCM verified while healthy, and an already
+verified next source. It prefers a prepared continuation or minimal fade;
+E01–E03 additionally require explicit permission and healthy captured material.
+Its audit records the fault, rejected safe recoveries, source digests, actual
+activation, output cursor, bounded motion/tail and completion/cancellation.
+
+`LiveRecoveryRenderer::activate` performs preparation on a control thread;
+`render_into` consumes prepared audio without reopening the failed source.
+Tests exercise the recovery state machine and PCM output. **This API is not
+wired into the existing Swift Player transport**, and is not a claim of a
+complete realtime player or device-lifecycle implementation.
+
 ## Implemented boundaries
 
 | Crate | Responsibility |
@@ -102,8 +286,8 @@ The saved mix plan includes the chosen source ranges, speed maps and crossfade.
 | `mixlib-types` | Shared records, Draft 2020-12 schemas, canonical hashes, diagnostics, cancellation and semantic validation |
 | `mixlib-catalog` | WAV discovery/identity, single-writer publication, references, jobs, corrections and derived summaries |
 | `mixlib-analysis` | Beat This! RTen adapter, streamed decode, spectral/chroma/band features, local tonal hypotheses and regions |
-| `mixlib-planner` | Directed region candidates, stretch/recovery constraints, explicit fallbacks, deterministic bounded beam search |
-| `mixlib-audio` | Bounded WAV decoder, resampling, linked stereo Signalsmith stretching, EQ/gain automation, meter and atomic export |
+| `mixlib-planner` | Region/route and cue/tactic search, measured evidence adapters, lane-specific compatibility, schedules and explicit rejection |
+| `mixlib-audio` | Bounded WAV decode, linked stereo stretching, stems/EQ/effects/source edits, live recovery buffers, peak checks and atomic export |
 | `mixlib-cli` | Commands and macOS playback through `afplay` after rendering |
 | `mixlib-apple` | Worker-thread JSON catalogue C ABI; header in `crates/apple/include` |
 
@@ -162,7 +346,7 @@ cancellation and a measured one-second worker-stop guarantee remain open.
 
 ## Models, DSP and corrections
 
-The installer downloads only two checksum-pinned assets from the published
+The beat-model installer downloads two checksum-pinned assets from the published
 `beat-this-rs` revision: the mel front end and converted `small1` beat model.
 Downloads resume when HTTP range requests are supported, use temporary files,
 and publish only after SHA-256 verification. It takes the same OS writer lock
@@ -219,16 +403,17 @@ notes for this small extension to the specification's directory layout.
 These are incomplete requirements, not optional acceptance criteria that have
 already passed:
 
-- Official-reference beat parity, CASM comparison, half/double-tempo alternatives,
+- Official-reference beat parity, CASM comparison, broader half/double-tempo evaluation,
   retained activation chunks and a representative 50-recording evaluation set.
 - Beat-synchronous harmonic aggregates, calibrated tuning evaluation, richer
-  modal/unknown hypotheses, BS.1770 integrated/short-term loudness, rhythmic
-  density and explicit silence-boundary artifacts. Current gain estimates use
-  RMS and peaks and are labeled accordingly.
-- Candidate scoring of the actually filtered overlap, audio-level refinement,
-  transition caches/coarse indexing and listening-tuned costs. Several current
-  scoring components are explicitly conservative unknown priors. Search has a
-  deterministic work cap but no measured 100-track/30-second guarantee.
+  modal/unknown hypotheses, and BS.1770 integrated/short-term loudness. Stem
+  density, event/absence descriptors and local pulse mapping are implemented
+  heuristics requiring calibration. Current gain estimates use RMS and peaks.
+- Audition-based tuning of measured selected-lane profiles, effects and source
+  edits, broader acoustic refinement, transition indexes and search cost. Tactic
+  profiles now use schedule-specific measurements; the older generic region
+  scorer still contains conservative priors. No measured 100-track/30-second
+  search guarantee is claimed.
 - Fault injection with process kills at every publication boundary and actual
   disk-full testing. Covered tests exercise validation/publication failures,
   interrupted-job state, checkpoint reuse and competing writer processes.
@@ -251,6 +436,12 @@ cd Sources/Analyzer
 cargo test --locked --workspace
 cargo test --locked -p mixlib-planner --test planning variable_grid
 cargo test --locked -p mixlib-audio --test render
+cargo test --locked -p mixlib-planner --test tactic_evidence
+cargo test --locked -p mixlib-analysis --test tactic_retention
+cargo test --locked -p mixlib-audio --test tactic_render
+cargo test --locked -p mixlib-audio --test live_recovery
+# From the repository root, using the configured model environment:
+# "$MIXLIB_SEPARATOR_PYTHON" -m unittest discover -s Sources/Analyzer/scripts -p 'test_*.py'
 python3 scripts/demo.py --output ./demo-output
 # Optional real neural inference instead of the default fallback-only demo:
 python3 scripts/demo.py --output ./demo-neural --neural
@@ -262,6 +453,16 @@ analysis, plans, previews and reports remain in the selected output directory.
 Variable-tempo pitch/alignment tests use known synthetic grids rather than
 claiming a synthetic signal is an acoustic recording. Static small fixtures are
 in `tests/fixtures`; example analysis/plan JSON is in `examples/`.
+
+
+Tactic tests cover all 38 contract IDs and every processing family with positive
+and negative fixtures: fixed six-plus-two envelopes, independent vocal gates,
+selected-layer compatibility, native/structural timing, bounded effects and wet
+tails, explicit source edits/pitch sampling, offline emergency refusal and live
+recovery. Storage tests exercise component invalidation, checksum failures,
+checkpoint recovery, pinned-generation retention and immutable hardlinks.
+These establish executable invariants, not listening quality. Only selected
+real recordings are under audit; the broad listening study remains outstanding.
 
 Benchmark commands (run on a fixed reference machine and retain JSON reports):
 

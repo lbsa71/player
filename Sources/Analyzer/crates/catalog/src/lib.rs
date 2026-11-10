@@ -1,5 +1,7 @@
 //! Single-writer JSON catalogue. Readers need no lock and retain immutable references.
 pub mod sidecars;
+mod read_snapshot;
+pub use read_snapshot::ReadSnapshotStats;
 use fs2::FileExt;
 use mixlib_audio::WavReader;
 use mixlib_types::*;
@@ -17,6 +19,7 @@ use walkdir::WalkDir;
 #[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
+    read_cache: Option<std::sync::Arc<read_snapshot::ReadSnapshot>>,
 }
 pub struct Writer {
     file: File,
@@ -30,6 +33,7 @@ impl Store {
     pub fn open(root: &Path) -> Result<Self> {
         let s = Self {
             root: fs::canonicalize(root)?,
+            read_cache: None,
         };
         s.read::<Library>("library.json")?;
         Ok(s)
@@ -50,6 +54,7 @@ impl Store {
         )?;
         let s = Self {
             root: fs::canonicalize(root)?,
+            read_cache: None,
         };
         let _lock = s.lock(false, &Cancellation::default())?;
         require(
@@ -133,6 +138,7 @@ impl Store {
         Ok(out)
     }
     pub fn directory(&self, relative: &str) -> Result<PathBuf> {
+        require(self.read_cache.is_none(), "READ_SNAPSHOT_WRITE", "metadata snapshot cannot create directories or acquire a writer lock")?;
         let p = self.path(relative)?;
         fs::create_dir_all(&p)?;
         Ok(p)
@@ -141,6 +147,7 @@ impl Store {
         validate_value(&serde_json::from_slice(&self.record_bytes(relative)?)?)
     }
     pub fn record_bytes(&self, relative: &str) -> Result<Vec<u8>> {
+        if self.read_cache.is_some() { return self.snapshot_record_bytes(relative); }
         if let Some(owner) = sidecars::record_owner(relative)? {
             if self.uses_sidecars()? {
                 return self.sidecar_record(&owner, relative);
@@ -151,7 +158,8 @@ impl Store {
     pub fn record_exists(&self, relative: &str) -> Result<bool> {
         if let Some(owner) = sidecars::record_owner(relative)? {
             if self.uses_sidecars()? {
-                return match self.sidecar_record(&owner, relative) {
+                let bytes = if self.read_cache.is_some() { self.snapshot_record_bytes(relative) } else { self.sidecar_record(&owner, relative) };
+                return match bytes {
                     Ok(_) => Ok(true),
                     Err(e) if e.code == "RECORD_MISSING" => Ok(false),
                     Err(e) => Err(e),
@@ -174,6 +182,7 @@ impl Store {
         require(hash_bytes(&bytes) == r.hash, "CHECKSUM", &r.path)
     }
     pub fn write<T: Record>(&self, relative: &str, record: &T) -> Result<FileRef> {
+        require(self.read_cache.is_none(), "READ_SNAPSHOT_WRITE", "metadata snapshot is read-only; publish through the live store after verification")?;
         let bytes = encode(record)?;
         if let Some(owner) = sidecars::record_owner(relative)? {
             if self.uses_sidecars()? {
@@ -925,6 +934,12 @@ pub fn validate_analysis(store: &Store, a: &AnalysisManifest) -> Result<()> {
             "regions" => {
                 store.read_ref::<Regions>(r)?;
             }
+            "segments" => {
+                store.read_ref::<SegmentAnalysis>(r)?;
+            }
+            "tactic_analysis" => {
+                store.read_ref::<TacticTrackAnalysis>(r)?;
+            }
             _ => store.verify_ref(r)?,
         }
     }
@@ -966,6 +981,23 @@ pub fn verify_plan(
             &t.track_id,
         )?;
         sources.insert(t.track_id, source);
+    }
+    for (key, audio) in p.prepared_assets() {
+        let path = store.path(&audio.path)?;
+        require(
+            WavReader::open(&path)?.hashes(cancel)?.0 == audio.hash,
+            "DRUM_INTRO_CHANGED",
+            &audio.path,
+        )?;
+        sources.insert(key.into(), path);
+    }
+    for tactic in read_tactics(p)? {
+        for asset in tactic.stem_assets {
+            let path=store.path(&asset.audio.path)?;
+            require(WavReader::open(&path)?.hashes(cancel)?.0==asset.audio.hash,
+                "TACTIC_STEM_CHANGED", &asset.audio.path)?;
+            sources.insert(asset.audio.path, path);
+        }
     }
     Ok(sources)
 }

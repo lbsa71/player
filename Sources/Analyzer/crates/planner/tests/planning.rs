@@ -34,6 +34,12 @@ fn library(seconds: f64) -> (tempfile::TempDir, Store, Vec<Track>) {
 #[test]
 fn deterministic_coverage_duration_fixed_end_and_infeasibility() {
     let (_d, s, tracks) = library(2.);
+    assert_eq!(
+        pick_four_tracks(&s, &MixingConfig::default(), 8, &Cancellation::default())
+            .unwrap_err()
+            .code,
+        "CHAIN_POOL"
+    );
     let mut c = MixingConfig::default();
     c.min_played_seconds = 0.25;
     c.overlap_seconds = 0.25;
@@ -209,8 +215,27 @@ fn variable_grid_blends_pitch_preservation_and_preview_coherence() {
         to: &tracks[1].track_id,
         overlap_beats: 8,
         context_beats: 4,
+        outgoing_after_frame: 0,
     };
     let p = stitch(&s, &request, &c, &Cancellation::default()).unwrap();
+    let options = tactic_stitch_candidates(&s, &request, &c, 24, &Cancellation::default()).unwrap();
+    assert!(
+        options
+            .iter()
+            .any(|p| p.header.extensions["tactic_cue_candidate"]["overlap_beats"] == 32),
+        "the short-fade policy must not remove complete eight-bar mashup alternatives"
+    );
+    for option in &options {
+        option.validate().unwrap();
+        assert!(
+            read_tactics(option).unwrap().is_empty(),
+            "timing skeletons are not admitted tactics"
+        );
+        assert!(option
+            .placements
+            .iter()
+            .all(|p| p.time_map.speed_ratio_limits == [0.94, 1.06]));
+    }
     assert_eq!(p.objective, "beat_stitch");
     assert!(p.placements[0].time_map.slopes().iter().all(|s| *s < 1.));
     assert!(p.placements[1].time_map.slopes().iter().all(|s| *s > 1.));
@@ -224,6 +249,69 @@ fn variable_grid_blends_pitch_preservation_and_preview_coherence() {
         transition.end_output_frame
     );
     assert!((7 * 48000..9 * 48000).contains(&p.total_output_frames));
+    let band_plan = band_stitch(&s, &request, &c, &Cancellation::default()).unwrap();
+    let exchange = &band_plan.transitions[0];
+    assert_eq!(exchange.template, Template::ThreeBandExchange);
+    let quarter =
+        exchange.start_output_frame + (exchange.end_output_frame - exchange.start_output_frame) / 4;
+    let (out_gain, out_bands) =
+        mixlib_audio::automation(&band_plan.placements[0].automation, quarter);
+    let (in_gain, in_bands) =
+        mixlib_audio::automation(&band_plan.placements[1].automation, quarter);
+    assert!(out_gain > 0. && in_gain > 0.);
+    assert_eq!(in_bands[0..2], [0., 0.]);
+    assert!(in_bands[2] > 0.99);
+    for (outgoing, incoming) in out_bands.into_iter().zip(in_bands) {
+        assert!((outgoing + incoming - 1.).abs() < 1e-9);
+    }
+    assert!(
+        preferred_band_stitch(&s, &request, &c, &Cancellation::default())
+            .unwrap()
+            .is_some()
+    );
+    let short_overlap = MixingConfig {
+        overlap_seconds: 4.5,
+        ..c.clone()
+    };
+    assert!(
+        preferred_band_stitch(&s, &request, &short_overlap, &Cancellation::default())
+            .unwrap()
+            .is_none()
+    );
+    assert!(band_stitch(&s, &request, &short_overlap, &Cancellation::default()).is_ok());
+    assert_eq!(
+        drum_stitch(&s, &request, &c, 1, &Cancellation::default())
+            .unwrap_err()
+            .code,
+        "STITCH_INFEASIBLE",
+        "a constant-level passage must not qualify as a quiet lead"
+    );
+    assert_eq!(
+        beat_return_stitch(
+            &s,
+            &request,
+            &c,
+            BeatReturnCue {
+                outgoing_near: 8.,
+                incoming_cut_near: None,
+                vocal_tail_until: None,
+                auto_vocal_handoff: false,
+            },
+            &Cancellation::default()
+        )
+        .unwrap_err()
+        .code,
+        "STITCH_BEAT_RETURN",
+        "a steady low band must not be mistaken for a returning beat"
+    );
+    assert!(automatic_cues(&s, &request, &c, &Cancellation::default())
+        .unwrap()
+        .is_empty());
+    assert!(
+        quiet_linger_stitch(&s, &request, &c, &Cancellation::default())
+            .unwrap()
+            .is_none()
+    );
     c.max_speed_deviation = 0.001;
     assert_eq!(
         stitch(&s, &request, &c, &Cancellation::default())

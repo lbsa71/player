@@ -1,0 +1,219 @@
+{
+  "$defs": {
+    "SegmentTile": {
+      "properties": {
+        "band_occupancy": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "bars": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chroma": {
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 12,
+          "minItems": 12,
+          "type": "array"
+        },
+        "crest_factor_db": {
+          "format": "double",
+          "type": "number"
+        },
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "harmonic_variation": {
+          "format": "double",
+          "type": "number"
+        },
+        "level_variation": {
+          "format": "double",
+          "type": "number"
+        },
+        "local_bpm": {
+          "format": "double",
+          "type": "number"
+        },
+        "onset_rate_hz": {
+          "format": "double",
+          "type": "number"
+        },
+        "peak": {
+          "format": "double",
+          "type": "number"
+        },
+        "pulse_score_min": {
+          "format": "double",
+          "type": "number"
+        },
+        "pulses_per_bar": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rms": {
+          "format": "double",
+          "type": "number"
+        },
+        "roles": {
+          "additionalProperties": {
+            "format": "double",
+            "type": "number"
+          },
+          "description": "Acoustic role evidence, not calibrated probabilities or vocal labels.",
+          "type": "object"
+        },
+        "separation_quality": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vocal_activity": {
+          "description": "These must remain unknown until a suitable analysis provider runs.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "start_frame",
+        "end_frame",
+        "bars",
+        "pulses_per_bar",
+        "pulse_score_min",
+        "local_bpm",
+        "rms",
+        "peak",
+        "crest_factor_db",
+        "band_occupancy",
+        "onset_rate_hz",
+        "chroma",
+        "level_variation",
+        "harmonic_variation",
+        "roles"
+      ],
+      "type": "object"
+    },
+    "StructuralBoundary": {
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "novelty": {
+          "format": "double",
+          "type": "number"
+        },
+        "repeated_support": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "supported_period_bars": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source_frame",
+        "novelty",
+        "repeated_support",
+        "evidence"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "boundaries": {
+      "items": {
+        "$ref": "#/$defs/StructuralBoundary"
+      },
+      "type": "array"
+    },
+    "extensions": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "method": {
+      "type": "string"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "score_semantics": {
+      "type": "string"
+    },
+    "segments_id": {
+      "type": "string"
+    },
+    "source_frames": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source_sample_rate_hz": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "tiles": {
+      "items": {
+        "$ref": "#/$defs/SegmentTile"
+      },
+      "type": "array"
+    },
+    "unavailable": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "segments_id",
+    "source_sample_rate_hz",
+    "source_frames",
+    "method",
+    "score_semantics",
+    "tiles",
+    "boundaries",
+    "unavailable"
+  ],
+  "title": "SegmentAnalysis",
+  "type": "object"
+}

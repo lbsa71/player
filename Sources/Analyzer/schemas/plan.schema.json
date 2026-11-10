@@ -87,6 +87,57 @@
       ],
       "type": "object"
     },
+    "DrumIntro": {
+      "description": "Prepared incoming excerpt with a drum-only lead and a band handoff.",
+      "properties": {
+        "accompaniment_start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "audio": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "outgoing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DrumRemoval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_offset": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "audio",
+        "source_offset",
+        "accompaniment_start_frame"
+      ],
+      "type": "object"
+    },
+    "DrumRemoval": {
+      "properties": {
+        "audio": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "source_offset": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "audio",
+        "source_offset"
+      ],
+      "type": "object"
+    },
     "FileRef": {
       "properties": {
         "hash": {
@@ -259,6 +310,36 @@
       ],
       "type": "object"
     },
+    "PreparedPatch": {
+      "description": "A prepared excerpt that replaces a bounded range of a placement's source frames.",
+      "properties": {
+        "audio": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "placement": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_end": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_offset": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "placement",
+        "audio",
+        "source_offset",
+        "source_end"
+      ],
+      "type": "object"
+    },
     "Template": {
       "enum": [
         "short_crossfade",
@@ -416,6 +497,16 @@
       },
       "type": "array"
     },
+    "drum_intro": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DrumIntro"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "extensions": {
       "additionalProperties": true,
       "default": {},
@@ -444,6 +535,12 @@
     },
     "policy_hash": {
       "$ref": "#/$defs/ContentHash"
+    },
+    "prepared_patches": {
+      "items": {
+        "$ref": "#/$defs/PreparedPatch"
+      },
+      "type": "array"
     },
     "renderer_version": {
       "type": "string"

@@ -1,6 +1,8 @@
 Implementation entry point: [CLI build, usage, tested behavior and remaining release gates](IMPLEMENTATION.md).
 The specification below remains the acceptance contract; the engineering CLI does not yet satisfy every release gate.
 
+Transition selection contract: [Mixing tactics, A/B eligibility rules, timing and research](MIXING_TACTICS.md).
+
 Build a local music player that analyses a folder of WAV files, selects a suitable play order, and automatically performs reasonably smooth transitions. The application should retain the expressive timing of acoustic recordings while supporting music with a steady pulse. Its scope is playlist selection and automated mixing, with a small interface for reviewing and correcting results.
 
 The system has two computational passes: an incremental library analyser and a mix planner. A separate renderer executes the resulting plan for previews, continuous playback or WAV export. Rust owns the reusable core. macOS is the first delivery platform; the architecture must allow a later iOS client.

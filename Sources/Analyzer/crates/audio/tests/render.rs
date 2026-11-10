@@ -26,6 +26,8 @@ fn plan(path: &std::path::Path, speed: f64, gain: f64) -> MixPlan {
             encoding: "float32".into(),
             dither: "seeded_tpdf_1_lsb".into(),
         },
+        drum_intro: None,
+        prepared_patches: vec![],
         placements: vec![Placement {
             track_id: "track".into(),
             audio_hash: audio,

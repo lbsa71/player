@@ -17,6 +17,12 @@ fn resumes_valid_stage_and_invalidates_only_dependencies() {
     analyze(&s, true, true, &Cancellation::default()).unwrap();
     let t = s.tracks().unwrap().remove(0);
     let old = s.analysis(&t).unwrap();
+    let segments: SegmentAnalysis = s.read_ref(&old.artifacts["segments"]).unwrap();
+    assert!(
+        segments.tiles.is_empty(),
+        "disabled rhythm must not fabricate bar evidence"
+    );
+    assert!(segments.unavailable.contains(&"reliable_bar_grid".into()));
     let old_ref = t.active_analysis.clone().unwrap();
     config.low_crossover_hz = 250.;
     s.write("config/analysis.json", &config).unwrap();

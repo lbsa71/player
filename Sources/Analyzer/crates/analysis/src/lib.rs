@@ -1,4 +1,7 @@
 //! Versioned analysis stages. Missing rhythm evidence stays unknown; it never becomes a fixed grid.
+mod segments;
+pub use segments::{analyze_segments, SEGMENTS};
+
 use mixlib_audio::WavReader;
 use mixlib_catalog::{fingerprint, rebuild_catalog, shard, validate_analysis, Store};
 use mixlib_types::*;
@@ -609,7 +612,15 @@ pub fn analyze_selected(
     let model_identity = if matches!(config.beat_backend, BeatBackend::Unavailable) {
         serde_json::json!("unavailable/1")
     } else {
-        serde_json::json!({"backend":RHYTHM,"models":manifest.models.iter().map(|m|(&m.model_id,&m.file.hash)).collect::<Vec<_>>()})
+        // A vocal or separation model cannot invalidate neural beat analysis.
+        // Only the two assets actually consumed by this stage belong in its key.
+        let assets: BTreeMap<_, _> = manifest
+            .models
+            .iter()
+            .filter(|m| matches!(m.model_id.as_str(), "mel_spectrogram" | "beat_this"))
+            .map(|m| (&m.model_id, &m.file.hash))
+            .collect();
+        serde_json::json!({"backend":RHYTHM,"models":assets})
     };
     let mut backend: Option<Box<dyn RhythmAnalyzer>> = None;
     let mut report = Report::new("analyze");
@@ -622,10 +633,32 @@ pub fn analyze_selected(
         let rhythm_key = canonical_hash(
             &serde_json::json!({"audio":track.audio_hash,"rhythm":model_identity,"version":RHYTHM}),
         )?;
+        // Migrate verified legacy keys without repeating inference. Each
+        // candidate still includes the current rhythm asset hashes; only
+        // unrelated assets from the old whole-manifest key are varied.
+        let mut legacy_rhythm_keys = Vec::new();
+        if !matches!(config.beat_backend, BeatBackend::Unavailable) {
+            for extra in ["", "vocal_phrase_whisper", "*"] {
+                let models: Vec<_> = manifest
+                    .models
+                    .iter()
+                    .filter(|m| {
+                        matches!(m.model_id.as_str(), "mel_spectrogram" | "beat_this")
+                            || m.model_id == extra
+                            || extra == "*"
+                    })
+                    .map(|m| (&m.model_id, &m.file.hash))
+                    .collect();
+                let identity = serde_json::json!({"backend":RHYTHM,"models":models});
+                legacy_rhythm_keys.push(canonical_hash(&serde_json::json!({
+                    "audio":track.audio_hash,"rhythm":identity,"version":RHYTHM
+                }))?);
+            }
+        }
         let features_key = canonical_hash(
             &serde_json::json!({"audio":track.audio_hash,"version":FEATURES,"hop_ms":config.feature_hop_ms,"crossovers":[config.low_crossover_hz,config.high_crossover_hz],"harmony":"krumhansl-multiscale/1"}),
         )?;
-        let effective = canonical_hash(&(&rhythm_key, &features_key, STRUCTURE))?;
+        let effective = canonical_hash(&(&rhythm_key, &features_key, STRUCTURE, SEGMENTS))?;
         let current = track
             .active_analysis
             .as_ref()
@@ -698,10 +731,17 @@ pub fn analyze_selected(
             let reusable = |name: &str, key: &ContentHash| -> Option<Stage> {
                 old.and_then(|a| a.stages.get(name))
                     .filter(|s| {
-                        &s.input_hash == key
+                        (&s.input_hash == key
+                            || (name == "rhythm"
+                                && s.implementation == RHYTHM
+                                && legacy_rhythm_keys.contains(&s.input_hash)))
                             && s.artifacts.values().all(|r| store.verify_ref(r).is_ok())
                     })
                     .cloned()
+                    .map(|mut stage| {
+                        stage.input_hash = key.clone();
+                        stage
+                    })
             };
             if let Some(stage) = reusable("features", &features_key) {
                 analysis.peak = old.unwrap().peak;
@@ -828,6 +868,24 @@ pub fn analyze_selected(
                     },
                 );
             }
+            let segments_key = canonical_hash(&(&beats_ref.hash, &features_key, SEGMENTS))?;
+            if let Some(stage) = reusable("segments", &segments_key) {
+                analysis.stages.insert("segments".into(), stage);
+                report.count("reused_segment_stages");
+            } else {
+                cancel.check()?;
+                let segments = analyze_segments(&beats, &features, &track.format)?;
+                let reference = store.write(&format!("{prefix}/segments.json"), &segments)?;
+                analysis.stages.insert(
+                    "segments".into(),
+                    Stage {
+                        implementation: SEGMENTS.into(),
+                        input_hash: segments_key,
+                        artifacts: BTreeMap::from([("segments".into(), reference)]),
+                        dependencies: vec!["rhythm".into(), "features".into()],
+                    },
+                );
+            }
             analysis.artifacts = BTreeMap::from([
                 ("beats".into(), beats_ref),
                 ("harmony".into(), harmony_ref),
@@ -835,7 +893,36 @@ pub fn analyze_selected(
                     "regions".into(),
                     analysis.stages["regions"].artifacts["regions"].clone(),
                 ),
+                (
+                    "segments".into(),
+                    analysis.stages["segments"].artifacts["segments"].clone(),
+                ),
             ]);
+            // Feature refreshes and cache-key migrations must not discard
+            // expensive source-aligned stems whose actual dependencies match.
+            if let Some(previous) = current.as_ref() {
+                if let Some(reference) = previous.artifacts.get("tactic_analysis") {
+                    let supplemental: TacticTrackAnalysis = store.read_ref(reference)?;
+                    if supplemental.track_id == track.track_id
+                        && supplemental.source_sample_rate_hz == track.format.sample_rate_hz
+                        && supplemental.source_frames == track.format.frames
+                        && supplemental.audio_hash == track.audio_hash
+                        && supplemental.audio_revision == track.audio_revision
+                        && supplemental.override_revision == track.override_revision
+                        && supplemental.beat_artifact.hash == analysis.artifacts["beats"].hash
+                    {
+                        analysis
+                            .artifacts
+                            .insert("tactic_analysis".into(), reference.clone());
+                        if let Some(stage) = previous.stages.get("tactic_analysis") {
+                            analysis
+                                .stages
+                                .insert("tactic_analysis".into(), stage.clone());
+                        }
+                        report.count("retained_tactic_analysis");
+                    }
+                }
+            }
             analysis.quality_flags.sort();
             analysis.quality_flags.dedup();
             store.write(&checkpoint_path, &analysis)?;
