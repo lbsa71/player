@@ -130,7 +130,9 @@ fn passages(
 #[derive(Clone, Copy)]
 enum StitchStyle {
     Basic,
-    Bands,
+    Bands {
+        require_space: bool,
+    },
     QuietLinger {
         outgoing: u64,
         incoming: u64,
@@ -640,10 +642,8 @@ fn distribute_tactic_durations(choices: Vec<TacticCueChoice>) -> Vec<TacticCueCh
     // Preserve ranking within each duration, but give every evidenced duration
     // a turn before taking another short candidate. A global cost truncation
     // otherwise discards the long windows before tactic admission can see them.
-    let mut durations = std::collections::BTreeMap::<
-        usize,
-        std::collections::VecDeque<TacticCueChoice>,
-    >::new();
+    let mut durations =
+        std::collections::BTreeMap::<usize, std::collections::VecDeque<TacticCueChoice>>::new();
     for choice in choices {
         durations.entry(choice.0).or_default().push_back(choice);
     }
@@ -755,7 +755,7 @@ pub fn band_stitch(
     policy: &MixingConfig,
     cancel: &Cancellation,
 ) -> Result<MixPlan> {
-    find_band_stitch(store, request, policy, &[16, 12, 8], cancel)?.ok_or_else(|| {
+    find_band_stitch(store, request, policy, &[16, 12, 8], false, cancel)?.ok_or_else(|| {
         Error::new(
             "STITCH_INFEASIBLE",
             "no aligned eight-beat or longer band exchange",
@@ -770,7 +770,7 @@ pub fn preferred_band_stitch(
     policy: &MixingConfig,
     cancel: &Cancellation,
 ) -> Result<Option<MixPlan>> {
-    find_band_stitch(store, request, policy, &[16, 12], cancel)
+    find_band_stitch(store, request, policy, &[16, 12], true, cancel)
 }
 
 fn find_band_stitch(
@@ -778,6 +778,7 @@ fn find_band_stitch(
     request: &StitchRequest<'_>,
     policy: &MixingConfig,
     lengths: &[usize],
+    require_space: bool,
     cancel: &Cancellation,
 ) -> Result<Option<MixPlan>> {
     for &overlap_beats in lengths {
@@ -791,7 +792,7 @@ fn find_band_stitch(
             policy,
             None,
             None,
-            StitchStyle::Bands,
+            StitchStyle::Bands { require_space },
             cancel,
         ) {
             Ok((plan, _)) => return Ok(Some(plan)),
@@ -962,6 +963,13 @@ impl ReturnFeatures {
     fn rms(&self, start: u64, end: u64) -> f64 {
         let frames = self.between(start, end);
         (frames.iter().map(|f| f.rms * f.rms).sum::<f64>() / frames.len().max(1) as f64).sqrt()
+    }
+
+    fn low_band_share(&self, start: u64, end: u64) -> Option<f64> {
+        let frames = self.between(start, end);
+        let low = frames.iter().map(|f| f.band_energy[0]).sum::<f64>();
+        let total = frames.iter().flat_map(|f| f.band_energy).sum::<f64>();
+        (total > 1e-12).then(|| low / total)
     }
 }
 
@@ -1683,12 +1691,14 @@ pub fn pick_tracks(
         tracks: Vec<usize>,
         entry_end: u64,
         score: f64,
+        worst_join: f64,
     }
     let mut routes: Vec<_> = (0..count)
         .map(|i| Route {
             tracks: vec![i],
             entry_end: 0,
             score: 0.,
+            worst_join: f64::NEG_INFINITY,
         })
         .collect();
     for _ in 1..track_count {
@@ -1717,11 +1727,16 @@ pub fn pick_tracks(
                         tracks,
                         entry_end: edge.entry_end,
                         score: route.score + edge.score,
+                        worst_join: route.worst_join.max(edge.score),
                     });
                 }
             }
         }
-        next.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.tracks.cmp(&b.tracks)));
+        next.sort_by(|a, b| {
+            (a.score + 0.75 * a.worst_join)
+                .total_cmp(&(b.score + 0.75 * b.worst_join))
+                .then(a.tracks.cmp(&b.tracks))
+        });
         next.truncate(policy.beam_width);
         routes = next;
     }
@@ -1901,7 +1916,13 @@ fn build_stitch(
         "STITCH_EXCLUDED",
         "a correction excludes this transition",
     )?;
-    let bands = matches!(style, StitchStyle::Bands);
+    let bands = matches!(style, StitchStyle::Bands { .. });
+    let require_band_space = matches!(
+        style,
+        StitchStyle::Bands {
+            require_space: true
+        }
+    );
     let linger = matches!(style, StitchStyle::QuietLinger { .. });
     let beat_return = if let StitchStyle::QuietLinger { outgoing, .. } = style {
         Some(BeatReturnSpan {
@@ -1987,21 +2008,30 @@ fn build_stitch(
         )?;
     }
 
-    let incoming_levels: BTreeMap<_, _> = if bands {
-        let features = ReturnFeatures::read(store, &tracks[1], cancel)?;
+    let (outgoing_low, incoming_profiles): (BTreeMap<_, _>, BTreeMap<_, _>) = if bands {
+        let outgoing_features = ReturnFeatures::read(store, &tracks[0], cancel)?;
+        let incoming_features = ReturnFeatures::read(store, &tracks[1], cancel)?;
         let rms = tracks[1].analysis.rms.max(1e-6);
         // Leave space for the outgoing track during the first bar.
-        incoming
+        let incoming_profiles = incoming
             .iter()
             .map(|p| {
                 (
                     p.start,
-                    features.rms(p.start, p.beat_frames[p.bar_beats]) / rms,
+                    (
+                        incoming_features.rms(p.start, p.beat_frames[p.bar_beats]) / rms,
+                        incoming_features.low_band_share(p.start, p.end),
+                    ),
                 )
             })
-            .collect()
+            .collect();
+        let outgoing_low = outgoing
+            .iter()
+            .map(|p| (p.start, outgoing_features.low_band_share(p.start, p.end)))
+            .collect();
+        (outgoing_low, incoming_profiles)
     } else {
-        BTreeMap::new()
+        (BTreeMap::new(), BTreeMap::new())
     };
 
     let mut levels = Vec::new();
@@ -2055,6 +2085,16 @@ fn build_stitch(
             }
         }
         for b in &incoming {
+            if require_band_space
+                && outgoing_low
+                    .get(&a.start)
+                    .copied()
+                    .flatten()
+                    .zip(incoming_profiles.get(&b.start).and_then(|(_, low)| *low))
+                    .is_some_and(|(a, b)| crate::tactics::shared_low_band_dominance(a, b))
+            {
+                continue;
+            }
             let timing = if matches!(style, StitchStyle::PinnedTactic { .. }) {
                 mapped_pair_timing(a, b, policy)
             } else {
@@ -2074,9 +2114,9 @@ fn build_stitch(
                 + 0.5 * (a.grid_error + b.grid_error)
                 + 0.2 * deviation
                 + 0.2 * quiet_ratio
-                + incoming_levels
+                + incoming_profiles
                     .get(&b.start)
-                    .map_or(0., |level| 0.075 * (level - 0.55).abs());
+                    .map_or(0., |(level, _)| 0.075 * (level - 0.55).abs());
             if cost < best_cost {
                 best_cost = cost;
                 best = Some((a, b, duration, skew, lead_beat, quiet_ratio));
@@ -2405,7 +2445,11 @@ mod mashup_tests {
             vec![4, 8, 32, 64]
         );
         assert_eq!(
-            balanced.iter().filter(|c| c.0 == 4).map(|c| c.2).collect::<Vec<_>>(),
+            balanced
+                .iter()
+                .filter(|c| c.0 == 4)
+                .map(|c| c.2)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3],
             "ranking within each duration remains intact"
         );

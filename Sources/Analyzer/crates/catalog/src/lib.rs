@@ -1,10 +1,10 @@
 //! Single-writer JSON catalogue. Readers need no lock and retain immutable references.
-pub mod sidecars;
 mod read_snapshot;
-pub use read_snapshot::ReadSnapshotStats;
+pub mod sidecars;
 use fs2::FileExt;
 use mixlib_audio::WavReader;
 use mixlib_types::*;
+pub use read_snapshot::ReadSnapshotStats;
 use serde::de::DeserializeOwned;
 use std::{
     collections::BTreeMap,
@@ -138,7 +138,11 @@ impl Store {
         Ok(out)
     }
     pub fn directory(&self, relative: &str) -> Result<PathBuf> {
-        require(self.read_cache.is_none(), "READ_SNAPSHOT_WRITE", "metadata snapshot cannot create directories or acquire a writer lock")?;
+        require(
+            self.read_cache.is_none(),
+            "READ_SNAPSHOT_WRITE",
+            "metadata snapshot cannot create directories or acquire a writer lock",
+        )?;
         let p = self.path(relative)?;
         fs::create_dir_all(&p)?;
         Ok(p)
@@ -147,7 +151,9 @@ impl Store {
         validate_value(&serde_json::from_slice(&self.record_bytes(relative)?)?)
     }
     pub fn record_bytes(&self, relative: &str) -> Result<Vec<u8>> {
-        if self.read_cache.is_some() { return self.snapshot_record_bytes(relative); }
+        if self.read_cache.is_some() {
+            return self.snapshot_record_bytes(relative);
+        }
         if let Some(owner) = sidecars::record_owner(relative)? {
             if self.uses_sidecars()? {
                 return self.sidecar_record(&owner, relative);
@@ -158,7 +164,11 @@ impl Store {
     pub fn record_exists(&self, relative: &str) -> Result<bool> {
         if let Some(owner) = sidecars::record_owner(relative)? {
             if self.uses_sidecars()? {
-                let bytes = if self.read_cache.is_some() { self.snapshot_record_bytes(relative) } else { self.sidecar_record(&owner, relative) };
+                let bytes = if self.read_cache.is_some() {
+                    self.snapshot_record_bytes(relative)
+                } else {
+                    self.sidecar_record(&owner, relative)
+                };
                 return match bytes {
                     Ok(_) => Ok(true),
                     Err(e) if e.code == "RECORD_MISSING" => Ok(false),
@@ -182,7 +192,11 @@ impl Store {
         require(hash_bytes(&bytes) == r.hash, "CHECKSUM", &r.path)
     }
     pub fn write<T: Record>(&self, relative: &str, record: &T) -> Result<FileRef> {
-        require(self.read_cache.is_none(), "READ_SNAPSHOT_WRITE", "metadata snapshot is read-only; publish through the live store after verification")?;
+        require(
+            self.read_cache.is_none(),
+            "READ_SNAPSHOT_WRITE",
+            "metadata snapshot is read-only; publish through the live store after verification",
+        )?;
         let bytes = encode(record)?;
         if let Some(owner) = sidecars::record_owner(relative)? {
             if self.uses_sidecars()? {
@@ -993,9 +1007,12 @@ pub fn verify_plan(
     }
     for tactic in read_tactics(p)? {
         for asset in tactic.stem_assets {
-            let path=store.path(&asset.audio.path)?;
-            require(WavReader::open(&path)?.hashes(cancel)?.0==asset.audio.hash,
-                "TACTIC_STEM_CHANGED", &asset.audio.path)?;
+            let path = store.path(&asset.audio.path)?;
+            require(
+                WavReader::open(&path)?.hashes(cancel)?.0 == asset.audio.hash,
+                "TACTIC_STEM_CHANGED",
+                &asset.audio.path,
+            )?;
             sources.insert(asset.audio.path, path);
         }
     }

@@ -327,6 +327,30 @@ fn candidate_facts_cached(
     };
     if let (Some(a), Some(b)) = (&cached[0], &cached[1]) {
         crate::tactic_pair_evidence::enrich_pair_evidence(a, b, placements, &mut result)?;
+        if result.timing_basis == TacticTimingBasis::Bars
+            && result.bar_frames.len() <= 3
+            && plan.drum_intro.is_none()
+            && plan.prepared_patches.is_empty()
+            && result
+                .pair
+                .profiles
+                .get(&TacticId::S02)
+                .is_some_and(|p| p.predicted_peak_dbfs.is_some())
+        {
+            let paths = [
+                store.source(&snapshots[0].track)?,
+                store.source(&snapshots[1].track)?,
+            ];
+            result.pair.short_fade_match = crate::short_fade::measure(
+                store,
+                [&paths[0], &paths[1]],
+                placements,
+                [a, b],
+                [transition.start_output_frame, transition.end_output_frame],
+                plan.crossover_hz,
+                cancel,
+            )?;
+        }
     }
     result.validate()?;
     Ok(result)
@@ -672,6 +696,7 @@ fn passage_facts(
         version_identity: None,
         natural_end_frame,
         arrival_frame,
+        build_release_frame: None,
         ready_buffer_frames: 0,
         evidence,
     }

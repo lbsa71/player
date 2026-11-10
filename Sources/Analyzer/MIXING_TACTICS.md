@@ -289,7 +289,10 @@ limits are this specification's design inferences.
 - **Given A** is ready to finish, **and B** has a clean entrance with similar
   energy and little material worth holding simultaneously.
 - **Use** a one- or two-bar transfer at the structural boundary, with level and
-  low-end control. This is also a possible exit treatment after a mashup.
+  low-end control. Treat it as a last resort unless aligned audio establishes
+  two quiet, closely matching passages, or matching drums and two matching
+  frequency bands with a harmonically compatible difference in the third.
+  This is also a possible exit treatment after a mashup.
 - **Reject** unfinished vocals or a compelling complementary hold that the
   short transfer would discard. Move the cue when the endpoint is unsuitable.
 - **Status** Implemented short phrase transfer with vocal, boundary and headroom admission.
@@ -314,6 +317,8 @@ limits are this specification's design inferences.
   gains. Choose ordering from occupancy rather than treating it as universal.
 - **Reject** vocal collisions hidden by band-level reasoning. Prefer stem
   handoffs when frequency bands cannot separate the competing material.
+  Skip automatic band exchanges when both passages place at least 70% of
+  their measured band energy in the lows.
 - **Status** Implemented staged three-band scheduling and measured compatibility checks. Further listening-based ordering refinements remain possible.
   [EQ transition foundation][basic].
 
@@ -407,6 +412,7 @@ limits are this specification's design inferences.
 - **Reject** word truncation, audible seams, implausible repetition or excessive
   extension. Do not fabricate source time through a monotonic time map.
 - **Status** Implemented explicit finite loop edits, source transport, seam/tonal and language checks.
+  Fixed-period loops require a steady output clock and cannot combine with D01.
   [Loop-based extensions][loops].
 
 ### Tempo modifiers
@@ -466,8 +472,9 @@ phrase or vocal constraints.
 
 - **Given A** has a coherent buildup, **and B** has a drop whose timing, energy
   and harmonic landing fulfill that buildup.
-- **Use** A's build to announce B's arrival, possibly with a restrained filter
-  or loop treatment. Measure the pickup-to-downbeat interval explicitly.
+- **Use** A's build to announce B's arrival. Keep A intact through the
+  measured end of the build and start the cut or its de-click ramp there
+  or later. Measure the pickup-to-downbeat interval explicitly.
 - **Reject** a build that promises an incompatible groove or an isolated
   snare-rush peak misclassified as the actual arrival.
 - **Status** Implemented measured buildup-to-arrival scheduling; unsupported event timing remains ineligible.
@@ -493,6 +500,7 @@ phrase or vocal constraints.
 - **Reject** chopped essential lyrics or a release with the wrong beat phase.
   `expressive_opt_in`; bounded duration and repetition are mandatory.
 - **Status** Implemented bounded loop/roll/stutter edits and transport/release validation; expressive opt-in.
+  The roll's beat clock must remain steady; this schedule cannot combine with D01.
   [Loop performance examples][crossfader], [roll and stutter effect families][serato-fx].
 
 #### C06 — Rhythmic gate / transform cuts
@@ -503,6 +511,7 @@ phrase or vocal constraints.
 - **Reject** cuts through required syllables or an uncertain subdivision.
   `expressive_opt_in`; this is a deliberate audible pattern.
 - **Status** Implemented explicit rhythmic gate patterns with subdivision and vocal checks; expressive opt-in.
+  Fixed-period gates require a steady output clock and cannot combine with D01.
   [Gater mechanics][effects].
 
 #### C07 — Same-song / remix switch
@@ -581,6 +590,7 @@ phrase or vocal constraints.
 - **Reject** accidental phase drift presented as polyrhythm, competing
   foreground rhythms or a release that misses the planned common boundary.
 - **Status** Implemented percussion-loop overlay with explicit common landing and language/ownership checks; expressive opt-in.
+  Fixed-period overlays require a steady output clock, whole cycles at the landing, and no D01 modifier.
   [Polyrhythmic-loop demonstration][crossfader].
 
 #### C14 — Percussion-loop tempo bridge

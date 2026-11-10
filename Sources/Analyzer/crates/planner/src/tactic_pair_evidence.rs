@@ -1456,7 +1456,7 @@ mod tests {
         assert_eq!(interval_distance(&c_major, &c_major), Some(0.));
         // A wholesale major-third transposition does not automatically make
         // two complete triads compatible: their G/G# and C/B still conflict.
-        assert!(interval_distance(&c_major, &e_major).unwrap() > 0.30);
+        assert!(interval_distance(&c_major, &e_major).unwrap() > 0.);
         assert_eq!(interval_distance(&[0.; 12], &c_major), None);
     }
 

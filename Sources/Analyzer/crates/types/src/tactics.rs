@@ -807,6 +807,29 @@ impl TacticPlan {
                 "M01 must hold six bars and resolve over bars seven and eight",
             )?;
         }
+        if matches!(
+            self.tactic_id,
+            TacticId::S12 | TacticId::C05 | TacticId::C06 | TacticId::C13
+        ) {
+            let first = self.bar_frames[1] - self.bar_frames[0];
+            require(
+                !self.modifiers.contains(&TacticId::D01)
+                    && self
+                        .bar_frames
+                        .windows(2)
+                        .all(|w| (w[1] - w[0]).abs_diff(first) <= 1),
+                "TACTIC_PHASE",
+                "fixed-period loop/gate schedule cannot run on a changing mapped bar clock or combine with D01",
+            )?;
+        }
+        if self.tactic_id == TacticId::C13 {
+            require(self.source_edits.iter().any(|edit| {
+                edit.placement==self.incoming_placement && edit.lane==StemLane::Drums
+                    && edit.output_start_frame==self.start_frame && edit.output_end_frame==self.end_frame
+                    && matches!(edit.kind, SourceEditKind::Loop { period_frames }
+                        if period_frames>=16 && (edit.output_end_frame-edit.output_start_frame)%period_frames==0)
+            }),"TACTIC_PHASE","polyrhythm loop must complete whole cycles at its declared common landing")?;
+        }
         if self.timing_basis == TacticTimingBasis::Structural {
             require(
                 matches!(
@@ -824,7 +847,11 @@ impl TacticPlan {
             )?;
         }
         if self.timing_basis == TacticTimingBasis::IndependentPulses {
-            require(self.tactic_id==TacticId::C14 && self.modifiers.is_empty(),"TACTIC_TIMING","independent pulses require a nonoverlapping percussion tempo bridge")?;
+            require(
+                self.tactic_id == TacticId::C14 && self.modifiers.is_empty(),
+                "TACTIC_TIMING",
+                "independent pulses require a nonoverlapping percussion tempo bridge",
+            )?;
         }
         let placements = [self.outgoing_placement, self.incoming_placement];
         for index in placements {
@@ -1402,6 +1429,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn saved_fixed_loop_roll_and_gate_schedules_reject_changing_clocks() {
+        for id in [TacticId::S12, TacticId::C05, TacticId::C06] {
+            let (p, mut t) = fixture();
+            t.tactic_id = id;
+            t.permission = id.permission();
+            if id == TacticId::C06 {
+                t.effects = (0..2)
+                    .map(|placement| EffectSpec {
+                        placement,
+                        lane: StemLane::Stereo,
+                        start_frame: 0,
+                        input_end_frame: t.end_frame,
+                        end_frame: t.end_frame,
+                        wet: vec![
+                            ScalarPoint {
+                                output_frame: 0,
+                                value: 1.,
+                            },
+                            ScalarPoint {
+                                output_frame: t.end_frame,
+                                value: 1.,
+                            },
+                        ],
+                        kind: EffectKind::Gate {
+                            period_frames: 24000,
+                            phase_frames: if placement == 0 { 0 } else { 12000 },
+                            duty_cycle: 0.5,
+                            smoothing_frames: 240,
+                        },
+                    })
+                    .collect();
+            } else {
+                t.source_edits.push(loop_edit());
+            }
+            t.validate(&p).unwrap();
+            let mut bad = t.clone();
+            bad.modifiers.push(TacticId::D01);
+            bad.bar_bpm = Some(vec![120., 121., 122.]);
+            assert_eq!(bad.validate(&p).unwrap_err().code, "TACTIC_PHASE", "{id:?}");
+            let mut bad = t;
+            bad.bar_frames[1] += 100;
+            assert_eq!(bad.validate(&p).unwrap_err().code, "TACTIC_PHASE", "{id:?}");
+        }
+    }
+    #[test]
+    fn saved_polyrhythm_requires_a_steady_clock_and_whole_loop_landing() {
+        let (p, mut t) = fixture();
+        t.tactic_id = TacticId::C13;
+        t.permission = TacticPermission::ExpressiveOptIn;
+        t.edit_speed_ratio_limits = [0.5, 2.];
+        t.bar_frames = vec![0, 64000, 128000, 192000];
+        t.lanes[1].lane = StemLane::Drums;
+        t.stem_assets = vec![StemAsset {
+            placement: 1,
+            lane: StemLane::Drums,
+            audio: FileRef {
+                path: "verified-drums.wav".into(),
+                hash: hash_bytes(b"drums"),
+            },
+            source_offset_frame: 0,
+            source_end_frame: 192000,
+        }];
+        let mut edit = loop_edit();
+        edit.placement = 1;
+        edit.lane = StemLane::Drums;
+        edit.source_end_frame = 64000;
+        edit.kind = SourceEditKind::Loop {
+            period_frames: 48000,
+        };
+        t.source_edits = vec![edit];
+        t.validate(&p).unwrap();
+        let mut bad = t.clone();
+        bad.source_edits[0].kind = SourceEditKind::Loop {
+            period_frames: 48001,
+        };
+        assert_eq!(bad.validate(&p).unwrap_err().code, "TACTIC_PHASE");
+        let mut bad = t.clone();
+        bad.bar_frames[1] += 100;
+        assert_eq!(bad.validate(&p).unwrap_err().code, "TACTIC_PHASE");
+        let mut bad = t;
+        bad.modifiers.push(TacticId::D01);
+        bad.bar_bpm = Some(vec![180., 181., 182., 183.]);
+        assert_eq!(bad.validate(&p).unwrap_err().code, "TACTIC_PHASE");
+    }
     #[test]
     fn legacy_plans_remain_valid_and_typed_extension_rejects_unknown_fields() {
         let (mut p, t) = fixture();

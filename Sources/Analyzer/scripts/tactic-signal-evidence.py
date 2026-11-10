@@ -389,7 +389,7 @@ def _events(bars, samples, rate):
         if on_boundary:
             events.append({"kind": "drum_attack", "frame": onset["frame"], "score": 1.0,
                            "support": {"onset_strength": onset["strength"], "boundary_distance_frames": abs(onset["frame"]-bar["start_frame"])}})
-        if i:
+        if i and bars[i-1]["end_frame"] == bar["start_frame"]:
             previous = bars[i-1]
             old = previous["stems"]["drums"]
             ratio = drums["rms"] / max(old["rms"], 0.0008)
@@ -402,7 +402,8 @@ def _events(bars, samples, rate):
                 events.append({"kind": "drop", "frame": bar["start_frame"], "score": _clip((energy_ratio-1)/2),
                                "support": {"source_rms_ratio": float(energy_ratio), "bass_activity": bar["stems"]["bass"]["activity_fraction"],
                                            "following_drum_onsets": drums["onset_count"]}})
-        if i >= 2:
+        if i >= 2 and all(a["end_frame"] == b["start_frame"]
+                          for a,b in zip(bars[i-2:i],bars[i-1:i+1])):
             window = bars[i-2:i+1]
             energy = np.array([b["source"]["rms"] for b in window])
             activity = np.array([b["stems"]["drums"]["onset_density_per_second"] for b in window])
@@ -602,12 +603,12 @@ def analyze_tactic_signals(samples, stems, rate, beat_frames, downbeat_frames, v
                 "score":_clip(reconstruction/0.20),"semantics":"measured_reconstruction_error_not_separation_correctness"},
             "vocal_leakage":leakage,"vocal":_vocal_window(stems["vocals"],normalized,start,end,max(0.0015,source["rms"]*0.04))}
     bars=[]
-    for index,(start,end) in enumerate(zip(downbeats[:-1],downbeats[1:])):
+    for start,end in zip(downbeats[:-1],downbeats[1:]):
         if end-start < round(rate*0.1):
-            raise ValueError("bar span is shorter than 100 ms")
-        bars.append(describe_window(start,end,index))
-    # Cover source intro/tail and truly unmetered recordings without fabricating
-    # bars. These scalar acoustic windows are usable by structural tactics only.
+            continue
+        bars.append(describe_window(start,end,len(bars)))
+    # Cover source intro/tail, unusable beat spans and unmetered recordings.
+    # These scalar acoustic windows are usable by structural tactics only.
     gaps=[]
     cursor=0
     for bar in bars:
@@ -626,6 +627,8 @@ def analyze_tactic_signals(samples, stems, rate, beat_frames, downbeat_frames, v
     for start in range(len(bars)):
         for count in range(1,min(4,len(bars)-start)+1):
             selected=bars[start:start+count]
+            if count > 1 and selected[-2]["end_frame"] != selected[-1]["start_frame"]:
+                break
             segment=_aggregate(selected,rate,normalized)
             segment["events"]=[e for e in events if segment["start_frame"]<=e["frame"]<segment["end_frame"]]
             segment["roles"]=sorted(set(role for b in selected for role in b["roles"]))

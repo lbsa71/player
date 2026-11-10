@@ -47,6 +47,18 @@ def analyze(stems, vocal=None, source=None):
 
 
 class PitchEvidence(unittest.TestCase):
+    def test_implausibly_short_downbeat_span_is_unmetered(self):
+        stems = parts(3)
+        source = sum(stems.values())
+        downbeats = [0, RATE, RATE + 80, 2 * RATE, 3 * RATE]
+        record = signals.analyze_tactic_signals(source, stems, RATE, downbeats[:-1], downbeats)
+        self.assertEqual(record["downbeat_frames"], downbeats)
+        self.assertEqual([(w["start_frame"], w["end_frame"]) for w in record["unmetered_windows"]],
+                         [(RATE, RATE + 80)])
+        for key in ("bars", "segments", "loops"):
+            self.assertFalse(any(w["start_frame"] < RATE + 80 and w["end_frame"] > RATE
+                                 for w in record[key]))
+
     def test_structural_windows_cover_audio_without_inventing_a_grid(self):
         stems=parts(3.2)
         stems["other"][:]=stereo(tone(220,len(stems["other"])))

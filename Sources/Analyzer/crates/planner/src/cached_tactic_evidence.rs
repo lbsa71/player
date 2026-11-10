@@ -565,20 +565,54 @@ fn apply_events(
     else {
         return;
     };
+    let start = anchors[0];
+    let end = *anchors.last().unwrap();
+    let source_start = p.time_map.source_at(start as f64).round() as u64;
+    let source_end = p.time_map.source_at(end as f64).round() as u64;
     for event in events {
         let Some(source) = event.get("frame").and_then(Value::as_u64) else {
-            continue;
-        };
-        let Some(frame) = output_at(&p.time_map, source as f64).map(|v| v.round() as u64) else {
             continue;
         };
         let Some(score) = num(event, "score").filter(|s| *s >= 0.6 && *s <= 1.) else {
             continue;
         };
-        if frame < anchors[0] || frame > *anchors.last().unwrap() {
+        let kind = event.get("kind").and_then(Value::as_str);
+        if kind == Some("build") {
+            if let Some(release) =
+                event
+                    .get("end_frame")
+                    .and_then(Value::as_u64)
+                    .filter(|&release| {
+                        source < release
+                            && release <= record.source_frames
+                            && source < source_end
+                            && release >= source_start
+                    })
+            {
+                let output = if release == source_start {
+                    start
+                } else if release > source_end {
+                    end.saturating_add(1)
+                } else {
+                    output_at(&p.time_map, release as f64)
+                        .map_or(end.saturating_add(1), |v| v.round() as u64)
+                };
+                facts.build_release_frame =
+                    Some(facts.build_release_frame.unwrap_or(0).max(output));
+                facts.roles.insert(TacticRole::Build, score);
+                facts.evidence.push(format!(
+                    "measured build span {source}–{release} source frames"
+                ));
+            }
             continue;
         }
-        match event.get("kind").and_then(Value::as_str) {
+        let Some(frame) = output_at(&p.time_map, source as f64).map(|v| v.round() as u64) else {
+            continue;
+        };
+        if frame < start || frame > end {
+            continue;
+        }
+        match kind {
             Some("drum_return") => {
                 facts.roles.insert(TacticRole::DrumReturn, score);
                 facts.arrival_frame = Some(frame);
@@ -586,9 +620,6 @@ fn apply_events(
             Some("drop") => {
                 facts.roles.insert(TacticRole::Drop, score);
                 facts.arrival_frame = Some(frame);
-            }
-            Some("build") => {
-                facts.roles.insert(TacticRole::Build, score);
             }
             Some("drum_attack") => {
                 if facts.arrival_frame.is_none() {

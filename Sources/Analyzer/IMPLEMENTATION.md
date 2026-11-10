@@ -464,6 +464,16 @@ checkpoint recovery, pinned-generation retention and immutable hardlinks.
 These establish executable invariants, not listening quality. Only selected
 real recordings are under audit; the broad listening study remains outstanding.
 
+A local Parasite → The Perfect Girl smoke test on 10 November 2026 used the
+pinned full-source analysis and the final automatic selector. It examined 22
+cue candidates and rendered a 9.260-second, 48 kHz stereo Float32 WAV using S02
+(one bar), with no render diagnostics and a measured peak of about −10.64 dBTP.
+The sampled long mashups remained ineligible because of phrase uncertainty,
+selected-layer instability, separation residual or incompatible material.
+This is a successful automatic search/export check, not a real-recording M01
+acceptance. M01's six-bar hold, full two-bar fade, drum ownership and independent
+vocal gates are verified sample by sample by the dedicated rendered-WAV fixture.
+
 Benchmark commands (run on a fixed reference machine and retain JSON reports):
 
 ```sh

@@ -16,8 +16,15 @@ pub(super) fn choose_pair(
     cancel: &Cancellation,
 ) -> Result<PairSelection> {
     let snapshot = store.read_snapshot();
-    let mut evidence_cache=mixlib_planner::CandidateEvidenceCache::new();
-    let result = choose_pair_inner(&snapshot, request, mixing, next_track, &mut evidence_cache,cancel);
+    let mut evidence_cache = mixlib_planner::CandidateEvidenceCache::new();
+    let result = choose_pair_inner(
+        &snapshot,
+        request,
+        mixing,
+        next_track,
+        &mut evidence_cache,
+        cancel,
+    );
     snapshot.verify_read_snapshot(cancel)?;
     let selection = result?;
     if selection.selected.is_none() && !selection.missing_analysis {
@@ -50,7 +57,7 @@ fn choose_pair_inner(
     request: &mixlib_planner::StitchRequest<'_>,
     mixing: &MixingConfig,
     next_track: Option<&str>,
-    evidence_cache:&mut mixlib_planner::CandidateEvidenceCache,
+    evidence_cache: &mut mixlib_planner::CandidateEvidenceCache,
     cancel: &Cancellation,
 ) -> Result<PairSelection> {
     for id in [request.from, request.to] {
@@ -84,8 +91,9 @@ fn choose_pair_inner(
         mixlib_planner::tactic_stitch_candidates(store, request, mixing, 24, cancel)?
     {
         cancel.check()?;
-        let measured =
-            evidence_cache.candidate_facts(store, &candidate, 0, cancel).and_then(|facts| {
+        let measured = evidence_cache
+            .candidate_facts(store, &candidate, 0, cancel)
+            .and_then(|facts| {
                 mixlib_planner::select_tactics(&facts, &admission)
                     .map(|selection| (facts, selection))
             });
@@ -134,7 +142,14 @@ fn choose_pair_inner(
                 let safe = if let Some(safe) = successor_cache.get(&after) {
                     *safe
                 } else {
-                    let safe = match choose_pair_inner(store, &future, mixing, None,evidence_cache,cancel) {
+                    let safe = match choose_pair_inner(
+                        store,
+                        &future,
+                        mixing,
+                        None,
+                        evidence_cache,
+                        cancel,
+                    ) {
                         Ok(selection) => selection.selected.is_some(),
                         Err(error)
                             if matches!(
@@ -164,7 +179,9 @@ fn choose_pair_inner(
                 "a_boundaries":facts.a.phrase_boundaries,"b_boundaries":facts.b.phrase_boundaries,
                 "a_stems":facts.a.stems,"b_stems":facts.b.stems,
                 "beat_skew_ms":facts.pair.beat_skew_ms,"harmonic_distance":facts.pair.harmonic_distance,
-                "predicted_peak_dbfs":facts.pair.predicted_peak_dbfs},
+                "predicted_peak_dbfs":facts.pair.predicted_peak_dbfs,
+                "short_fade_match":facts.pair.short_fade_match,
+                "outgoing_build_release_frame":facts.a.build_release_frame},
             "rejected_tactics":selection.rejected}));
         if let Some((score, trial)) = accepted {
             if best.as_ref().is_none_or(|(old, _)| score > *old) {
@@ -219,8 +236,8 @@ pub(super) fn select(
 ) -> Result<serde_json::Value> {
     let mut policy = policy(allow_expressive);
     policy.normal_speed_deviation = plan.policy.max_speed_deviation;
-    let snapshot=store.read_snapshot();
-    let mut evidence_cache=mixlib_planner::CandidateEvidenceCache::new();
+    let snapshot = store.read_snapshot();
+    let mut evidence_cache = mixlib_planner::CandidateEvidenceCache::new();
     let mut selections = Vec::new();
     let mut chosen = Vec::new();
     for index in 0..plan.transitions.len() {

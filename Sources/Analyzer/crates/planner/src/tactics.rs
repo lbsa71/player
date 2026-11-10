@@ -130,6 +130,10 @@ pub struct PassageFacts {
     pub natural_end_frame: Option<u64>,
     /// Verified drop/attack arrival, rather than a role label over a whole window.
     pub arrival_frame: Option<u64>,
+    /// End of a measured build touching the window, or a frame past the
+    /// window when the current placement cannot reach the release.
+    #[serde(default)]
+    pub build_release_frame: Option<u64>,
     pub ready_buffer_frames: u64,
     pub evidence: Vec<String>,
 }
@@ -156,6 +160,12 @@ pub struct PairProfile {
     #[serde(default)]
     pub incoming_layer_stability: Option<Vec<f64>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortFadeMatch {
+    QuietNearMatch,
+    OneBandDifference,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairEvidence {
     #[serde(default)]
@@ -171,6 +181,8 @@ pub struct PairEvidence {
     pub pulse_ratio: Option<f64>,
     pub target_tempo_ratio: Option<f64>,
     pub groove_similarity: Option<f64>,
+    #[serde(default)]
+    pub short_fade_match: Option<ShortFadeMatch>,
     pub semantic_relation: Option<SemanticRelation>,
     pub shared_motif: Option<Vec<PitchNote>>,
     /// Output tempo at every bar anchor, validated against both actual time maps.
@@ -302,22 +314,36 @@ fn role(p: &PassageFacts, roles: &[TacticRole]) -> bool {
 fn stable(p: &PassageFacts) -> bool {
     !p.bars.is_empty() && p.bars.iter().all(|b| known(b.stability, |v| v >= 0.65))
 }
-fn band_exchange_order(f: &CandidateFacts) -> Option<([usize;3],[[f64;3];2])> {
-    let mut occupancy=[[0.;3];2];
-    for (side,passage) in [&f.a,&f.b].into_iter().enumerate() {
-        if passage.bars.is_empty() {return None;}
+// A three-way split offers little musical separation if both passages carry
+// most of their measured energy in the low band.
+pub(crate) fn shared_low_band_dominance(a: f64, b: f64) -> bool {
+    a >= 0.70 && b >= 0.70
+}
+
+fn band_exchange_order(f: &CandidateFacts) -> Option<([usize; 3], [[f64; 3]; 2])> {
+    let mut occupancy = [[0.; 3]; 2];
+    for (side, passage) in [&f.a, &f.b].into_iter().enumerate() {
+        if passage.bars.is_empty() {
+            return None;
+        }
         for bar in &passage.bars {
-            for (band,value) in [bar.low_occupancy,bar.mid_occupancy,bar.high_occupancy].into_iter().enumerate() {
-                let value=value.filter(|v|v.is_finite() && (0.0..=1.).contains(v))?;
-                occupancy[side][band]+=value/passage.bars.len() as f64;
+            for (band, value) in [bar.low_occupancy, bar.mid_occupancy, bar.high_occupancy]
+                .into_iter()
+                .enumerate()
+            {
+                let value = value.filter(|v| v.is_finite() && (0.0..=1.).contains(v))?;
+                occupancy[side][band] += value / passage.bars.len() as f64;
             }
         }
     }
-    let mut order=[2,0,1];
+    let mut order = [2, 0, 1];
     // Bring in B where it contributes measured material and A leaves space;
     // preserve A's occupied regions until later. Ties are deterministic.
-    order.sort_by(|a,b| (occupancy[1][*b]*(1.-occupancy[0][*b])).total_cmp(&(occupancy[1][*a]*(1.-occupancy[0][*a]))));
-    Some((order,occupancy))
+    order.sort_by(|a, b| {
+        (occupancy[1][*b] * (1. - occupancy[0][*b]))
+            .total_cmp(&(occupancy[1][*a] * (1. - occupancy[0][*a])))
+    });
+    Some((order, occupancy))
 }
 fn grid(p: &PassageFacts) -> bool {
     !p.bars.is_empty()
@@ -383,6 +409,50 @@ fn density(p: &PassageFacts) -> Option<f64> {
 }
 fn loop_candidate<'a>(p: &'a PassageFacts, policy: &TacticPolicy) -> Option<&'a LoopEvidence> {
     loop_candidate_for(p, policy, StemLane::Stereo)
+}
+fn steady_bar_clock(f: &CandidateFacts) -> bool {
+    let Some(first) = f.bar_frames.windows(2).next().map(|w| w[1] - w[0]) else {
+        return false;
+    };
+    f.bar_frames
+        .windows(2)
+        .all(|w| (w[1] - w[0]).abs_diff(first) <= 1)
+        && !f
+            .pair
+            .shared_bar_bpm
+            .as_ref()
+            .is_some_and(|v| v.windows(2).any(|w| (w[0] - w[1]).abs() > 0.01))
+}
+/// C13 currently renders a fixed three-beat cycle. Beat-count divisibility
+/// alone is insufficient when mapped bars change duration: the actual output
+/// span must contain whole cycles on a steady clock. C14 owns moving loops.
+fn polyrhythm_period(f: &CandidateFacts) -> Option<u64> {
+    if !steady_bar_clock(f) {
+        return None;
+    }
+    let first = f.a.bars.first()?;
+    let meter = u64::from(first.beats_per_bar?);
+    if meter == 0 {
+        return None;
+    }
+    let period = ((first.end_frame - first.start_frame) as f64 * 3. / meter as f64).round() as u64;
+    let start = *f.bar_frames.first()?;
+    let end = *f.bar_frames.last()?;
+    if period < 16 || (end - start) % period != 0 {
+        return None;
+    }
+    f.a.bars
+        .iter()
+        .all(|bar| {
+            bar.beats_per_bar.is_some_and(|beats| {
+                beats > 0
+                    && ((bar.end_frame - bar.start_frame) as f64
+                        - period as f64 * f64::from(beats) / 3.)
+                        .abs()
+                        <= 1.
+            })
+        })
+        .then_some(period)
 }
 fn loop_candidate_for<'a>(
     p: &'a PassageFacts,
@@ -625,6 +695,10 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         "composite headroom is unknown or insufficient",
     );
     let pulse_free = matches!(id, S07 | S11 | C04 | C14 | E01 | E02 | E03 | E04);
+    if matches!(id, S12 | C05 | C06 | C13) {
+        need(steady_bar_clock(f),
+            "fixed-period loop/gate schedule requires a steady output bar clock; D01 is unsupported");
+    }
     need(
         f.timing_basis == TacticTimingBasis::Bars
             || f.timing_basis == TacticTimingBasis::IndependentPulses && id == C14
@@ -646,6 +720,15 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         );
     }
     if id.permission() != TacticPermission::EmergencyOnly {
+        need(
+            f.a.build_release_frame.is_none_or(|release| {
+                release <= start
+                    || matches!(id, C01 | C02 | C03 | C04 | C07)
+                        && landing >= release
+                        && release < end
+            }),
+            "outgoing buildup must reach its measured release before the transfer starts",
+        );
         let a_exit = if cut { landing } else { end };
         let b_entry = if cut { landing } else { start };
         need(
@@ -793,7 +876,15 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         S04 => {
-            need(bars>=3 && band_exchange_order(f).is_some(),"three-band exchange needs three measured bars and complete low/mid/high occupancy");
+            let exchange = band_exchange_order(f);
+            need(
+                bars >= 3 && exchange.is_some(),
+                "three-band exchange needs three measured bars and complete low/mid/high occupancy",
+            );
+            need(
+                exchange.is_some_and(|(_, [a, b])| !shared_low_band_dominance(a[0], b[0])),
+                "both passages concentrate their energy in the low band",
+            );
             need(
                 complementary(f),
                 "band exchange requires compatible remaining upper layers",
@@ -898,6 +989,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             need(
                 role(&f.a, &[R::Build])
                     && role(&f.b, &[R::Drop])
+                    && f.a.build_release_frame.is_some()
                     && f.b.arrival_frame.is_some()
                     && tonal(f, p),
                 "build-to-drop requires compatible buildup and measured arrival",
@@ -992,6 +1084,8 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                     == 0,
                 "polyrhythm window must end at its common pulse boundary",
             );
+            need(polyrhythm_period(f).is_some(),
+                "fixed polyrhythm requires steady mapped pulses and whole output cycles at its landing");
         }
         C14 => {
             need(grid(&f.a) && grid(&f.b) && loop_candidate_for(&f.a,p,StemLane::Drums).is_some_and(|l|l.vocal_free) && known(f.pair.target_tempo_ratio,|r|(0.25..=4.).contains(&r) && (r-1.).abs()>0.06) && f.b.arrival_frame.is_some_and(|v|v>start && v<=end),"percussion tempo bridge requires reliable separate pulses, bounded loop move and prepared arrival");
@@ -1542,10 +1636,15 @@ pub(crate) fn candidate_tactic_schedule(
     };
     let shape_known = match id {
         TacticId::M01 => count == 8,
-        TacticId::S04 => count>=3 && band_exchange_order(f).is_some(),
+        TacticId::S04 => count >= 3 && band_exchange_order(f).is_some(),
         TacticId::M04 => motif_known(&f.a),
-        TacticId::S12 => loop_candidate(&f.a, p).is_some() || loop_candidate(&f.b, p).is_some(),
-        TacticId::C05 | TacticId::C12 => loop_candidate(&f.a, p).is_some(),
+        TacticId::S12 => {
+            steady_bar_clock(f)
+                && (loop_candidate(&f.a, p).is_some() || loop_candidate(&f.b, p).is_some())
+        }
+        TacticId::C05 => steady_bar_clock(f) && loop_candidate(&f.a, p).is_some(),
+        TacticId::C06 => steady_bar_clock(f),
+        TacticId::C12 => loop_candidate(&f.a, p).is_some(),
         TacticId::C08 => {
             motif_known(&f.a)
                 && f.a.motif.as_ref().is_some_and(|m| {
@@ -1558,7 +1657,9 @@ pub(crate) fn candidate_tactic_schedule(
                 && f.pair.shared_motif.as_ref().is_some_and(|n| !n.is_empty())
         }
         TacticId::C11 => motif_known(&f.b),
-        TacticId::C13 => loop_candidate_for(&f.b, p, StemLane::Drums).is_some(),
+        TacticId::C13 => {
+            loop_candidate_for(&f.b, p, StemLane::Drums).is_some() && polyrhythm_period(f).is_some()
+        }
         TacticId::C14 => {
             loop_candidate_for(&f.a, p, StemLane::Drums).is_some()
                 && known(f.pair.target_tempo_ratio, |r| r > 0.)
@@ -1820,18 +1921,38 @@ pub(crate) fn candidate_tactic_schedule(
                     ];
                 }
                 if id == S04 {
-                    let (order,_) = band_exchange_order(f).ok_or_else(||Error::new("TACTIC_SHAPE","three-band occupancy is unknown"))?;
-                    let times=[start,f.bar_frames[bars/3],f.bar_frames[2*bars/3],end];
-                    let mut incoming_gains=[0.;3];
-                    l.eq=times.into_iter().enumerate().map(|(step,output_frame)| {
-                        if step>0 {incoming_gains[order[step-1]]=1.;}
-                        BandGainPoint {output_frame,gains:if incoming {incoming_gains} else {incoming_gains.map(|g|1.-g)}}
-                    }).collect();
+                    let (order, _) = band_exchange_order(f).ok_or_else(|| {
+                        Error::new("TACTIC_SHAPE", "three-band occupancy is unknown")
+                    })?;
+                    let times = [
+                        start,
+                        f.bar_frames[bars / 3],
+                        f.bar_frames[2 * bars / 3],
+                        end,
+                    ];
+                    let mut incoming_gains = [0.; 3];
+                    l.eq = times
+                        .into_iter()
+                        .enumerate()
+                        .map(|(step, output_frame)| {
+                            if step > 0 {
+                                incoming_gains[order[step - 1]] = 1.;
+                            }
+                            BandGainPoint {
+                                output_frame,
+                                gains: if incoming {
+                                    incoming_gains
+                                } else {
+                                    incoming_gains.map(|g| 1. - g)
+                                },
+                            }
+                        })
+                        .collect();
                 }
             }
-            if id==S04 {
-                let (order,occupancy)=band_exchange_order(f).unwrap();
-                let names=["low","mid","high"];
+            if id == S04 {
+                let (order, occupancy) = band_exchange_order(f).unwrap();
+                let names = ["low", "mid", "high"];
                 plan.evidence.push(format!("S04 measured mean band occupancy A={:?}, B={:?}; exchange order {} -> {} -> {}, prioritizing incoming occupancy times outgoing space",occupancy[0],occupancy[1],names[order[0]],names[order[1]],names[order[2]]));
             }
         }
@@ -1963,16 +2084,26 @@ pub(crate) fn candidate_tactic_schedule(
                 landing
             };
             plan.hold_end_frame = cut;
-            plan.exit_start_frame = cut.saturating_sub(ramp).max(start);
+            let release = f.a.build_release_frame.filter(|&release| release <= cut);
+            let fade_start = cut
+                .saturating_sub(ramp)
+                .max(start)
+                .max(release.unwrap_or(start));
+            let fade_end = if fade_start == cut && cut != start {
+                (cut + ramp).min(end)
+            } else {
+                cut
+            };
+            plan.exit_start_frame = fade_start;
             plan.lanes[0].gain = if cut == start {
                 constant(start, end, 0.)
             } else {
-                transfer(start, end, cut.saturating_sub(ramp).max(start), cut, false)
+                transfer(start, end, fade_start, fade_end, false)
             };
             plan.lanes[1].gain = if cut == start {
                 constant(start, end, 1.)
             } else {
-                transfer(start, end, cut.saturating_sub(ramp).max(start), cut, true)
+                transfer(start, end, fade_start, fade_end, true)
             };
         }
         C05 => {
@@ -2171,7 +2302,12 @@ pub(crate) fn candidate_tactic_schedule(
                 end,
                 f.output_sample_rate_hz,
                 SourceEditKind::Loop {
-                    period_frames: beat * 3,
+                    period_frames: polyrhythm_period(f).ok_or_else(|| {
+                        Error::new(
+                            "TACTIC_PHASE",
+                            "polyrhythm has no whole-cycle steady-clock landing",
+                        )
+                    })?,
                 },
             ));
             for l in &mut plan.lanes {
@@ -2292,7 +2428,11 @@ pub(crate) fn candidate_tactic_schedule(
         M05 => "coincident complementary drops with assigned bass and lead ownership",
         M06 => "verified answering phrases alternate without overlapping vocals",
         S01 => "stable sparse intro/outro spans support a long phrase-aligned EQ blend",
-        S02 => "complete short window with safe vocal occupancy supports direct gain transfer",
+        S02 => match preferred_short_fade(f, p) {
+            Some(ShortFadeMatch::QuietNearMatch) => "quiet passages have closely matching aligned audio",
+            Some(ShortFadeMatch::OneBandDifference) => "aligned drums and two matching bands leave one harmonically compatible band to exchange",
+            None => "last resort: short window passes vocal, boundary and headroom checks",
+        },
         S03 => "active bass on both tracks requires one bounded bass ownership exchange",
         S04 => "measured frequency occupancy selects the staged three-band exchange order",
         S05 => "quiet A bed leaves room for stable B drums before the accompaniment transfer",
@@ -2325,7 +2465,13 @@ pub(crate) fn candidate_tactic_schedule(
     Ok(plan)
 }
 
-fn preference(id: TacticId, f: &CandidateFacts) -> f64 {
+fn preferred_short_fade(f: &CandidateFacts, p: &TacticPolicy) -> Option<ShortFadeMatch> {
+    f.pair
+        .short_fade_match
+        .filter(|m| *m == ShortFadeMatch::QuietNearMatch || tonal(f, p))
+}
+
+fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
     use TacticId::*;
     let base = match id {
         M01 => 100.,
@@ -2339,7 +2485,8 @@ fn preference(id: TacticId, f: &CandidateFacts) -> f64 {
         S04 => 72.,
         S03 => 70.,
         S01 => 65.,
-        S02 => 50.,
+        S02 if preferred_short_fade(f, p).is_some() => 50.,
+        S02 => -1000.,
         S07 => 63.,
         S08 => 60.,
         S09 => 55.,
@@ -2353,9 +2500,11 @@ fn preference(id: TacticId, f: &CandidateFacts) -> f64 {
         E01 | E02 | E03 => 10.,
         _ => 35.,
     };
-    base + 10. * f.pair.complementarity.unwrap_or(0.)
-        - 10. * f.pair.harmonic_distance.unwrap_or(0.5)
-        - 5. * f.pair.lead_conflict.unwrap_or(0.5)
+    // Tactic preferences break close calls. A strong measured fit can
+    // outrank a more elaborate but less compatible schedule.
+    0.20 * base + 40. * f.pair.complementarity.unwrap_or(0.)
+        - 40. * f.pair.harmonic_distance.unwrap_or(0.5)
+        - 30. * f.pair.lead_conflict.unwrap_or(0.5)
 }
 
 fn specialized_facts(id: TacticId, f: &CandidateFacts) -> CandidateFacts {
@@ -2417,7 +2566,7 @@ pub fn select_tactics(f: &CandidateFacts, p: &TacticPolicy) -> Result<TacticSele
         match schedule_tactic(id, f, p) {
             Ok(plan) => candidates.push(RankedTactic {
                 plan,
-                score: preference(id, &specialized),
+                score: preference(id, &specialized, p),
             }),
             Err(e) => rejected.push(TacticRejection {
                 tactic_id: id,
@@ -2534,6 +2683,7 @@ pub(crate) mod tests {
             version_identity: Some("verified-version-family".into()),
             natural_end_frame: Some(end),
             arrival_frame: Some(end),
+            build_release_frame: None,
             ready_buffer_frames: BAR,
             evidence: vec![format!("measured-fixture/{placement}")],
         };
@@ -2555,6 +2705,7 @@ pub(crate) mod tests {
                 pulse_ratio: Some(1.),
                 target_tempo_ratio: Some(1.5),
                 groove_similarity: Some(0.95),
+                short_fade_match: None,
                 semantic_relation: Some(SemanticRelation {
                     relation: "answer".into(),
                     confidence_margin: 0.8,
@@ -2866,6 +3017,80 @@ pub(crate) mod tests {
         assert!(schedule_tactic(TacticId::E03, &f, &p).is_err());
     }
     #[test]
+    fn fixed_loop_roll_and_gate_schedules_reject_tempo_drift() {
+        for id in [TacticId::S12, TacticId::C05, TacticId::C06] {
+            let mut f = facts(4);
+            let t = schedule_tactic(id, &f, &policy()).unwrap();
+            validate_compiled(&t, &f);
+            if id == TacticId::C06 {
+                assert_eq!(t.effects.len(), 2);
+                assert!(t.effects.iter().all(|fx|matches!(fx.kind,EffectKind::Gate{period_frames,..} if period_frames==BAR/4)));
+            }
+            f.pair.shared_bar_bpm = Some(vec![120., 121., 122., 123., 124.]);
+            assert!(
+                schedule_tactic(id, &f, &policy())
+                    .unwrap_err()
+                    .message
+                    .contains("steady output bar clock"),
+                "{id:?}"
+            );
+            assert!(
+                candidate_tactic_schedule(id, &f, &policy()).is_err(),
+                "{id:?} pair profile must not model unsupported tempo drift"
+            );
+            f.pair.shared_bar_bpm = None;
+            f.bar_frames[2] += 1000;
+            for passage in [&mut f.a, &mut f.b] {
+                passage.bars[1].end_frame += 1000;
+                passage.bars[2].start_frame += 1000;
+            }
+            assert!(
+                schedule_tactic(id, &f, &policy())
+                    .unwrap_err()
+                    .message
+                    .contains("steady output bar clock"),
+                "{id:?} missing D01 metadata must not hide a changing clock"
+            );
+        }
+    }
+    #[test]
+    fn polyrhythm_rejects_changing_clocks_and_partial_output_cycles() {
+        let mut f = facts(3);
+        role_set(&mut f.a, &[TacticRole::SteadyGroove]);
+        let t = schedule_tactic(TacticId::C13, &f, &policy()).unwrap();
+        let edit = &t.source_edits[0];
+        let SourceEditKind::Loop { period_frames } = edit.kind else {
+            panic!("expected fixed percussion loop")
+        };
+        assert_eq!(period_frames, 3 * BAR / 4);
+        assert_eq!(
+            (edit.output_end_frame - edit.output_start_frame) % period_frames,
+            0
+        );
+        validate_compiled(&t, &f);
+        // Both bar clocks still have twelve beats, but the second bar is longer
+        // and the next shorter. Count % 3 previously admitted this drift.
+        f.bar_frames[2] += 1000;
+        for passage in [&mut f.a, &mut f.b] {
+            passage.bars[1].end_frame += 1000;
+            passage.bars[2].start_frame += 1000;
+        }
+        assert!(eligibility(TacticId::C13, &f, &policy())
+            .iter()
+            .any(|r| r.contains("whole output cycles")));
+        assert!(candidate_tactic_schedule(TacticId::C13, &f, &policy()).is_err());
+        let mut f = facts(3);
+        role_set(&mut f.a, &[TacticRole::SteadyGroove]);
+        f.pair.shared_bar_bpm = Some(vec![120., 121., 122., 123.]);
+        assert!(schedule_tactic(TacticId::C13, &f, &policy()).is_err());
+        // A rounding remainder must not silently become a truncated final loop.
+        f.pair.shared_bar_bpm = None;
+        *f.bar_frames.last_mut().unwrap() += 1;
+        f.a.bars.last_mut().unwrap().end_frame += 1;
+        f.b.bars.last_mut().unwrap().end_frame += 1;
+        assert!(polyrhythm_period(&f).is_none());
+    }
+    #[test]
     fn every_family_emits_its_declared_executable_operation() {
         use TacticId::*;
         use TacticRole as R;
@@ -2901,6 +3126,9 @@ pub(crate) mod tests {
             }
             if id == M05 {
                 f.b.arrival_frame = Some(0);
+            }
+            if id == C03 {
+                f.a.build_release_frame = Some(0);
             }
             if id == M03 {
                 f.a.vocal_phrases = Some(vec![vocal(0, 3 * BAR)]);
@@ -2997,5 +3225,96 @@ pub(crate) mod tests {
         let mut f = facts(8);
         f.pair.beat_skew_ms = None;
         assert!(schedule_tactic(TacticId::C14, &f, &policy()).is_ok());
+    }
+
+    #[test]
+    fn three_band_order_uses_measured_space_and_retains_complementary_ownership() {
+        let mut f = facts(8);
+        for (a, b) in f.a.bars.iter_mut().zip(&mut f.b.bars) {
+            a.low_occupancy = Some(0.9);
+            a.mid_occupancy = Some(0.6);
+            a.high_occupancy = Some(0.05);
+            b.low_occupancy = Some(0.2);
+            b.mid_occupancy = Some(0.2);
+            b.high_occupancy = Some(0.8);
+        }
+        let high_first = schedule_tactic(TacticId::S04, &f, &policy()).unwrap();
+        assert_eq!(high_first.lanes[1].eq[1].gains, [0., 0., 1.]);
+        assert_eq!(high_first.lanes[1].eq[2].gains, [0., 1., 1.]);
+        for (a, b) in high_first.lanes[0].eq.iter().zip(&high_first.lanes[1].eq) {
+            assert_eq!(a.output_frame, b.output_frame);
+            for band in 0..3 {
+                assert_eq!(a.gains[band] + b.gains[band], 1.);
+            }
+        }
+        for (a, b) in f.a.bars.iter_mut().zip(&mut f.b.bars) {
+            a.low_occupancy = Some(0.05);
+            a.high_occupancy = Some(0.9);
+            b.low_occupancy = Some(0.8);
+            b.high_occupancy = Some(0.2);
+        }
+        let low_first = schedule_tactic(TacticId::S04, &f, &policy()).unwrap();
+        assert_eq!(low_first.lanes[1].eq[1].gains, [1., 0., 0.]);
+        validate_compiled(&low_first, &f);
+        f.a.bars[3].high_occupancy = None;
+        assert!(schedule_tactic(TacticId::S04, &f, &policy()).is_err());
+    }
+
+    #[test]
+    fn band_exchange_rejects_two_bass_dominant_passages() {
+        let mut f = facts(4);
+        for bar in f.a.bars.iter_mut().chain(&mut f.b.bars) {
+            bar.low_occupancy = Some(0.82);
+            bar.mid_occupancy = Some(0.14);
+            bar.high_occupancy = Some(0.04);
+        }
+        let error = schedule_tactic(TacticId::S04, &f, &policy()).unwrap_err();
+        assert!(error
+            .message
+            .contains("concentrate their energy in the low band"));
+    }
+
+    #[test]
+    fn a_clean_short_fade_can_outrank_a_marginal_band_exchange() {
+        let mut crowded = facts(4);
+        crowded.pair.complementarity = Some(0.66);
+        crowded.pair.harmonic_distance = Some(0.28);
+        crowded.pair.lead_conflict = Some(0.22);
+        let mut clean = facts(1);
+        clean.pair.complementarity = Some(0.91);
+        clean.pair.harmonic_distance = Some(0.09);
+        clean.pair.lead_conflict = Some(0.04);
+        let policy = policy();
+        let band = preference(TacticId::S04, &crowded, &policy);
+        assert!(preference(TacticId::S02, &clean, &policy) < band);
+        clean.pair.short_fade_match = Some(ShortFadeMatch::QuietNearMatch);
+        assert!(preference(TacticId::S02, &clean, &policy) > band);
+        clean.pair.short_fade_match = Some(ShortFadeMatch::OneBandDifference);
+        assert!(preference(TacticId::S02, &clean, &policy) > band);
+        clean.pair.harmonic_distance = Some(0.9);
+        assert!(preference(TacticId::S02, &clean, &policy) < band);
+    }
+
+    #[test]
+    fn build_to_drop_keeps_the_crescendo_until_the_release() {
+        let mut f = facts(2);
+        role_set(&mut f.a, &[TacticRole::Build]);
+        role_set(&mut f.b, &[TacticRole::Drop]);
+        f.a.build_release_frame = Some(BAR);
+        f.b.arrival_frame = Some(BAR / 2);
+        assert!(schedule_tactic(TacticId::S02, &f, &policy())
+            .unwrap_err()
+            .message
+            .contains("buildup"));
+        assert!(schedule_tactic(TacticId::C03, &f, &policy())
+            .unwrap_err()
+            .message
+            .contains("buildup"));
+        f.b.arrival_frame = Some(BAR);
+        let cut = schedule_tactic(TacticId::C03, &f, &policy()).unwrap();
+        assert_eq!(cut.exit_start_frame, BAR);
+        assert_eq!(cut.hold_end_frame, BAR);
+        assert_eq!(curve_value(&cut.lanes[0].gain, BAR), 1.);
+        assert_eq!(curve_value(&cut.lanes[1].gain, BAR), 0.);
     }
 }
