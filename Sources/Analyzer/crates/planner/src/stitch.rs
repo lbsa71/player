@@ -2119,7 +2119,10 @@ fn pick_tracks_in_pool(
                 }
                 if let Some(edge) = edges[from][to]
                     .iter()
-                    .filter(|edge| edge.exit >= earliest)
+                    .filter(|edge| {
+                        edge.exit >= earliest
+                            && pacing[from].assess(route.entry_end, edge.exit).is_some()
+                    })
                     .min_by(|a, b| a.score.total_cmp(&b.score))
                 {
                     let mut tracks = route.tracks.clone();

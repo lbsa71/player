@@ -449,23 +449,29 @@ pub fn shard(id: &str) -> String {
     hash_bytes(id.as_bytes()).digest[..2].into()
 }
 pub fn read_limited(path: &Path) -> Result<Vec<u8>> {
+    read_limited_with_limit(path, logical_json_limit(&path.to_string_lossy()))
+}
+fn read_limited_with_limit(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let f = File::open(path)?;
     require(
-        f.metadata()?.len() <= MAX_JSON,
+        f.metadata()?.len() <= limit,
         "RECORD_TOO_LARGE",
         path.display().to_string(),
     )?;
     let mut bytes = vec![];
-    f.take(MAX_JSON + 1).read_to_end(&mut bytes)?;
+    f.take(limit + 1).read_to_end(&mut bytes)?;
     require(
-        bytes.len() as u64 <= MAX_JSON,
+        bytes.len() as u64 <= limit,
         "RECORD_TOO_LARGE",
         "record grew while reading",
     )?;
     Ok(bytes)
 }
 pub fn read_record<T: Record>(path: &Path) -> Result<T> {
-    validate_value(&serde_json::from_slice(&read_limited(path)?)?)
+    validate_value(&serde_json::from_slice(&read_limited_with_limit(
+        path,
+        T::MAX_JSON_BYTES,
+    )?)?)
 }
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(&read_limited(path)?)?)

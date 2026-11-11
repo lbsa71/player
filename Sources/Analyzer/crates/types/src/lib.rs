@@ -22,6 +22,15 @@ use std::{
 
 pub const MAX_FRAME: u64 = (1u64 << 53) - 1;
 pub const MAX_JSON: u64 = 8 * 1024 * 1024;
+/// Full-track evidence is bounded separately from small catalog/control records.
+pub const MAX_TACTIC_JSON: u64 = 32 * 1024 * 1024;
+pub fn logical_json_limit(path: &str) -> u64 {
+    if path.rsplit('/').next() == Some("tactic-analysis.json") {
+        MAX_TACTIC_JSON
+    } else {
+        MAX_JSON
+    }
+}
 pub const ENGINE: &str = "mixlib/0.1.0";
 pub type Extensions = BTreeMap<String, Value>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -152,6 +161,7 @@ impl Default for Header {
     }
 }
 pub trait Record: Serialize + for<'de> Deserialize<'de> + JsonSchema + 'static {
+    const MAX_JSON_BYTES: u64 = MAX_JSON;
     fn validate(&self) -> Result<()> {
         Ok(())
     }
@@ -198,9 +208,12 @@ pub fn encode<T: Record>(record: &T) -> Result<Vec<u8>> {
     validate_value::<T>(&value)?;
     let bytes = serde_json::to_vec_pretty(&value)?;
     require(
-        bytes.len() as u64 <= MAX_JSON,
+        bytes.len() as u64 <= T::MAX_JSON_BYTES,
         "RECORD_TOO_LARGE",
-        "JSON record exceeds 8 MiB",
+        format!(
+            "JSON record exceeds {} MiB",
+            T::MAX_JSON_BYTES / (1024 * 1024)
+        ),
     )?;
     Ok(bytes)
 }

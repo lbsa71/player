@@ -119,10 +119,14 @@ impl Store {
                 .get(relative)
                 .ok_or_else(|| Error::new("RECORD_MISSING", relative))?;
             let bytes = serde_json::to_vec_pretty(value)?;
-            require(bytes.len() as u64 <= MAX_JSON, "RECORD_TOO_LARGE", relative)?;
+            require(
+                bytes.len() as u64 <= logical_json_limit(relative),
+                "RECORD_TOO_LARGE",
+                relative,
+            )?;
             bytes
         } else {
-            (*self.snapshot_physical(&self.path(relative)?, MAX_JSON)?).clone()
+            (*self.snapshot_physical(&self.path(relative)?, logical_json_limit(relative))?).clone()
         };
         lock(&cache.records)?.insert(relative.into(), Arc::new(bytes.clone()));
         Ok(bytes)

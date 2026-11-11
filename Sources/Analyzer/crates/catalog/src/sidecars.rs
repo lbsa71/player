@@ -240,7 +240,11 @@ impl Store {
             .get(key)
             .ok_or_else(|| Error::new("RECORD_MISSING", key))?;
         let bytes = serde_json::to_vec_pretty(value)?;
-        require(bytes.len() as u64 <= MAX_JSON, "RECORD_TOO_LARGE", key)?;
+        require(
+            bytes.len() as u64 <= logical_json_limit(key),
+            "RECORD_TOO_LARGE",
+            key,
+        )?;
         Ok(bytes)
     }
 

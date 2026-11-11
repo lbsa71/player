@@ -34,6 +34,7 @@ pub struct TacticTrackAnalysis {
 }
 
 impl Record for TacticTrackAnalysis {
+    const MAX_JSON_BYTES: u64 = MAX_TACTIC_JSON;
     fn validate(&self) -> Result<()> {
         valid_id(&self.tactic_analysis_id)?;
         valid_id(&self.track_id)?;
