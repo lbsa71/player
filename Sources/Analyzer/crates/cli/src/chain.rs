@@ -304,23 +304,17 @@ pub(super) fn finish_measured(
     finish_chain(store, plan, joins, tactics, cancel)
 }
 
-fn apply_bookends(store: &Store, plan: &mut MixPlan, cancel: &Cancellation) -> Result<u64> {
-    let cues = mixlib_planner::choose_chain_bookends(
-        store,
-        &plan.placements[0],
-        plan.placements.last().unwrap(),
-        cancel,
-    )?;
+fn apply_opening(plan: &mut MixPlan, start: u64) -> u64 {
     let first = &mut plan.placements[0];
     let rate = u64::from(plan.output.sample_rate_hz);
-    let intro_frames = ((first.source_start_frame - cues.start) as f64 * rate as f64
+    let intro_frames = ((first.source_start_frame - start) as f64 * rate as f64
         / f64::from(first.time_map.source_sample_rate_hz)
         / first.time_map.slopes()[0])
         .round() as u64;
     if intro_frames > 0 {
         let (gain, bands) = mixlib_audio::automation(&first.automation, rate / 25);
-        first.source_start_frame = cues.start;
-        first.time_map.anchors[0].source_frame = cues.start;
+        first.source_start_frame = start;
+        first.time_map.anchors[0].source_frame = start;
         for anchor in first.time_map.anchors.iter_mut().skip(1) {
             anchor.output_frame += intro_frames;
         }
@@ -373,6 +367,48 @@ fn apply_bookends(store: &Store, plan: &mut MixPlan, cancel: &Cancellation) -> R
         }
         plan.total_output_frames += intro_frames;
     }
+    intro_frames
+}
+
+/// Apply the real opening before scoring partial-set output positions. Reusing
+/// this transformation makes the final bookend pass idempotent at the start.
+pub(super) fn open_measured(plan: &mut MixPlan, start: u64) -> Result<()> {
+    let tactics = read_tactics(plan)?;
+    let shift = apply_opening(plan, start.min(plan.placements[0].source_start_frame));
+    if !tactics.is_empty() {
+        write_tactics(
+            plan,
+            tactics
+                .iter()
+                .map(|t| t.translated(shift, 0))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+    }
+    plan.header.extensions.insert(
+        "selected_opening_source_frame".into(),
+        serde_json::json!(plan.placements[0].source_start_frame),
+    );
+    plan.validate()
+}
+
+fn apply_bookends(store: &Store, plan: &mut MixPlan, cancel: &Cancellation) -> Result<u64> {
+    let mut cues = mixlib_planner::choose_chain_bookends(
+        store,
+        &plan.placements[0],
+        plan.placements.last().unwrap(),
+        cancel,
+    )?;
+    if plan
+        .header
+        .extensions
+        .get("selected_opening_source_frame")
+        .and_then(serde_json::Value::as_u64)
+        == Some(plan.placements[0].source_start_frame)
+    {
+        cues.start = plan.placements[0].source_start_frame;
+    }
+    let intro_frames = apply_opening(plan, cues.start);
+    let rate = u64::from(plan.output.sample_rate_hz);
     let last = plan.placements.last_mut().unwrap();
     let map = &mut last.time_map;
     let solo = map.anchors[map.anchors.len() - 2].clone();
@@ -424,14 +460,21 @@ pub(super) fn pick_chain(
     cancel: &Cancellation,
 ) -> Result<MixPlan> {
     let pool = measured_beam::prepared_pool(&store.read_snapshot())?;
-    let result = measured_beam::choose(
-        store,
-        policy,
-        context_beats,
-        track_count,
-        pool.clone(),
-        cancel,
-    );
+    let select = |pool| {
+        if policy
+            .header
+            .extensions
+            .get("set_search_strategy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(if track_count == 8 { "lazy" } else { "eager" })
+            != "lazy"
+        {
+            measured_beam::choose(store, policy, context_beats, track_count, pool, cancel)
+        } else {
+            lazy_solver::choose(store, policy, context_beats, track_count, pool, cancel)
+        }
+    };
+    let result = select(pool.clone());
     let (Some(python), Err(error)) = (separator, &result) else {
         return result;
     };
@@ -463,7 +506,7 @@ pub(super) fn pick_chain(
     if expanded.len() == pool.len() {
         return result;
     }
-    measured_beam::choose(store, policy, context_beats, track_count, expanded, cancel)
+    select(expanded)
 }
 
 pub(super) fn try_quiet_linger(
@@ -647,4 +690,43 @@ fn append_pair(chain: &mut MixPlan, mut pair: MixPlan) -> Result<u64> {
     chain.placements.push(incoming);
     chain.diagnostics.append(&mut pair.diagnostics);
     Ok(offset)
+}
+
+#[cfg(test)]
+mod opening_tests {
+    use super::*;
+    #[test]
+    fn opening_is_applied_once_and_shifts_every_output_coordinate() {
+        let mut plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        let shift = 10 * u64::from(plan.output.sample_rate_hz);
+        let first = &mut plan.placements[0];
+        first.source_start_frame += shift;
+        first.source_end_frame += shift;
+        for anchor in &mut first.time_map.anchors {
+            anchor.source_frame += shift;
+        }
+        plan.header.extensions.insert(
+            "chain_joins".into(),
+            serde_json::json!([
+                {"start_output_frame":plan.transitions[0].start_output_frame,"pair_output_offset":0}
+            ]),
+        );
+        let old_transition = plan.transitions[0].start_output_frame;
+        let old_second = plan.placements[1].time_map.anchors[0].output_frame;
+        let old_total = plan.total_output_frames;
+        assert_eq!(apply_opening(&mut plan, 0), shift);
+        assert_eq!(
+            plan.transitions[0].start_output_frame,
+            old_transition + shift
+        );
+        assert_eq!(
+            plan.placements[1].time_map.anchors[0].output_frame,
+            old_second + shift
+        );
+        assert_eq!(plan.total_output_frames, old_total + shift);
+        let once = serde_json::to_value(&plan).unwrap();
+        assert_eq!(apply_opening(&mut plan, 0), 0);
+        assert_eq!(serde_json::to_value(&plan).unwrap(), once);
+    }
 }

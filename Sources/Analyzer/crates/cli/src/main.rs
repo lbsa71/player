@@ -1,4 +1,6 @@
 mod chain;
+mod composition;
+mod lazy_solver;
 mod measured_beam;
 mod tactic_analysis;
 mod tactics;
@@ -133,6 +135,9 @@ enum Command {
         /// Choose and order four tracks from the analyzed library.
         #[arg(long, conflicts_with_all = ["from", "to", "then", "overlap_beats", "beat_return_near", "drum_lead_bars"])]
         pick_four: bool,
+        /// Override search strategy; eight-track sets default to lazy anchor discovery.
+        #[arg(long, value_parser=["lazy","eager"])]
+        search_strategy: Option<String>,
         /// Choose and order eight tracks from the analyzed library.
         #[arg(long, conflicts_with_all = ["pick_four", "from", "to", "then", "overlap_beats", "beat_return_near", "drum_lead_bars"])]
         pick_eight: bool,
@@ -182,6 +187,26 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         overwrite: bool,
+    },
+    /// Search for a full set, saving improved complete plans without rendering audio.
+    SearchSet {
+        /// Compose a full set lasting 57–60 or 117–120 minutes; song count is free.
+        #[arg(long, value_parser=["60", "120"], conflicts_with="incumbent")]
+        set_minutes: Option<String>,
+        /// Emotional pacing model (auto: story for 60 minutes, chapters for 120).
+        #[arg(long, default_value="auto", value_parser=["auto","story","wave","ramp","chapters"])]
+        structure: String,
+        /// Retain this verified complete plan unless the search finds a better one.
+        #[arg(long)]
+        incumbent: Option<String>,
+        #[arg(long, conflicts_with="set_minutes", value_parser=clap::value_parser!(u8).range(3..=8))]
+        tracks: Option<u8>,
+        /// Default: 8192/16384 windows for full sets, 1536 for short diagnostics.
+        #[arg(long, value_parser=clap::value_parser!(u64).range(1..=100000))]
+        measurements: Option<u64>,
+        /// Default search budget: 7200/14400 seconds for full sets, 1200 for diagnostics.
+        #[arg(long, value_parser=clap::value_parser!(u64).range(1..=86400))]
+        seconds: Option<u64>,
     },
     Play {
         #[arg(long)]
@@ -294,6 +319,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             | Command::AnalyzeTactics { .. }
             | Command::Plan { .. }
             | Command::Stitch { .. }
+            | Command::SearchSet { .. }
             | Command::Tactics { apply: true, .. }
             | Command::RebuildCatalog
             | Command::FuseSidecars
@@ -484,6 +510,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             serde_json::json!({"plan_id":proposed.plan_id,"result":result})
         }
         Command::Stitch {
+            search_strategy,
             pick_four,
             pick_eight,
             from,
@@ -513,6 +540,12 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                     .header
                     .extensions
                     .insert("allow_expressive_tactics".into(), serde_json::json!(true));
+            }
+            if let Some(strategy) = search_strategy {
+                policy
+                    .header
+                    .extensions
+                    .insert("set_search_strategy".into(), serde_json::json!(strategy));
             }
             if *pick_four || *pick_eight {
                 let count = if *pick_eight { 8 } else { 4 };
@@ -731,6 +764,60 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                 reports.push(r);
             }
             serde_json::to_value(reports)?
+        }
+        Command::SearchSet {
+            set_minutes,
+            structure,
+            incumbent,
+            tracks,
+            measurements,
+            seconds,
+        } => {
+            let set_minutes = set_minutes
+                .clone()
+                .or_else(|| (tracks.is_none() && incumbent.is_none()).then(|| "60".to_string()));
+            let (default_measurements, default_seconds) = match set_minutes.as_deref() {
+                Some("120") => (16384, 14400),
+                Some(_) => (8192, 7200),
+                None => (1536, 1200),
+            };
+            let measurements = measurements.unwrap_or(default_measurements);
+            let seconds = seconds.unwrap_or(default_seconds);
+            let mut policy: MixingConfig = store.read("config/mixing.json")?;
+            policy.header.extensions.insert(
+                "lazy_measurement_budget".into(),
+                serde_json::json!(measurements),
+            );
+            policy
+                .header
+                .extensions
+                .insert("lazy_search_seconds".into(), serde_json::json!(seconds));
+            if let Some(id) = incumbent {
+                policy
+                    .header
+                    .extensions
+                    .insert("lazy_incumbent_plan".into(), serde_json::json!(id));
+            }
+            if let Some(minutes) = set_minutes {
+                policy.header.extensions.insert(
+                    "set_minutes".into(),
+                    serde_json::json!(minutes.parse::<u64>().unwrap()),
+                );
+                policy
+                    .header
+                    .extensions
+                    .insert("set_structure".into(), serde_json::json!(structure));
+            }
+            let pool = measured_beam::prepared_pool(&store.read_snapshot())?;
+            let plan = lazy_solver::choose(
+                &store,
+                &policy,
+                12,
+                usize::from(tracks.unwrap_or(8)),
+                pool,
+                cancel,
+            )?;
+            serde_json::json!({"plan":plan})
         }
         Command::Play { plan } => {
             require(

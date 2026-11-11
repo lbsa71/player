@@ -8,6 +8,7 @@ pub(super) struct PairSelection {
     pub examined: Vec<serde_json::Value>,
 }
 
+#[derive(Clone)]
 pub(super) struct MeasuredEdge {
     pub plan: MixPlan,
     pub exit: u64,
@@ -18,7 +19,7 @@ pub(super) struct MeasuredEdge {
     pub handoff_quality_seconds: f64,
 }
 
-struct CandidateQueue {
+pub(super) struct CandidateQueue {
     pending: std::collections::VecDeque<MixPlan>,
     seen: std::collections::BTreeSet<[u64; 4]>,
     extended: std::collections::BTreeMap<[u64; 2], usize>,
@@ -49,6 +50,14 @@ fn cue_key(plan: &MixPlan) -> [u64; 4] {
 }
 
 impl CandidateQueue {
+    pub(super) fn expansion_only(plans: &[MixPlan], budget: usize) -> Self {
+        let mut queue = Self::new(plans.to_vec(), budget);
+        queue.pending.clear();
+        queue
+    }
+    pub(super) fn take_discovered(&mut self) -> Vec<MixPlan> {
+        self.pending.drain(..).collect()
+    }
     fn new(plans: Vec<MixPlan>, budget: usize) -> Self {
         Self {
             seen: plans.iter().map(cue_key).collect(),
@@ -175,87 +184,120 @@ pub(super) fn measure_edges(
     while let Some(candidate) = queue.pending.pop_front() {
         windows += 1;
         cancel.check()?;
-        let facts = match cache.candidate_facts(store, &candidate, 0, cancel) {
-            Ok(facts) => facts,
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "TACTIC_FACTS"
-                        | "TACTIC_GRID"
-                        | "TACTIC_BAR_WINDOW"
-                        | "TACTIC_NATIVE_GRID"
-                        | "TACTIC_BOUNDARIES"
-                ) =>
-            {
-                *rejected.entry(error.code).or_default() += 1;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let selection = mixlib_planner::select_tactics(&facts, &admission)?;
-        details.push(window_diagnostic(&candidate, &facts, &selection));
-        extend_cues(
-            store, request, mixing, &candidate, &selection, &facts, &mut queue, cancel,
-        )?;
-        for profile in facts
-            .pair
-            .profiles
-            .values()
-            .filter(|p| p.predicted_peak_dbfs.is_none())
-        {
-            for reason in &profile.evidence {
-                *rejected.entry(reason.clone()).or_default() += 1;
-            }
-        }
-        for rejection in &selection.rejected {
-            for reason in &rejection.reasons {
-                *rejected
-                    .entry(format!("{:?}: {reason}", rejection.tactic_id))
-                    .or_default() += 1;
-            }
-        }
-        let t = &candidate.transitions[0];
-        let exit = candidate.placements[0]
-            .time_map
-            .source_at(t.start_output_frame as f64)
-            .round() as u64;
-        let entry_end = candidate.placements[1]
-            .time_map
-            .source_at(t.end_output_frame as f64)
-            .round() as u64;
-        for ranked in selection.candidates {
-            let id = format!("{:?}", ranked.plan.tactic_id);
-            let mut plan = candidate.clone();
-            if write_tactics(&mut plan, vec![ranked.plan]).is_err() {
-                continue;
-            }
-            plan.header.extensions.insert(
-                "dense_quality_seconds".into(),
-                serde_json::json!(ranked.dense_quality_seconds),
-            );
-            plan.header.extensions.insert(
-                "handoff_quality_seconds".into(),
-                serde_json::json!(ranked.handoff_quality_seconds),
-            );
-            plan.renderer_version = mixlib_audio::TACTIC_RENDERER.into();
-            plan.validate()?;
-            *admitted.entry(id).or_default() += 1;
-            edges.push(MeasuredEdge {
-                plan,
-                exit,
-                entry_end,
-                score: ranked.score,
-                last_resort: ranked.last_resort,
-                dense_quality_seconds: ranked.dense_quality_seconds,
-                handoff_quality_seconds: ranked.handoff_quality_seconds,
-            });
-        }
+        edges.extend(measure_window(
+            store,
+            request,
+            mixing,
+            cache,
+            &candidate,
+            &mut queue,
+            &admission,
+            &mut admitted,
+            &mut rejected,
+            &mut details,
+            cancel,
+        )?);
     }
     Ok((
         edges,
         serde_json::json!({"from":request.from,"to":request.to,
         "windows":windows,"admitted":admitted,"rejected":rejected,"window_details":details}),
     ))
+}
+
+/// One expensive audio measurement, with exactly the same admission and dynamic
+/// endpoint discovery used by eager search. Caller owns scheduling and caching.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn measure_window(
+    store: &Store,
+    request: &mixlib_planner::StitchRequest<'_>,
+    mixing: &MixingConfig,
+    cache: &mut mixlib_planner::CandidateEvidenceCache,
+    candidate: &MixPlan,
+    queue: &mut CandidateQueue,
+    admission: &TacticPolicy,
+    admitted: &mut std::collections::BTreeMap<String, usize>,
+    rejected: &mut std::collections::BTreeMap<String, usize>,
+    details: &mut Vec<serde_json::Value>,
+    cancel: &Cancellation,
+) -> Result<Vec<MeasuredEdge>> {
+    let mut edges = vec![];
+    let facts = match cache.candidate_facts(store, candidate, 0, cancel) {
+        Ok(facts) => facts,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "TACTIC_FACTS"
+                    | "TACTIC_GRID"
+                    | "TACTIC_BAR_WINDOW"
+                    | "TACTIC_NATIVE_GRID"
+                    | "TACTIC_BOUNDARIES"
+            ) =>
+        {
+            *rejected.entry(error.code).or_default() += 1;
+            return Ok(vec![]);
+        }
+        Err(error) => return Err(error),
+    };
+    let selection = mixlib_planner::select_tactics(&facts, admission)?;
+    details.push(window_diagnostic(candidate, &facts, &selection));
+    extend_cues(
+        store, request, mixing, candidate, &selection, &facts, queue, cancel,
+    )?;
+    for profile in facts
+        .pair
+        .profiles
+        .values()
+        .filter(|p| p.predicted_peak_dbfs.is_none())
+    {
+        for reason in &profile.evidence {
+            *rejected.entry(reason.clone()).or_default() += 1;
+        }
+    }
+    for rejection in &selection.rejected {
+        for reason in &rejection.reasons {
+            *rejected
+                .entry(format!("{:?}: {reason}", rejection.tactic_id))
+                .or_default() += 1;
+        }
+    }
+    let t = &candidate.transitions[0];
+    let exit = candidate.placements[0]
+        .time_map
+        .source_at(t.start_output_frame as f64)
+        .round() as u64;
+    let entry_end = candidate.placements[1]
+        .time_map
+        .source_at(t.end_output_frame as f64)
+        .round() as u64;
+    for ranked in selection.candidates {
+        let id = format!("{:?}", ranked.plan.tactic_id);
+        let mut plan = candidate.clone();
+        if write_tactics(&mut plan, vec![ranked.plan]).is_err() {
+            continue;
+        }
+        plan.header.extensions.insert(
+            "dense_quality_seconds".into(),
+            serde_json::json!(ranked.dense_quality_seconds),
+        );
+        plan.header.extensions.insert(
+            "handoff_quality_seconds".into(),
+            serde_json::json!(ranked.handoff_quality_seconds),
+        );
+        plan.renderer_version = mixlib_audio::TACTIC_RENDERER.into();
+        plan.validate()?;
+        *admitted.entry(id).or_default() += 1;
+        edges.push(MeasuredEdge {
+            plan,
+            exit,
+            entry_end,
+            score: ranked.score,
+            last_resort: ranked.last_resort,
+            dense_quality_seconds: ranked.dense_quality_seconds,
+            handoff_quality_seconds: ranked.handoff_quality_seconds,
+        });
+    }
+    Ok(edges)
 }
 
 #[derive(Clone, Copy)]

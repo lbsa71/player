@@ -175,7 +175,7 @@ pub(super) fn build(
     let comparisons = measured_beam::route_comparisons(plan);
     let data = json!({"version":1,"plan_id":plan.plan_id,"duration_seconds":plan.total_output_frames as f64/rate,
         "evidence_basis":"Exact saved schedule; profiles remeasured without cue/tactic selection. Heuristic scores, not probabilities.",
-        "rows":rows,"route_comparisons":comparisons,"search":plan.header.extensions.get("dense_anchor_search")});
+        "rows":rows,"set_composition":plan.header.extensions.get("set_composition"),"route_comparisons":comparisons,"search":plan.header.extensions.get("lazy_search").or_else(||plan.header.extensions.get("dense_anchor_search"))});
     let mut markdown = format!("# Mix timetable and evidence\n\nPlan `{}` · duration **{}**.\n\nRows describe the saved choices. Evidence is remeasured for those cues and the chosen exit variant; no tracks or tactics are reselected. Scores are heuristics, not probabilities.\n\n| # | Track | Mix presence | Incoming transition | Hold / resolution | Source excerpt | Evidence / reason |\n|---|---|---|---|---|---|---|\n", plan.plan_id, clock(plan.total_output_frames as f64/rate));
     for row in &rows {
         let t = &row["transition"];
@@ -208,6 +208,8 @@ pub(super) fn build(
                         / rate
                         * 1000.
                 )
+            } else if t["tactic"].as_str() == Some("M04") {
+                format!("{}-bar isolated motif overlay; no full-mix hold", t["bars"])
             } else {
                 format!(
                     "{} bars; {:.2} held + {:.2} resolve",
@@ -249,48 +251,96 @@ pub(super) fn build(
             cell(&evidence)
         ));
     }
-    markdown.push_str("\nHigher complementarity/stability and lower harmonic distance/lead conflict are preferable. Density and stability ranges cover the candidate bars; the saved JSON preserves their individual values and exact vocal schedules.\n\n## Full-set alternatives\n\nThe search minimizes fallbacks, then weak joins, then maximizes quality-weighted sustained seconds minus saved pacing penalties, weakest-join score and total score, in that order. These comparisons concern measured candidates within the saved search budget.\n\n| Anchor | Result | First deciding criterion | Problem joins |\n|---|---|---|---|\n");
-    if let Some(comparisons) = comparisons.as_array() {
-        for comparison in comparisons {
-            let anchor = &comparison["anchor"];
-            let label = |id: &Value| {
-                rows.iter()
-                    .find(|r| r["track_id"] == *id)
-                    .and_then(|r| r["track"].as_str())
-                    .unwrap_or_else(|| id.as_str().unwrap_or("?"))
-                    .to_owned()
-            };
-            let name = if anchor.is_null() {
-                "Unconstrained".into()
-            } else {
-                format!("{} → {}", label(&anchor["from"]), label(&anchor["to"]))
-            };
-            let problems = comparison["problem_joins"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|join| {
-                    format!(
-                        "{} → {}: {}, score {:.2}{}",
-                        label(&join["from"]),
-                        label(&join["to"]),
-                        join["choice"].as_str().unwrap_or("unknown tactic"),
-                        join["score"].as_f64().unwrap_or(0.),
-                        if join["last_resort"].as_bool().unwrap_or(false) {
-                            ", fallback"
-                        } else {
-                            ""
-                        }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
+    if let Some(c) = plan.header.extensions.get("set_composition") {
+        markdown.push_str(&format!("\n## Set structure\n\n{} arc; {}–{} minutes required. Actual duration {}. Composition objective {:.3}; mean intensity mismatch {:.3}; development-shortage penalty {:.3}. These are acoustic heuristics, not emotion probabilities.\n\n| Track | Solo time | Minimum | Preferred | Intensity percentile | Arc mismatch |\n|---|---:|---:|---:|---:|---:|\n",
+            c["structure"].as_str().unwrap_or("unknown"), c["minimum_seconds"].as_f64().unwrap_or(0.) / 60., c["maximum_seconds"].as_f64().unwrap_or(0.) / 60.,
+            clock(c["duration_seconds"].as_f64().unwrap_or(0.)), c["objective"].as_f64().unwrap_or(0.), c["arc_error"].as_f64().unwrap_or(0.), c["dwell_penalty"].as_f64().unwrap_or(0.)));
+        for passage in c["passages"].as_array().into_iter().flatten() {
+            let label = rows
+                .iter()
+                .find(|r| r["track_id"] == passage["track_id"])
+                .map_or_else(
+                    || passage["track_id"].as_str().unwrap_or("unknown").to_owned(),
+                    |r| r["track"].as_str().unwrap_or("unknown").to_owned(),
+                );
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} |\n",
-                cell(&name),
-                cell(comparison["result"].as_str().unwrap()),
-                cell(comparison["reason"].as_str().unwrap()),
-                cell(&problems)
+                "| {} | {} | {} | {} | {:.3} | {:.3} |\n",
+                cell(&label),
+                clock(passage["solo_seconds"].as_f64().unwrap_or(0.)),
+                clock(passage["minimum_seconds"].as_f64().unwrap_or(0.)),
+                clock(passage["preferred_seconds"].as_f64().unwrap_or(0.)),
+                passage["intensity_percentile"].as_f64().unwrap_or(0.),
+                passage["arc_error"].as_f64().unwrap_or(0.)
+            ));
+        }
+    }
+    if !plan.header.extensions.contains_key("set_composition") {
+        markdown.push_str("\nHigher complementarity/stability and lower harmonic distance/lead conflict are preferable. Density and stability ranges cover the candidate bars; the saved JSON preserves their individual values and exact vocal schedules.\n\n## Full-set alternatives\n\nThe search minimizes fallbacks, then weak joins, then maximizes quality-weighted sustained seconds minus saved pacing penalties, weakest-join score and total score, in that order. These comparisons concern measured candidates within the saved search budget.\n\n| Anchor | Result | First deciding criterion | Problem joins |\n|---|---|---|---|\n");
+        if let Some(comparisons) = comparisons.as_array() {
+            for comparison in comparisons {
+                let anchor = &comparison["anchor"];
+                let label = |id: &Value| {
+                    rows.iter()
+                        .find(|r| r["track_id"] == *id)
+                        .and_then(|r| r["track"].as_str())
+                        .unwrap_or_else(|| id.as_str().unwrap_or("?"))
+                        .to_owned()
+                };
+                let name = if anchor.is_null() {
+                    "Unconstrained".into()
+                } else {
+                    format!("{} → {}", label(&anchor["from"]), label(&anchor["to"]))
+                };
+                let problems = comparison["problem_joins"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|join| {
+                        format!(
+                            "{} → {}: {}, score {:.2}{}",
+                            label(&join["from"]),
+                            label(&join["to"]),
+                            join["choice"].as_str().unwrap_or("unknown tactic"),
+                            join["score"].as_f64().unwrap_or(0.),
+                            if join["last_resort"].as_bool().unwrap_or(false) {
+                                ", fallback"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                markdown.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    cell(&name),
+                    cell(comparison["result"].as_str().unwrap()),
+                    cell(comparison["reason"].as_str().unwrap()),
+                    cell(&problems)
+                ));
+            }
+        }
+    }
+    if let Some(search) = plan.header.extensions.get("lazy_search") {
+        let stats = &search["stats"];
+        markdown.push_str(&format!(
+            "\n## Lazy search evidence\n\nStopped at `{}` after {:.1} seconds: {} measured windows, {} cached uses, {} cheap branch rejections, {} objective-bound rejections, and {} frontier drops. Frontier drops are budget decisions, not proofs of infeasibility.\n\n| Origin | Seconds | Measurements | Sustained quality after pacing | Composition score |\n|---|---:|---:|---:|---:|\n",
+            search["status"].as_str().unwrap_or("unknown"),
+            search["elapsed_seconds"].as_f64().unwrap_or(0.),
+            stats["measured_windows"], stats["cached_window_uses"],
+            stats["cheap_rejections"], stats["bound_rejections"], stats["frontier_dropped"]
+        ));
+        for entry in search["improvements"].as_array().into_iter().flatten() {
+            markdown.push_str(&format!(
+                "| {} | {:.1} | {} | {:.3} | {} |\n",
+                cell(entry["origin"].as_str().unwrap_or("searched")),
+                entry["elapsed_seconds"].as_f64().unwrap_or(0.),
+                entry["measured_windows"],
+                entry["sustained_after_pacing"].as_f64().unwrap_or(0.),
+                entry["composition"]["objective"]
+                    .as_f64()
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "—".into())
             ));
         }
     }

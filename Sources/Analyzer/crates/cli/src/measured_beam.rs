@@ -21,8 +21,7 @@ pub(super) fn prepared_pool(store: &Store) -> Result<Vec<Track>> {
             pool.push(track);
         }
     }
-    pool.sort_by(|a, b| a.track_id.cmp(&b.track_id));
-    Ok(pool)
+    mixlib_planner::unique_song_pool(store, pool)
 }
 
 type Graph = Vec<Vec<MeasuredEdge>>;
@@ -133,18 +132,18 @@ fn measure_graph(
 }
 
 #[derive(Clone, Copy)]
-struct Quality {
-    fallbacks: usize,
-    weak_links: usize,
-    dense_quality_seconds: f64,
-    handoff_quality_seconds: f64,
-    pacing_penalty: f64,
-    weakest: f64,
-    total: f64,
+pub(super) struct Quality {
+    pub(super) fallbacks: usize,
+    pub(super) weak_links: usize,
+    pub(super) dense_quality_seconds: f64,
+    pub(super) handoff_quality_seconds: f64,
+    pub(super) pacing_penalty: f64,
+    pub(super) weakest: f64,
+    pub(super) total: f64,
 }
 
 impl Quality {
-    const EMPTY: Self = Self {
+    pub(super) const EMPTY: Self = Self {
         fallbacks: 0,
         weak_links: 0,
         dense_quality_seconds: 0.,
@@ -154,7 +153,7 @@ impl Quality {
         total: 0.,
     };
 
-    fn extend(
+    pub(super) fn extend(
         self,
         score: f64,
         last_resort: bool,
@@ -172,16 +171,16 @@ impl Quality {
         }
     }
 
-    fn paced(mut self, penalty: f64) -> Self {
+    pub(super) fn paced(mut self, penalty: f64) -> Self {
         self.pacing_penalty += penalty;
         self
     }
 
-    fn sustained(self) -> f64 {
+    pub(super) fn sustained(self) -> f64 {
         self.dense_quality_seconds + self.handoff_quality_seconds - self.pacing_penalty
     }
 
-    fn best_first(self, other: Self) -> std::cmp::Ordering {
+    pub(super) fn best_first(self, other: Self) -> std::cmp::Ordering {
         self.fallbacks
             .cmp(&other.fallbacks)
             .then_with(|| self.weak_links.cmp(&other.weak_links))
@@ -213,7 +212,7 @@ impl Anchor {
     }
 }
 
-fn route_quality(plan: &MixPlan) -> Quality {
+pub(super) fn route_quality(plan: &MixPlan) -> Quality {
     plan.header
         .extensions
         .get("chain_joins")
@@ -420,7 +419,7 @@ impl Runway<'_> {
     }
 }
 
-fn route_local(error: &Error) -> bool {
+pub(super) fn route_local(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
         "CHAIN_CUES"
@@ -664,6 +663,127 @@ fn search_with_fallback_budget(
     Ok(None)
 }
 
+/// Assemble only already measured choices. Both eager selection and lazy
+/// discovery share anchor ranking, phrase pacing, route constraints and score.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn assemble_measured(
+    store: &Store,
+    graph: &Graph,
+    pool: &[Track],
+    pacing: &[TrackPacing],
+    policy: &MixingConfig,
+    count: usize,
+    max_fallbacks: usize,
+    anchor_slots: usize,
+    deadline: Option<std::time::Instant>,
+    cancel: &Cancellation,
+) -> Result<Option<MixPlan>> {
+    let n = pool.len();
+    // Keep anchor opportunities from both successful musical patterns.
+    // Neither plentiful dense mashups nor long sparse handoffs can evict
+    // the other family before full-route comparison.
+    let anchors_for = |handoff: bool| {
+        let mut anchors: Vec<_> = graph
+            .iter()
+            .enumerate()
+            .flat_map(|(pair, edges)| {
+                edges
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, e)| {
+                        if handoff {
+                            e.handoff_quality_seconds > 0.
+                        } else {
+                            e.dense_quality_seconds > 0.
+                        }
+                    })
+                    .map(move |(edge, _)| Anchor {
+                        from: pair / n,
+                        to: pair % n,
+                        edge,
+                    })
+            })
+            .collect();
+        anchors.sort_by(|a, b| {
+            let value = |a: &Anchor| {
+                let e = &graph[a.from * n + a.to][a.edge];
+                if handoff {
+                    e.handoff_quality_seconds
+                } else {
+                    e.dense_quality_seconds
+                }
+            };
+            value(b).total_cmp(&value(a))
+        });
+        anchors.truncate(anchor_slots);
+        anchors
+    };
+    let mut anchors = anchors_for(false);
+    anchors.extend(anchors_for(true));
+    let mut trials = vec![];
+    {
+        let width = policy.beam_width;
+        let mut best: Option<MixPlan> = None;
+
+        for anchor in anchors
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                break;
+            }
+            let candidate = search(
+                store,
+                graph,
+                pool,
+                pacing,
+                count,
+                width,
+                max_fallbacks,
+                anchor,
+                cancel,
+            )?;
+            let effective_width = candidate
+                .as_ref()
+                .and_then(|p| p.header.extensions.get("search_bounds"))
+                .and_then(|v| v.get("beam_width"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(width.saturating_mul(4) as u64);
+            let edge = anchor.map(|a| &graph[a.from * pool.len() + a.to][a.edge]);
+            trials.push(serde_json::json!({
+                    "anchor":edge.map(|e|serde_json::json!({"from":e.plan.placements[0].track_id,"to":e.plan.placements[1].track_id,
+                        "cue":e.plan.header.extensions.get("tactic_cue_candidate"),"score":e.score,"dense_quality_seconds":e.dense_quality_seconds,"handoff_quality_seconds":e.handoff_quality_seconds})),
+                    "beam_width":effective_width,"complete":candidate.is_some(),
+                    "route":candidate.as_ref().map(|p|serde_json::json!({"tracks":p.placements.iter().map(|p|&p.track_id).collect::<Vec<_>>(),
+                        "joins":p.header.extensions.get("chain_joins"),
+                        "fallbacks":route_quality(p).fallbacks,"weak_links":route_quality(p).weak_links,
+                        "weakest":route_quality(p).weakest,"total":route_quality(p).total,"dense_quality_seconds":route_quality(p).dense_quality_seconds,"handoff_quality_seconds":route_quality(p).handoff_quality_seconds,"pacing_penalty":route_quality(p).pacing_penalty})),
+                    "failure":if candidate.is_none(){Some("no complete route within this anchor, cue, solo-runway and beam budget")}else{None::<&str>}
+                }));
+            if let Some(plan) = candidate {
+                if best
+                    .as_ref()
+                    .is_none_or(|old| route_quality(&plan).best_first(route_quality(old)).is_lt())
+                {
+                    best = Some(plan);
+                }
+            }
+            eprintln!("stitch: tested {} sustained-anchor routes", trials.len());
+        }
+        let Some(mut plan) = best else {
+            return Ok(None);
+        };
+
+        plan.planner_version = "phrase-paced-anchor-beam/6".into();
+        plan.header.extensions.insert("dense_anchor_search".into(),serde_json::json!({"trials":trials,
+                "objective":"fewest fallbacks, fewest joins below score 25, most quality-weighted dense mashup plus stable handoff seconds minus pacing penalty, strongest weakest join, total fit",
+                "anchor_limit":anchor_slots*2,"selected_dense_quality_seconds":route_quality(&plan).dense_quality_seconds,"selected_handoff_quality_seconds":route_quality(&plan).handoff_quality_seconds,"selected_pacing_penalty":route_quality(&plan).pacing_penalty,"anchor_slots_per_family":anchor_slots}));
+        Ok(Some(plan))
+    }
+}
+
 pub(super) fn choose(
     store: &Store,
     policy: &MixingConfig,
@@ -712,114 +832,30 @@ pub(super) fn choose(
         );
         let edges: usize = graph.iter().map(Vec::len).sum();
         eprintln!("stitch: {edges} admitted cue/tactic choices");
-        let n = pool.len();
-        // Keep anchor opportunities from both successful musical patterns.
-        // Neither plentiful dense mashups nor long sparse handoffs can evict
-        // the other family before full-route comparison.
-        let anchors_for = |handoff: bool| {
-            let mut anchors: Vec<_> = graph
-                .iter()
-                .enumerate()
-                .flat_map(|(pair, edges)| {
-                    edges
-                        .iter()
-                        .enumerate()
-                        .filter(move |(_, e)| {
-                            if handoff {
-                                e.handoff_quality_seconds > 0.
-                            } else {
-                                e.dense_quality_seconds > 0.
-                            }
-                        })
-                        .map(move |(edge, _)| Anchor {
-                            from: pair / n,
-                            to: pair % n,
-                            edge,
-                        })
-                })
-                .collect();
-            anchors.sort_by(|a, b| {
-                let value = |a: &Anchor| {
-                    let e = &graph[a.from * n + a.to][a.edge];
-                    if handoff {
-                        e.handoff_quality_seconds
-                    } else {
-                        e.dense_quality_seconds
-                    }
-                };
-                value(b).total_cmp(&value(a))
-            });
-            anchors.truncate(12);
-            anchors
+        let Some(mut plan) = assemble_measured(
+            &snapshot,
+            &graph,
+            &pool,
+            &pacing,
+            policy,
+            count,
+            max_fallbacks,
+            12,
+            None,
+            cancel,
+        )?
+        else {
+            continue;
         };
-        let mut anchors = anchors_for(false);
-        anchors.extend(anchors_for(true));
-        let mut trials = vec![];
-        {
-            let width = policy.beam_width;
-            let mut best: Option<MixPlan> = None;
-            let mut best_width = width;
-            for anchor in anchors
-                .iter()
-                .copied()
-                .map(Some)
-                .chain(std::iter::once(None))
-            {
-                let candidate = search(
-                    &snapshot,
-                    &graph,
-                    &pool,
-                    &pacing,
-                    count,
-                    width,
-                    max_fallbacks,
-                    anchor,
-                    cancel,
-                )?;
-                let effective_width = candidate
-                    .as_ref()
-                    .and_then(|p| p.header.extensions.get("search_bounds"))
-                    .and_then(|v| v.get("beam_width"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(width.saturating_mul(4) as u64);
-                let edge = anchor.map(|a| &graph[a.from * pool.len() + a.to][a.edge]);
-                trials.push(serde_json::json!({
-                    "anchor":edge.map(|e|serde_json::json!({"from":e.plan.placements[0].track_id,"to":e.plan.placements[1].track_id,
-                        "cue":e.plan.header.extensions.get("tactic_cue_candidate"),"score":e.score,"dense_quality_seconds":e.dense_quality_seconds,"handoff_quality_seconds":e.handoff_quality_seconds})),
-                    "beam_width":effective_width,"complete":candidate.is_some(),
-                    "route":candidate.as_ref().map(|p|serde_json::json!({"tracks":p.placements.iter().map(|p|&p.track_id).collect::<Vec<_>>(),
-                        "joins":p.header.extensions.get("chain_joins"),
-                        "fallbacks":route_quality(p).fallbacks,"weak_links":route_quality(p).weak_links,
-                        "weakest":route_quality(p).weakest,"total":route_quality(p).total,"dense_quality_seconds":route_quality(p).dense_quality_seconds,"handoff_quality_seconds":route_quality(p).handoff_quality_seconds,"pacing_penalty":route_quality(p).pacing_penalty})),
-                    "failure":if candidate.is_none(){Some("no complete route within this anchor, cue, solo-runway and beam budget")}else{None::<&str>}
-                }));
-                if let Some(plan) = candidate {
-                    if best.as_ref().is_none_or(|old| {
-                        route_quality(&plan).best_first(route_quality(old)).is_lt()
-                    }) {
-                        best_width = effective_width as usize;
-                        best = Some(plan);
-                    }
-                }
-                eprintln!("stitch: tested {} sustained-anchor routes", trials.len());
-            }
-            let Some(mut plan) = best else {
-                continue;
-            };
-            snapshot.verify_read_snapshot(cancel)?;
-            plan.planner_version = "phrase-paced-anchor-beam/6".into();
-            plan.header.extensions.insert("dense_anchor_search".into(),serde_json::json!({"trials":trials,
-                "objective":"fewest fallbacks, fewest joins below score 25, most quality-weighted dense mashup plus stable handoff seconds minus pacing penalty, strongest weakest join, total fit",
-                "anchor_limit":24,"selected_dense_quality_seconds":route_quality(&plan).dense_quality_seconds,"selected_handoff_quality_seconds":route_quality(&plan).handoff_quality_seconds,"selected_pacing_penalty":route_quality(&plan).pacing_penalty,"anchor_slots_per_family":12}));
-            plan.header.extensions.insert("library_pick".into(), serde_json::json!({
+        snapshot.verify_read_snapshot(cancel)?;
+        plan.header.extensions.insert("library_pick".into(), serde_json::json!({
                 "analyzed_tracks": pool.len(), "measured_choices": edges, "cue_budget_per_pair": budget*2+(budget/3).max(1),
                 "return_probe_budget_per_pair":(budget/3).max(1),
                 "seed_cue_budget_per_pair":budget,"continuation_budget_per_pair":budget,
-                "beam_width": best_width, "track_ids": plan.placements.iter().map(|p| &p.track_id).collect::<Vec<_>>(),
+                "beam_width": plan.header.extensions.get("search_bounds").and_then(|v|v.get("beam_width")), "track_ids": plan.placements.iter().map(|p| &p.track_id).collect::<Vec<_>>(),
                 "max_last_resort_transitions": max_fallbacks,
             }));
-            return Ok(plan);
-        }
+        return Ok(plan);
     }
     snapshot.verify_read_snapshot(cancel)?;
     Err(Error::new(
@@ -834,6 +870,36 @@ pub(super) fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_anchor_that_cannot_open_a_set_can_finish_one() {
+        let plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        let edge = |exit, entry_end, value| MeasuredEdge {
+            plan: plan.clone(),
+            exit,
+            entry_end,
+            score: 50.,
+            last_resort: false,
+            dense_quality_seconds: value,
+            handoff_quality_seconds: 0.,
+        };
+        let mut graph: Graph = (0..9).map(|_| vec![]).collect();
+        graph[1].push(edge(10, 20, 0.));
+        graph[5].push(edge(70, 20, 20.));
+        let pacing = vec![TrackPacing::unknown(1); 3];
+        let mut runway = Runway {
+            graph: &graph,
+            pacing: &pacing,
+            anchor: Some(Anchor {
+                from: 1,
+                to: 2,
+                edge: 0,
+            }),
+            memo: BTreeMap::new(),
+        };
+        assert!(!runway.can_finish(2, 1, 0, 2, 0));
+        assert!(runway.can_finish(1, 0, 0, 2, 0));
+    }
 
     #[test]
     fn reachability_uses_measured_phrases_instead_of_reapplying_a_time_minimum() {

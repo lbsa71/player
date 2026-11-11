@@ -2,6 +2,8 @@
 use super::*;
 
 const MAX_BEAT_SKEW_SECONDS: f64 = 0.030;
+/// Upper duration of dynamically discovered tactic continuations.
+pub const MAX_TACTIC_CONTINUATION_SECONDS: f64 = 120.;
 
 pub struct StitchRequest<'a> {
     pub from: &'a str,
@@ -683,7 +685,7 @@ pub fn tactic_stitch_candidates(
     // ordinary entries from which long dense continuations were discovered.
     let return_keys = append_return_probes(&mut choices, return_choices, (limit / 3).max(1));
     let mut result = Vec::new();
-    for (overlap, _, outgoing, incoming, _, incoming_overlap) in choices {
+    for (overlap, proposal_cost, outgoing, incoming, meter, incoming_overlap) in choices {
         let pinned = StitchRequest {
             overlap_beats: overlap,
             ..*request
@@ -716,7 +718,7 @@ pub fn tactic_stitch_candidates(
         plan.header.extensions.insert("tactic_cue_candidate".into(),serde_json::json!({
             "outgoing_source_frame":outgoing,"incoming_source_frame":incoming,"overlap_beats":overlap,
             "incoming_overlap_beats":incoming_overlap,"pulse_ratio":incoming_overlap as f64/overlap as f64,
-            "timing_basis":"bars", "entry_return_probe":return_keys.contains(&(overlap,outgoing,incoming,incoming_overlap))
+            "timing_basis":"bars", "bar_beats":meter, "proposal_cost":proposal_cost, "entry_return_probe":return_keys.contains(&(overlap,outgoing,incoming,incoming_overlap))
         }));
         result.push(plan);
     }
@@ -890,7 +892,7 @@ pub fn tactic_continuations(
         };
         if (plan.transitions[0].end_output_frame - plan.transitions[0].start_output_frame) as f64
             / f64::from(plan.output.sample_rate_hz)
-            > 120.
+            > MAX_TACTIC_CONTINUATION_SECONDS
         {
             continue;
         }
@@ -1893,7 +1895,7 @@ pub fn pick_tracks(
     track_count: usize,
     cancel: &Cancellation,
 ) -> Result<ChainPick> {
-    pick_tracks_in_pool(store, policy, context, track_count, false, cancel)
+    pick_tracks_in_pool(store, policy, context, track_count, false, false, cancel)
 }
 
 /// Restrict a route search to recordings with full tactic evidence when the
@@ -1905,15 +1907,29 @@ pub fn pick_prepared_tracks(
     track_count: usize,
     cancel: &Cancellation,
 ) -> Result<ChainPick> {
-    pick_tracks_in_pool(store, policy, context, track_count, true, cancel)
+    pick_tracks_in_pool(store, policy, context, track_count, true, false, cancel)
 }
 
+/// Preparation needs only prepared↔unprepared connections, not a speculative
+/// full route through every unanalyzed candidate in the library.
+pub fn shortlist_preparation(
+    store: &Store,
+    policy: &MixingConfig,
+    context: usize,
+    count: usize,
+    cancel: &Cancellation,
+) -> Result<ChainPick> {
+    pick_tracks_in_pool(store, policy, context, count, false, true, cancel)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pick_tracks_in_pool(
     store: &Store,
     policy: &MixingConfig,
     context: usize,
     track_count: usize,
     prepared_only: bool,
+    preparation_only: bool,
     cancel: &Cancellation,
 ) -> Result<ChainPick> {
     require(
@@ -1927,17 +1943,17 @@ fn pick_tracks_in_pool(
         "STITCH_BEATS",
         "choose 1–64 context beats",
     )?;
+    let tracks = store
+        .tracks()?
+        .into_iter()
+        .filter(|t| matches!(t.lifecycle, Lifecycle::Available) && t.active_analysis.is_some())
+        .collect();
     let mut pool = Vec::new();
-    let mut hashes = BTreeSet::new();
-    for track in store.tracks()? {
+    for track in crate::unique_song_pool(store, tracks)? {
         cancel.check()?;
-        if matches!(track.lifecycle, Lifecycle::Available) && track.active_analysis.is_some() {
-            let analyzed = load_analyzed(store, track)?;
-            if (!prepared_only || analyzed.analysis.artifacts.contains_key("tactic_analysis"))
-                && hashes.insert(analyzed.track.audio_hash.digest.clone())
-            {
-                pool.push(analyzed);
-            }
+        let analyzed = load_analyzed(store, track)?;
+        if !prepared_only || analyzed.analysis.artifacts.contains_key("tactic_analysis") {
+            pool.push(analyzed);
         }
     }
     require(
@@ -1992,6 +2008,9 @@ fn pick_tracks_in_pool(
         for (from, track) in pool.iter().enumerate() {
             for (to, incoming) in pool.iter().enumerate() {
                 cancel.check()?;
+                if preparation_only && evidence[from].is_some() == evidence[to].is_some() {
+                    continue;
+                }
                 if from == to || track.overrides.operations.iter().any(|op| matches!(
                     op, Correction::ExcludeTransition { to_track_id } if to_track_id == &incoming.track.track_id
                 )) { continue; }
@@ -2089,6 +2108,14 @@ fn pick_tracks_in_pool(
             "basis":"basic timing, harmony, texture and source runway; pending stem/vocal admission"})
     }).collect();
 
+    if preparation_only {
+        return Ok(ChainPick {
+            analyzed_tracks: count,
+            orders: vec![],
+            preparation_candidates,
+        });
+    }
+
     struct Route {
         tracks: Vec<usize>,
         entry_end: u64,
@@ -2174,16 +2201,37 @@ pub struct ChainBookends {
     pub ending: &'static str,
 }
 
-pub fn choose_chain_bookends(
+#[derive(Clone, Debug, Default)]
+pub struct ChainOpening {
+    attack: u64,
+    accent: Option<u64>,
+    lead: u64,
+}
+impl ChainOpening {
+    pub fn before(&self, frame: u64) -> u64 {
+        self.accent
+            .filter(|accent| *accent <= frame)
+            .map_or(self.attack, |accent| accent.saturating_sub(self.lead))
+            .min(frame)
+    }
+}
+pub fn read_chain_opening(
     store: &Store,
-    first: &Placement,
-    last: &Placement,
+    track_id: &str,
+    before_frame: u64,
     cancel: &Cancellation,
-) -> Result<ChainBookends> {
-    let first_track = load_analyzed(store, store.track(&first.track_id)?)?;
-    let last_track = load_analyzed(store, store.track(&last.track_id)?)?;
+) -> Result<u64> {
+    Ok(read_chain_opening_cue(store, track_id, cancel)?.before(before_frame))
+}
+
+/// Shared opening selection for both short chains and duration-aware sets.
+pub fn read_chain_opening_cue(
+    store: &Store,
+    track_id: &str,
+    cancel: &Cancellation,
+) -> Result<ChainOpening> {
+    let first_track = load_analyzed(store, store.track(track_id)?)?;
     let opening = ReturnFeatures::read(store, &first_track, cancel)?;
-    let closing = ReturnFeatures::read(store, &last_track, cancel)?;
     let threshold = first_track.analysis.rms.max(1e-6) * 0.10;
     let first_audible = opening
         .frames
@@ -2202,7 +2250,6 @@ pub fn choose_chain_bookends(
                 && beat.score >= 0.5
                 && beat.source_frame >= first_audible
                 && beat.source_frame <= first_audible + 2 * opening_rate
-                && beat.source_frame <= first.source_start_frame
         })
         .find(|beat| {
             let at = beat.source_frame;
@@ -2210,11 +2257,23 @@ pub fn choose_chain_bookends(
             let after = opening.rms(at, at + opening_rate / 2);
             after >= threshold && before <= after * 0.30
         })
-        .map_or(attack, |beat| {
-            beat.source_frame.saturating_sub(opening_rate / 20)
-        });
-    let start = first.source_start_frame.min(entry);
+        .map(|beat| beat.source_frame);
+    Ok(ChainOpening {
+        attack,
+        accent: entry,
+        lead: opening_rate / 20,
+    })
+}
 
+pub fn choose_chain_bookends(
+    store: &Store,
+    first: &Placement,
+    last: &Placement,
+    cancel: &Cancellation,
+) -> Result<ChainBookends> {
+    let start = read_chain_opening(store, &first.track_id, first.source_start_frame, cancel)?;
+    let last_track = load_analyzed(store, store.track(&last.track_id)?)?;
+    let closing = ReturnFeatures::read(store, &last_track, cancel)?;
     let rate = u64::from(last_track.track.format.sample_rate_hz);
     let source_end = last_track.track.format.frames;
     let solo_start = last.time_map.anchors[last.time_map.anchors.len() - 2].source_frame;
@@ -3032,5 +3091,23 @@ mod mashup_tests {
         incoming[2] = bar(true);
         incoming[2].relative_level = 0.3;
         assert!(mashup_compatibility(&outgoing, &incoming).is_none());
+    }
+}
+
+#[cfg(test)]
+mod opening_cue_tests {
+    use super::*;
+    #[test]
+    fn cached_opening_keeps_the_before_frame_constraint() {
+        let cue = ChainOpening {
+            attack: 75,
+            accent: Some(150),
+            lead: 5,
+        };
+        assert_eq!(cue.before(50), 50);
+        assert_eq!(cue.before(100), 75);
+        assert_eq!(cue.before(149), 75);
+        assert_eq!(cue.before(150), 145);
+        assert_eq!(cue.before(500), 145);
     }
 }

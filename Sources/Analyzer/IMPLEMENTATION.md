@@ -631,7 +631,149 @@ measurements and penalty. The planner version is `phrase-paced-anchor-beam/6`.
 reports the native pacing decision without selecting a tactic or changing the
 library. This is a pacing audit, not proof that an entire route can render.
 
-The search remains bounded beam search. A future anytime constraint solver can
-reuse these pure admission contracts, add lazy candidate measurement and
-optimistic bounds, and refine promising complete sets. The current implementation
-does not claim exhaustive combinations or a globally optimal set.
+Four-track selection retains bounded beam search. Eight-track selection uses
+the lazy solver below, sharing admission contracts and optimistic bounds.
+Neither strategy claims exhaustive combinations or a globally optimal set.
+
+## Lazy anytime set search
+
+`stitch --pick-eight` defaults to `lazy-constraint-search/3`, with a 1,536-window
+and 1,200-second budget. `--search-strategy eager` retains the fully measured
+comparison path; four-track selection still defaults to eager.
+`search-set --tracks 8 --measurements 1536 --seconds 1200`
+searches and saves plans without rendering audio. Each strictly better complete
+incumbent is persisted as an independently addressable plan and recorded in a
+progress report. A measurement/time/work budget returns the best admitted
+incumbent; exhausting the budget without one reports `LAZY_NO_INCUMBENT`, not
+proof that the library has no valid set. Cancellation stops work; already saved
+incumbents remain available, but cancellation does not silently render one.
+
+The cheap proposal stage creates bounded cue families for every directed track
+pair, using the established tempo/cue/phrase and exclusion rules. It does not
+compute pair PCM profiles. Each family retains an outgoing cue and an optimistic
+incoming-end bound. Dynamic continuations retain those starts and can only
+lengthen the overlap. This permits distinct-track/source-runway reachability
+checks before audio measurement. Optimistic reachability uses the shortest
+entry even if that seed's tactics later fail; it cannot authorize a join.
+
+Surviving branches request one cue-window measurement at a time through the
+same `tactics::measure_window` used by eager search. Every discovered tactic and
+exit variant retains all existing audible-vocal, buildup, isolation, layer,
+headroom and assembly checks. Results are cached within that immutable source
+snapshot and reused across routes. The existing dynamic endpoint discovery and
+per-pair continuation reserve remain active.
+
+The pruning upper bound gives future joins zero fallback/weak-link/pacing cost,
+unlimited total-fit improvement, and up to the maximum possible held duration
+in sustained quality. Weighted sustained quality cannot exceed held duration;
+dynamic continuation duration is a shared planner constant. Runtime checks
+reject a measured edge or continuation escaping that envelope. This bound is
+intentionally conservative. Frontier ordering is a separate heuristic and is
+never treated as a proof that a branch cannot win.
+
+The search periodically explores shallower alternatives, retains multiple entry
+cues, and reserves frontier capacity across depths. Its diagnostics distinguish
+cheap/bound rejections, measured windows, cache reuse, frontier truncation,
+incumbent improvements and the stopping budget. It remains bounded in cue
+proposals, measurements and frontier memory, so it does not claim a global
+optimum over every segment of every track. Future work can tighten sound bounds
+or make proposal discovery lazy without changing tactic admission or scoring.
+
+`search-set --incumbent PLAN_ID` starts from a saved, verified complete plan.
+Track membership, distinctness, source integrity, musical policy and current
+phrase pacing must still match. Search-budget settings do not alter musical
+policy equivalence. The supplied plan is copied under a new ID and explicitly
+labelled `provided_incumbent`; only strictly better sets can replace it. This
+provides a no-regression starting point while measurement budgets are refined.
+The initial cold benchmark found a clean set quickly but favored bass swaps.
+The version 3 cold benchmark independently recovered the reference 53.8024 set
+at 1,024 measurements, versus 5,965 windows in the fully measured reference;
+this validated switching the automatic eight-track path to lazy discovery.
+
+Time limits are checked between work items; initial cue proposal, an in-flight
+measurement and final snapshot verification can extend wall time beyond the
+requested limit. Measurement budgets count unique evaluated windows, not tactics.
+
+Incumbent comparison normalizes the generic playlist template/fallback fields
+to the short-crossfade scaffold used by measured cue construction. Actual tactic
+fallback limits, speed limits and all other musical settings still must match.
+
+### Anchor discovery in lazy search, version 2
+
+Lazy discovery and route expansion now have separate scheduling lanes. Cheap
+proposal cost, supported meter, returning-beat probes, measured sustained value,
+and per-pair coverage order the next measurement. Raw overlap duration no longer
+wins by itself. Eight-to-sixteen-bar probes get early measurement opportunities;
+this is a discovery preference, not a rendered duration limit. Measured promising
+seeds still expand to the actual musical endpoints through the existing tactic
+continuation rules, including longer holds.
+
+Each window is measured once. Its admitted edges also enter a persistent graph
+independent of the route frontier. Every 128 measurements and at the measurement
+budget, the app reassembles full sets around the strongest measured dense-mashup
+and sustained-handoff anchors. Anchors can occur at any position. Both eager and
+lazy callers share `measured_beam::assemble_measured`; vocal, buildup, phrase
+pacing, time-map assembly and lexicographic quality rules are unchanged.
+
+Discovery ordering is heuristic, not a proof-based prune. Route pruning retains
+its conservative bounds. Diagnostics distinguish discovery measurements, anchor
+assembly checkpoints and incumbent origins; no previous mix is read unless the
+caller explicitly passes `--incumbent`. Previously measured pair reports are not
+used as a cache across runs.
+
+Version 3 also learns measurement demand from its own anchor trials. Weak or
+fallback joins on routes containing valuable anchors receive a temporary pair
+priority; ordinary non-sustained links receive a smaller opportunity bonus.
+The bonus decays after each measurement and is recomputed at the next graph
+checkpoint. This directs work toward missing connections instead of repeatedly
+measuring only the strongest mashup itself. Route-frontier priority uses the
+same phrase-probe preference and observed sustained value, removing its raw
+length bonus. No external winner, artist identity or hand-picked cue is used.
+The last 16 graph checkpoints are retained in the plan; saved incumbent history
+and separate pair reports preserve the search evidence.
+
+Automatic pools now deduplicate both audio hashes and nonempty recorder `trackID`
+metadata. A second capture of the same source song is not a new song. Existing
+prepared captures win over unprepared copies; among prepared copies the earliest
+recording is retained deterministically. Missing source IDs fall back to audio
+identity, and titles are never used to merge different releases/remixes.
+Preparation reports separate analyzed recording counts from unique song counts.
+
+Preparation shortlisting now computes only prepared↔unprepared basic connections
+and returns before speculative full-route construction. It retains the existing
+bidirectional timing, harmony and phrase-runway ranking; full stem/vocal analysis
+still decides actual transition eligibility.
+
+The 19-song expansion benchmark exposed a remaining coverage limit: the default
+1,536-window cold run scored 52.1856 and missed one reference S05 cue, while the
+15-song cold run recovered 53.8024 at 1,024 windows. A larger pool is not a
+guarantee of a better result at a fixed budget. Previously saved winners remain
+available; a cold search does not silently seed itself with those plans.
+
+## Set composition (2026-11-11)
+
+`search-set` now defaults to a duration-constrained hour; `--set-minutes 120`
+selects 117–120 minutes. Explicit `--tracks 8` retains the short benchmark path.
+`--structure story|wave|ramp|chapters` selects a documented acoustic arc; auto
+uses story for an hour and chapters for two. See `SET_STRUCTURE_TACTICS.md` for
+research, exact initial weights, assumptions and unimplemented semantic tactics.
+
+The CLI composition owner consumes already admitted measured edges. It searches
+variable song counts, scores actual played source bars against output-time arc
+positions, weights developmental dwell, retains elapsed/entry diversity, and
+checks finished bookends against the duration window. It cannot change DSP,
+relax vocal/buildup admission, pad audio or return an undersized set as complete.
+Later exit proposals are protected at 35% and 60% of outgoing source duration.
+Saved plans and timetables include `set_composition` evidence. This is bounded
+heuristic search; it does not certify global optimality or semantic emotion.
+
+Full `analyze-tactics` preparation now deduplicates available source song IDs,
+retains prepared captures, and visits every unique song instead of a shortlist.
+On machines with at least eight logical CPUs it runs two four-thread separator
+jobs, serializes fused-sidecar publication, and persists batch progress. Explicit
+track IDs still address particular recordings. Source data and the one-JSON-per-
+WAV layout are preserved.
+
+M04 timetable wording now identifies its isolated motif overlay and does not
+present zero held bars as a full-mix hold/resolve. Perceptual masking of a quiet
+motif beneath strong incoming material remains distinct from set composition.

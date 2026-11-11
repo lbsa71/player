@@ -47,32 +47,100 @@ pub(super) fn ensure_tactic_analysis(
             .collect::<BTreeMap<_, _>>(),
     )?;
     let targets: BTreeSet<_> = if track_ids.is_empty() {
-        store.tracks()?.into_iter().map(|t| t.track_id).collect()
+        mixlib_planner::unique_song_pool(
+            store,
+            store
+                .tracks()?
+                .into_iter()
+                .filter(|t| matches!(t.lifecycle, Lifecycle::Available))
+                .collect(),
+        )?
+        .into_iter()
+        .map(|t| t.track_id)
+        .collect()
     } else {
         track_ids.iter().cloned().collect()
     };
     let mut report = Report::new("tactic_analysis");
-    for track_id in targets {
+    report
+        .header
+        .extensions
+        .insert("target_songs".into(), serde_json::json!(targets.len()));
+    let targets: Vec<_> = targets.into_iter().collect();
+    // Each separator owns four CPU threads. Keep at most two independent jobs
+    // on machines with eight logical CPUs; publication remains serialized.
+    let workers = std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).clamp(1, 2));
+    for batch in targets.chunks(workers) {
         cancel.check()?;
-        eprintln!("tactic analysis: inspecting {track_id}");
-        match analyze_one(
-            store,
-            &track_id,
-            python,
-            &models,
-            &implementation_hash,
-            &methods,
-            cancel,
-        ) {
-            Ok(cached) => report.count(if cached { "cached" } else { "analyzed" }),
-            Err(error) if error.code == "CANCELLED" => return Err(error),
-            Err(error) => {
-                eprintln!("tactic analysis: failed {track_id}: {error}");
-                report.count("failed");
-                report.error(&track_id, &error);
+        let results = std::thread::scope(|scope| {
+            let jobs: Vec<_> = batch
+                .iter()
+                .map(|track_id| {
+                    let models = &models;
+                    let implementation_hash = &implementation_hash;
+                    let methods = &methods;
+                    scope.spawn(move || {
+                        eprintln!("tactic analysis: inspecting {track_id}");
+                        (
+                            track_id,
+                            analyze_one(
+                                store,
+                                track_id,
+                                python,
+                                models,
+                                implementation_hash,
+                                methods,
+                                cancel,
+                            ),
+                        )
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|j| {
+                    j.join()
+                        .map_err(|_| Error::new("TACTIC_WORKER", "analysis worker failed"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (track_id, result) in results {
+            match result {
+                Ok(cached) => report.count(if cached { "cached" } else { "analyzed" }),
+                Err(error) if error.code == "CANCELLED" => {
+                    report
+                        .header
+                        .extensions
+                        .insert("status".into(), serde_json::json!("cancelled"));
+                    store.report(&report)?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    eprintln!("tactic analysis: failed {track_id}: {error}");
+                    report.count("failed");
+                    report.error(track_id, &error);
+                }
             }
         }
+        report
+            .header
+            .extensions
+            .insert("status".into(), serde_json::json!("running"));
+        store.report(&report)?;
+        eprintln!(
+            "tactic analysis: {} prepared/cached, {} failed, {} targets",
+            report.counts.get("cached").unwrap_or(&0) + report.counts.get("analyzed").unwrap_or(&0),
+            report.counts.get("failed").unwrap_or(&0),
+            targets.len()
+        );
     }
+    report.header.extensions.insert(
+        "status".into(),
+        serde_json::json!(if report.counts.get("failed").copied().unwrap_or(0) == 0 {
+            "complete"
+        } else {
+            "incomplete"
+        }),
+    );
     store.report(&report)?;
     Ok(report)
 }
@@ -90,11 +158,20 @@ pub(super) fn expand_pool(
     eprintln!(
         "tactic analysis: ranking new tracks by two-sided connections to {before} prepared tracks"
     );
-    let shortlist = mixlib_planner::pick_tracks(store, &policy, 12, 8, cancel)?;
+    let snapshot = store.read_snapshot();
+    let shortlist = mixlib_planner::shortlist_preparation(&snapshot, &policy, 12, 8, cancel)?;
+    snapshot.verify_read_snapshot(cancel)?;
+    let analyzed_recordings = store
+        .tracks()?
+        .iter()
+        .filter(|t| t.active_analysis.is_some() && matches!(t.lifecycle, Lifecycle::Available))
+        .count();
     let mut report = Report::new("tactic_pool_expansion");
     report.header.extensions.insert("selection".into(), serde_json::json!({
         "requested":count,"added":0,"prepared_before":before,"prepared_after":before,
-        "basic_analyzed_tracks":shortlist.analyzed_tracks,"shortlist":shortlist.preparation_candidates,
+        "basic_analyzed_tracks":shortlist.analyzed_tracks,"basic_analyzed_recordings":analyzed_recordings,
+        "identity_policy":"distinct recorder trackID when known, plus distinct audio hashes; prepared captures preferred",
+        "shortlist":shortlist.preparation_candidates,
         "attempts":[],"complete":false,"status":"running"
     }));
     store.report(&report)?;
@@ -117,7 +194,27 @@ pub(super) fn expand_pool(
             .unwrap()
             .push(attempt);
         store.report(&report)?;
-        let analyzed = ensure_tactic_analysis(store, &[id.to_owned()], python, cancel)?;
+        let analyzed = match ensure_tactic_analysis(store, &[id.to_owned()], python, cancel) {
+            Ok(report) => report,
+            Err(error) => {
+                let status = if error.code == "CANCELLED" {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                let selection = report.header.extensions.get_mut("selection").unwrap();
+                selection["status"] = serde_json::json!(status);
+                let attempt = selection["attempts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap();
+                attempt["status"] = serde_json::json!(status);
+                attempt["error"] = serde_json::json!({"code":error.code,"message":error.message});
+                store.report(&report)?;
+                return Err(error);
+            }
+        };
         prepared = measured_beam::prepared_pool(store)?;
         let succeeded = prepared.iter().any(|p| p.audio_hash == track.audio_hash);
         let selection = report.header.extensions.get_mut("selection").unwrap();
@@ -627,6 +724,12 @@ fn analyze_one(
         "tracks/{}/{track_id}/analysis/{generation}",
         shard(track_id)
     );
+    // Fused sidecars in one source directory share an advisory directory lock.
+    // Keep all publication writes for a generation together across workers.
+    static PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _publication = PUBLICATION
+        .lock()
+        .map_err(|_| Error::new("TACTIC_PUBLICATION", "publication lock poisoned"))?;
     let reference = store.write(&format!("{prefix}/tactic-analysis.json"), &record)?;
     base.analysis_id = generation;
     base.artifacts

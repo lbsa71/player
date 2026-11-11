@@ -1115,3 +1115,11 @@ M01's measured rhythmic handoff remains the tactic for a compatible busy mashup
 that should hold until a late accent and resolve swiftly. A good example of this
 pattern is evidence for preserving the hold and seeking a better continuation,
 not permission to weaken a later incompatible join.
+
+## Set structure tactics
+
+Set-wide programming is specified in [SET_STRUCTURE_TACTICS.md](SET_STRUCTURE_TACTICS.md):
+research sources, story/wave/ramp/chapter strategies, development-weighted song
+lengths, alternative later exits, and hard 57–60 / 117–120 minute completion
+windows. These rules sit above transition admission and never relax its safety
+or musical endpoint checks.
