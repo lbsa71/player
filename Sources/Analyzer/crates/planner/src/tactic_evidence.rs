@@ -327,6 +327,63 @@ fn candidate_facts_cached(
     };
     if let (Some(a), Some(b)) = (&cached[0], &cached[1]) {
         crate::tactic_pair_evidence::enrich_pair_evidence(a, b, placements, &mut result)?;
+        // Assess continuity independently of nonoverlapping gains and bind it
+        // to each tactic's actual landing. C01 can land on an earlier attack
+        // than a build/drop cut, so one proof cannot promote both locations.
+        let start = result.bar_frames[0];
+        let end = *result.bar_frames.last().unwrap();
+        let landings = [
+            (
+                TacticId::C01,
+                crate::tactics::phrase_cut_landing(&result).unwrap_or(end),
+            ),
+            (TacticId::C02, result.b.arrival_frame.unwrap_or(end)),
+            (TacticId::C03, result.b.arrival_frame.unwrap_or(end)),
+            (TacticId::C04, result.b.arrival_frame.unwrap_or(end)),
+            (TacticId::C07, result.b.arrival_frame.unwrap_or(start)),
+        ];
+        let mut measured = std::collections::BTreeMap::new();
+        let paths = [
+            store.source(&snapshots[0].track)?,
+            store.source(&snapshots[1].track)?,
+        ];
+        for (id, landing) in landings {
+            let landing = landing.clamp(start, end);
+            let compatible = if let Some(value) = measured.get(&landing) {
+                *value
+            } else {
+                let bar = result
+                    .bar_frames
+                    .windows(2)
+                    .find(|w| w[0] <= landing && landing < w[1])
+                    .unwrap_or(&result.bar_frames[result.bar_frames.len() - 2..]);
+                let half = (bar[1] - bar[0]) / 2;
+                let bounds = [
+                    landing.saturating_sub(half).max(start),
+                    (landing + half).min(end),
+                ];
+                let value = matches!(
+                    crate::short_fade::measure(
+                        store,
+                        [&paths[0], &paths[1]],
+                        placements,
+                        [a, b],
+                        bounds,
+                        plan.crossover_hz,
+                        cancel,
+                    )?,
+                    Some(
+                        crate::tactics::ShortFadeMatch::QuietNearMatch
+                            | crate::tactics::ShortFadeMatch::AllBandsMatch
+                    )
+                );
+                measured.insert(landing, value);
+                value
+            };
+            if compatible {
+                result.pair.cut_band_matches.insert(id);
+            }
+        }
         if result.timing_basis == TacticTimingBasis::Bars
             && result.bar_frames.len() <= 3
             && plan.drum_intro.is_none()
@@ -696,6 +753,7 @@ fn passage_facts(
         vocal_phrases,
         vocal_quiet: None,
         stems: None,
+        stem_leakage: None,
         stem_assets: vec![],
         loop_candidates: vec![],
         motif: None,

@@ -25,7 +25,7 @@ pub(super) fn measure_edges(
     cache: &mut mixlib_planner::CandidateEvidenceCache,
     budget: usize,
     cancel: &Cancellation,
-) -> Result<Vec<MeasuredEdge>> {
+) -> Result<(Vec<MeasuredEdge>, serde_json::Value)> {
     let mut admission = policy(
         mixing
             .header
@@ -41,11 +41,14 @@ pub(super) fn measure_edges(
             Err(error)
                 if matches!(error.code.as_str(), "STITCH_INFEASIBLE" | "STITCH_EXCLUDED") =>
             {
-                return Ok(vec![])
+                return Ok((vec![], serde_json::json!({"timing_rejection":error.code})))
             }
             Err(error) => return Err(error),
         };
     let mut edges = vec![];
+    let mut admitted = std::collections::BTreeMap::<String, usize>::new();
+    let mut rejected = std::collections::BTreeMap::<String, usize>::new();
+    let windows = candidates.len();
     for candidate in candidates {
         cancel.check()?;
         let facts = match cache.candidate_facts(store, &candidate, 0, cancel) {
@@ -60,11 +63,29 @@ pub(super) fn measure_edges(
                         | "TACTIC_BOUNDARIES"
                 ) =>
             {
-                continue
+                *rejected.entry(error.code).or_default() += 1;
+                continue;
             }
             Err(error) => return Err(error),
         };
         let selection = mixlib_planner::select_tactics(&facts, &admission)?;
+        for profile in facts
+            .pair
+            .profiles
+            .values()
+            .filter(|p| p.predicted_peak_dbfs.is_none())
+        {
+            for reason in &profile.evidence {
+                *rejected.entry(reason.clone()).or_default() += 1;
+            }
+        }
+        for rejection in &selection.rejected {
+            for reason in &rejection.reasons {
+                *rejected
+                    .entry(format!("{:?}: {reason}", rejection.tactic_id))
+                    .or_default() += 1;
+            }
+        }
         let t = &candidate.transitions[0];
         let exit = candidate.placements[0]
             .time_map
@@ -75,12 +96,14 @@ pub(super) fn measure_edges(
             .source_at(t.end_output_frame as f64)
             .round() as u64;
         for ranked in selection.candidates {
+            let id = format!("{:?}", ranked.plan.tactic_id);
             let mut plan = candidate.clone();
             if write_tactics(&mut plan, vec![ranked.plan]).is_err() {
                 continue;
             }
             plan.renderer_version = mixlib_audio::TACTIC_RENDERER.into();
             plan.validate()?;
+            *admitted.entry(id).or_default() += 1;
             edges.push(MeasuredEdge {
                 plan,
                 exit,
@@ -90,7 +113,11 @@ pub(super) fn measure_edges(
             });
         }
     }
-    Ok(edges)
+    Ok((
+        edges,
+        serde_json::json!({"from":request.from,"to":request.to,
+        "windows":windows,"admitted":admitted,"rejected":rejected}),
+    ))
 }
 
 #[derive(Clone, Copy)]

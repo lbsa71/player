@@ -141,6 +141,9 @@ pub(crate) fn measure(
     if quiet && matches.iter().all(|&matched| matched) {
         return Ok(Some(ShortFadeMatch::QuietNearMatch));
     }
+    if matches.iter().all(|&matched| matched) {
+        return Ok(Some(ShortFadeMatch::AllBandsMatch));
+    }
     if matches.iter().filter(|&&matched| matched).count() != 2 {
         return Ok(None);
     }

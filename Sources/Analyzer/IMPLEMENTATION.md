@@ -208,7 +208,22 @@ Each edge retains its cue, tactic, and evidence. Each partial route carries
 its entry point and assembled time maps, so separate entries into the same
 track can survive. Extensions require 45 seconds of solo source time and
 validate the translated schedules together, including vocal tails. Complete
-routes rank by fewest last-resort fades, then weakest join, then total score.
+routes rank by fewest last-resort transitions, then weakest join, then total score.
+Unmatched ownership cuts and ordinary short fades share a default budget of one
+last-resort join per set. All-band mapped PCM agreement can promote a cut. Each
+measurement pass saves a `measured_graph` report with per-pair tactic admissions
+and rejection reasons. The cue shortlist does not privilege simultaneous vocal
+gaps over structural phrase quality.
+Dry stem handoffs apply persisted leakage vetoes to the audible lane intervals.
+Unknown or suspected bleed is rejected when that deck's vocal is suppressed,
+unless the interval has affirmative quiet evidence. Bleed of the same line can
+continue under its own fully open, unedited vocal lane. The analyzer's lagged
+projection coefficient is not treated as a measured bleed amplitude in dB.
+Edited/effected stem captures still require separate source-specific evidence.
+Pair evidence version 3 compares added interval conflict against the internal
+pitch-class distributions of both passages. It retains spectral disagreement
+and the independent supported-note and foreground-lead vetoes. This prevents an
+identical full major-scale passage from failing harmony admission against itself.
 Cue budgets and beam width bound the search. The export records those bounds
 and the measured pool size. Opening and closing cues are selected as part of
 validating a complete route. Explicit ordered chains still use their own

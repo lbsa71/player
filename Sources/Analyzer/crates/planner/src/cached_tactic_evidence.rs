@@ -73,6 +73,7 @@ pub(crate) fn apply_cached_tactic_facts(
     let rows = window_rows(record, p, anchors);
     if let Some(rows) = &rows {
         facts.stems = stem_quality(rows, facts.vocal_phrases.is_some(), &mut facts.evidence);
+        facts.stem_leakage = mapped_leakage(rows, p, anchors);
         if facts.stems.is_some() {
             facts.stem_assets = record
                 .stems
@@ -216,12 +217,21 @@ fn stem_quality(
                 match leakage.get("status")?.as_str()? {
                     "suspected" => projection = projection.max(1.),
                     "not_detected" => {
-                        projection = projection.max(num(leakage, "max_projection_ratio")?)
+                        // A regression coefficient against a noisy separated
+                        // reference is not a certified bleed amplitude. Keep
+                        // the legacy amplitude bound adverse; the mapped,
+                        // versioned veto record owns schedule-aware admission.
+                        num(leakage, "max_projection_ratio")?;
+                        projection = projection.max(1.);
                     }
                     "unassessed"
                         if known_vocals
                             && row.get("vocal")?.get("acoustic_active")?.as_bool()
                                 == Some(false) => {}
+                    // Preserve unknown isolation as an adverse legacy bound.
+                    // Mapped leakage windows allow the schedule to determine
+                    // whether that uncertainty is actually audible.
+                    "unassessed" => projection = projection.max(1.),
                     _ => return None,
                 }
             }
@@ -241,6 +251,71 @@ fn stem_quality(
         reconstruction_error: reconstruction,
         artifact_score: artifact,
     })
+}
+
+fn mapped_leakage(
+    rows: &[&Value],
+    p: &Placement,
+    anchors: &[u64],
+) -> Option<Vec<StemLeakageWindow>> {
+    let start = *anchors.first()?;
+    let end = *anchors.last()?;
+    let mapped = |source: u64| output_at(&p.time_map, source as f64).map(|v| v.round() as u64);
+    let mut result = vec![];
+    for row in rows {
+        let a = row
+            .get("start_frame")?
+            .as_u64()?
+            .max(p.time_map.source_at(start as f64).floor() as u64);
+        let b = row
+            .get("end_frame")?
+            .as_u64()?
+            .min(p.time_map.source_at(end as f64).ceil() as u64);
+        let lo = mapped(a)?.max(start);
+        let hi = mapped(b)?.min(end);
+        if lo >= hi {
+            continue;
+        }
+        for (name, lane) in [
+            ("drums", StemLane::Drums),
+            ("bass", StemLane::Bass),
+            ("other", StemLane::Other),
+        ] {
+            let leakage = row.get("vocal_leakage")?.get(name)?;
+            if leakage.get("method")?.as_str()? != "lagged_vocal_projection_and_coherence/1" {
+                return None;
+            }
+            let spans = match leakage.get("status")?.as_str()? {
+                "not_detected" if leakage.get("measured_window_count")?.as_u64()? > 0 => {
+                    Some(vec![])
+                }
+                "suspected" => {
+                    let mut spans = vec![];
+                    let source_spans = leakage.get("suspect_spans")?.as_array()?;
+                    if source_spans.is_empty() {
+                        return None;
+                    }
+                    for span in source_spans {
+                        let a = span.get("start_frame")?.as_u64()?.max(a);
+                        let b = span.get("end_frame")?.as_u64()?.min(b);
+                        if a < b {
+                            spans.push([mapped(a)?.max(lo), mapped(b)?.min(hi)]);
+                        }
+                    }
+                    Some(spans)
+                }
+                "unassessed" => None,
+                _ => return None,
+            };
+            result.push(StemLeakageWindow {
+                lane,
+                start_frame: lo,
+                end_frame: hi,
+                suspect_spans: spans,
+            });
+        }
+    }
+    Some(result)
 }
 
 fn cached_vocal_phrases(
@@ -927,6 +1002,29 @@ mod tests {
         assert!(motif_sample(&motif, 0, 400, 1000).is_none());
     }
     #[test]
+    fn mapped_leakage_keeps_veto_status_separate_from_projection_amplitude() {
+        let plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        let p = &plan.placements[0];
+        let first = p.time_map.anchors.first().unwrap();
+        let last = p.time_map.anchors.last().unwrap();
+        let anchors = [first.output_frame, last.output_frame];
+        let mut row = json!({"start_frame":first.source_frame,"end_frame":last.source_frame,"vocal_leakage":{}});
+        for lane in ["drums", "bass", "other"] {
+            row["vocal_leakage"][lane] = json!({"method":"lagged_vocal_projection_and_coherence/1",
+                "status":"not_detected","measured_window_count":4,"max_projection_ratio":2.,"suspect_spans":[]});
+        }
+        let mapped = mapped_leakage(&[&row], p, &anchors).unwrap();
+        assert!(mapped.iter().all(|w| w.suspect_spans == Some(vec![])));
+        row["vocal_leakage"]["other"]["status"] = json!("unassessed");
+        assert!(mapped_leakage(&[&row], p, &anchors).unwrap()[2]
+            .suspect_spans
+            .is_none());
+        row["vocal_leakage"]["other"]["method"] = json!("unknown");
+        assert!(mapped_leakage(&[&row], p, &anchors).is_none());
+    }
+
+    #[test]
     fn stem_quality_preserves_unknown_leakage_and_reconstruction_measurements() {
         let mut row = json!({"reconstruction":{"relative_rms_error":0.02},"stems":{},"vocal_leakage":{},"vocal":{"acoustic_active":false}});
         for lane in ["drums", "bass", "other", "vocals"] {
@@ -936,11 +1034,21 @@ mod tests {
                 row["vocal_leakage"][lane] = json!({"status":"unassessed"});
             }
         }
-        assert!(stem_quality(&[&row], false, &mut vec![]).is_none());
+        assert_eq!(
+            stem_quality(&[&row], false, &mut vec![])
+                .unwrap()
+                .max_vocal_leakage_db,
+            0.
+        );
         let quiet = stem_quality(&[&row], true, &mut vec![]).unwrap();
         assert_eq!(quiet.reconstruction_error, 0.02);
         row["vocal"]["acoustic_active"] = json!(true);
-        assert!(stem_quality(&[&row], true, &mut vec![]).is_none());
+        assert_eq!(
+            stem_quality(&[&row], true, &mut vec![])
+                .unwrap()
+                .max_vocal_leakage_db,
+            0.
+        );
         for lane in ["drums", "bass", "other"] {
             row["vocal_leakage"][lane] =
                 json!({"status":"not_detected","max_projection_ratio":0.01});
@@ -949,7 +1057,7 @@ mod tests {
             stem_quality(&[&row], true, &mut vec![])
                 .unwrap()
                 .max_vocal_leakage_db,
-            -40.
+            0.
         );
         row["vocal_leakage"]["other"]["status"] = json!("suspected");
         assert_eq!(

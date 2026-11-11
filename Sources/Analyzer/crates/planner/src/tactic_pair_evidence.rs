@@ -6,7 +6,7 @@ use mixlib_types::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-const METHOD: &str = "mapped_selected_lane_pair_evidence/2";
+const METHOD: &str = "mapped_selected_lane_pair_evidence/3";
 const LANES: [StemLane; 4] = [
     StemLane::Drums,
     StemLane::Bass,
@@ -38,27 +38,37 @@ fn db(v: f64) -> f64 {
     20. * v.max(1e-12).log10()
 }
 fn interval_distance(a: &[f64; 12], b: &[f64; 12]) -> Option<f64> {
-    let norm = a.iter().sum::<f64>() * b.iter().sum::<f64>();
-    if norm <= 1e-18 {
+    let sums = [a.iter().sum::<f64>(), b.iter().sum::<f64>()];
+    if sums[0] * sums[1] <= 1e-18 {
         return None;
     }
-    // Different notes are expected in complementary arrangements. Measure
-    // incompatible interval mass, using the same pitch-class interval rule as
-    // the supported-note conflict test, rather than requiring matching spectra.
-    let conflict = a
-        .iter()
-        .enumerate()
-        .flat_map(|(i, a)| {
-            b.iter().enumerate().map(move |(j, b)| {
-                if [0, 3, 4, 5, 7, 8, 9].contains(&((j + 12 - i) % 12)) {
-                    0.
-                } else {
-                    a * b
-                }
+    let a = a.map(|x| x / sums[0]);
+    let b = b.map(|x| x / sums[1]);
+    let mass = |a: &[f64; 12], b: &[f64; 12]| {
+        a.iter()
+            .enumerate()
+            .flat_map(|(i, a)| {
+                b.iter().enumerate().map(move |(j, b)| {
+                    if [0, 3, 4, 5, 7, 8, 9].contains(&((j + 12 - i) % 12)) {
+                        0.
+                    } else {
+                        a * b
+                    }
+                })
             })
-        })
-        .sum::<f64>();
-    Some((conflict / norm).clamp(0., 1.))
+            .sum::<f64>()
+    };
+    // Bar chroma aggregates notes over time. Internal intervals in a passage
+    // are not new clashes introduced by the other deck. Without this baseline
+    // even an identical seven-note major scale exceeds the admission limit.
+    // Retain spectral disagreement in proportion to that baseline so unrelated
+    // broad pitch distributions cannot erase their mismatch by being dense.
+    let baseline = (mass(&a, &a) + mass(&b, &b)) / 2.;
+    let variation = a.iter().zip(b).map(|(a, b)| (a - b).abs()).sum::<f64>() / 2.;
+    Some(
+        ((mass(&a, &b) - baseline).max(0.) / (1. - baseline).max(1e-9) + baseline * variation)
+            .clamp(0., 1.),
+    )
 }
 
 fn layer_stability(levels: &[f64]) -> Vec<f64> {
@@ -636,7 +646,7 @@ fn profile(
         densities.push(per_density.into_iter().fold(1., f64::min));
         beds.push(per_bed.into_iter().fold(0., f64::max));
     }
-    Some(PairProfile{method:METHOD.into(),evidence:vec![format!("source analysis {} / {}; actual {:?} lane curves, edit captures and bounded FX; harmony is incompatible pitch-class interval mass, not spectral identity; stability uses separate sustained-lane source RMS before intentional fades; summaries are measured heuristics, summed peak is an upper bound, RMS combination assumes uncorrelated layers",records[0].tactic_analysis_id,records[1].tactic_analysis_id,t.tactic_id)],harmonic_distance:Some(harmonic),lead_conflict:Some(conflict.clamp(0.,1.)),complementarity:Some((1.-collision).clamp(0.,1.)),predicted_peak_dbfs:Some(db(peak)),selected_composite_density:Some(densities),retained_bed_density:Some(beds),outgoing_layer_stability:measure_stability.then(||layer_stability(&held_levels[0])),incoming_layer_stability:measure_stability.then(||layer_stability(&held_levels[1]))})
+    Some(PairProfile{method:METHOD.into(),evidence:vec![format!("source analysis {} / {}; actual {:?} lane curves, edit captures and bounded FX; harmony is added incompatible pitch-class interval mass over within-passage baselines plus baseline-weighted spectral disagreement; stability uses separate sustained-lane source RMS before intentional fades; summaries are measured heuristics, summed peak is an upper bound, RMS combination assumes uncorrelated layers",records[0].tactic_analysis_id,records[1].tactic_analysis_id,t.tactic_id)],harmonic_distance:Some(harmonic),lead_conflict:Some(conflict.clamp(0.,1.)),complementarity:Some((1.-collision).clamp(0.,1.)),predicted_peak_dbfs:Some(db(peak)),selected_composite_density:Some(densities),retained_bed_density:Some(beds),outgoing_layer_stability:measure_stability.then(||layer_stability(&held_levels[0])),incoming_layer_stability:measure_stability.then(||layer_stability(&held_levels[1]))})
 }
 
 #[derive(Clone, Debug)]
@@ -1123,10 +1133,22 @@ pub(crate) fn enrich_pair_evidence(
         .into_iter()
         .filter(|id| !id.is_modifier() && id.permission() != TacticPermission::EmergencyOnly)
     {
-        let measured = crate::tactics::candidate_tactic_schedule(id, facts, &policy)
-            .ok()
-            .and_then(|t| profile(&t, records, placements, facts));
-        facts.pair.profiles.insert(id,measured.unwrap_or_else(||PairProfile{method:METHOD.into(),evidence:vec![format!("{id:?}: required source coverage or provisional processing shape is unknown; no compatibility inferred")],..PairProfile::default()}));
+        let (measured, reason) = match crate::tactics::candidate_tactic_schedule(id, facts, &policy)
+        {
+            Ok(t) => (
+                profile(&t, records, placements, facts),
+                "required source coverage is unknown".into(),
+            ),
+            Err(e) => (None, format!("{}: {}", e.code, e.message)),
+        };
+        facts.pair.profiles.insert(
+            id,
+            measured.unwrap_or_else(|| PairProfile {
+                method: METHOD.into(),
+                evidence: vec![format!("{id:?}: {reason}; no compatibility inferred")],
+                ..PairProfile::default()
+            }),
+        );
     }
     Ok(())
 }
@@ -1428,6 +1450,24 @@ mod tests {
         }
         f.a.bars[0].beats_per_bar = Some(0);
         assert!(candidate_tactic_schedule(TacticId::S02, &f, &TacticPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn repeated_scale_is_not_a_new_clash_and_shifted_scales_still_differ() {
+        let major = |root: usize| {
+            std::array::from_fn(|pc| {
+                if [0, 2, 4, 5, 7, 9, 11].contains(&((pc + 12 - root) % 12)) {
+                    1.
+                } else {
+                    0.
+                }
+            })
+        };
+        for root in 0..12 {
+            assert_eq!(interval_distance(&major(root), &major(root)), Some(0.));
+            assert!(interval_distance(&major(root), &major((root + 1) % 12)).unwrap() > 0.30);
+            assert!(interval_distance(&major(root), &major((root + 7) % 12)).unwrap() < 0.30);
+        }
     }
 
     #[test]

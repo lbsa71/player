@@ -82,6 +82,15 @@ pub struct StemEvidence {
     pub artifact_score: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StemLeakageWindow {
+    pub lane: StemLane,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    /// Mapped suspect spans; None is unassessed, Some([]) is measured with
+    /// no leakage veto. This proxy does not measure leakage amplitude in dB.
+    pub suspect_spans: Option<Vec<[u64; 2]>>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoopEvidence {
     pub lane: StemLane,
     pub source_start_frame: u64,
@@ -127,6 +136,8 @@ pub struct PassageFacts {
     #[serde(default)]
     pub vocal_quiet: Option<Vec<[u64; 2]>>,
     pub stems: Option<StemEvidence>,
+    #[serde(default)]
+    pub stem_leakage: Option<Vec<StemLeakageWindow>>,
     pub stem_assets: Vec<StemAsset>,
     pub loop_candidates: Vec<LoopEvidence>,
     pub motif: Option<MotifEvidence>,
@@ -171,6 +182,7 @@ pub struct PairProfile {
 #[serde(rename_all = "snake_case")]
 pub enum ShortFadeMatch {
     QuietNearMatch,
+    AllBandsMatch,
     OneBandDifference,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -190,6 +202,10 @@ pub struct PairEvidence {
     pub groove_similarity: Option<f64>,
     #[serde(default)]
     pub short_fade_match: Option<ShortFadeMatch>,
+    /// Positive mapped PCM agreement in every band around the actual cut.
+    /// Absence of overlap or matching key/BPM alone cannot establish this.
+    #[serde(default)]
+    pub cut_band_matches: BTreeSet<TacticId>,
     pub semantic_relation: Option<SemanticRelation>,
     pub shared_motif: Option<Vec<PitchNote>>,
     /// Output tempo at every bar anchor, validated against both actual time maps.
@@ -376,8 +392,9 @@ fn boundary(p: &PassageFacts, frame: u64, entry: bool, policy: &TacticPolicy) ->
 }
 fn stems(p: &PassageFacts, policy: &TacticPolicy, lanes: &[StemLane]) -> bool {
     p.stems.as_ref().is_some_and(|s| {
-        s.max_vocal_leakage_db.is_finite()
-            && s.max_vocal_leakage_db <= policy.max_vocal_leakage_db
+        (p.stem_leakage.is_some()
+            || s.max_vocal_leakage_db.is_finite()
+                && s.max_vocal_leakage_db <= policy.max_vocal_leakage_db)
             && s.reconstruction_error.is_finite()
             && s.reconstruction_error <= policy.max_reconstruction_error
             && s.artifact_score.is_finite()
@@ -1148,7 +1165,7 @@ fn curve(start: u64, end: u64, points: &[(u64, f64)]) -> Vec<ScalarPoint> {
         })
         .collect()
 }
-fn phrase_cut_landing(f: &CandidateFacts) -> Option<u64> {
+pub(crate) fn phrase_cut_landing(f: &CandidateFacts) -> Option<u64> {
     f.b.cut_attacks
         .iter()
         .copied()
@@ -1180,7 +1197,7 @@ fn lane(placement: usize, lane: StemLane, gain: Vec<ScalarPoint>) -> LaneSchedul
 fn safe_add(a: u64, b: u64) -> u64 {
     a.saturating_add(b)
 }
-fn curve_value(points: &[ScalarPoint], frame: u64) -> f64 {
+pub(crate) fn curve_value(points: &[ScalarPoint], frame: u64) -> f64 {
     if frame <= points[0].output_frame {
         return points[0].value;
     }
@@ -2460,6 +2477,7 @@ pub(crate) fn candidate_tactic_schedule(
         let vocal_facts = remap_edited_vocals(&plan, f)?;
         apply_vocal_contract(&mut plan, &vocal_facts, p)?;
     }
+    crate::stem_audibility::validate(&mut plan, f)?;
     let method = match id {
         M01 => "dense selected layers remain compatible; six complete hold bars and a fixed two-bar accompaniment exit",
         M02 => "spacious retained bed and measured incoming arrival support a one-bar resolution",
@@ -2470,9 +2488,11 @@ pub(crate) fn candidate_tactic_schedule(
         S01 => "stable sparse intro/outro spans support a long phrase-aligned EQ blend",
         S02 => match preferred_short_fade(f, p) {
             Some(ShortFadeMatch::QuietNearMatch) => "quiet passages have closely matching aligned audio",
+            Some(ShortFadeMatch::AllBandsMatch) => "aligned audio closely matches in all three bands",
             Some(ShortFadeMatch::OneBandDifference) => "aligned drums and two matching bands leave one harmonically compatible band to exchange",
             None => "last resort: short window passes vocal, boundary and headroom checks",
         },
+        S03 if last_resort(id, f, p) => "last resort: a one-bar bass swap still replaces the whole arrangement quickly without a measured short-fade match",
         S03 => "active bass on both tracks requires one bounded bass ownership exchange",
         S04 => "measured frequency occupancy selects the staged three-band exchange order",
         S05 => "quiet A bed leaves room for stable B drums before the accompaniment transfer",
@@ -2483,7 +2503,8 @@ pub(crate) fn candidate_tactic_schedule(
         S10 => "verified nonvocal capture supports a bounded filtered frozen-delay bridge",
         S11 => "isolated A texture and spacious B entry leave room for a bounded reverb tail",
         S12 => "verified loop seam and complete captured language extend the candidate runway",
-        C01|C02|C03|C04|C07 => "verified structural/attack landing supports a short ownership switch",
+        C01|C02|C03|C04|C07 if f.pair.cut_band_matches.contains(&id) => "verified landing and matching mapped PCM in all bands support an ownership switch",
+        C01|C02|C03|C04|C07 => "last resort: verified landing permits a cut, but all-band continuity is unproven",
         C05 => "verified rhythmic capture tightens in four bounded stages before the measured landing",
         C06 => "complementary vocal-free rhythmic gaps support alternating phase-offset gates",
         C08 => "isolated sample and verified note sequence introduce B's corresponding motif",
@@ -2508,11 +2529,27 @@ pub(crate) fn candidate_tactic_schedule(
 fn preferred_short_fade(f: &CandidateFacts, p: &TacticPolicy) -> Option<ShortFadeMatch> {
     f.pair
         .short_fade_match
-        .filter(|m| *m == ShortFadeMatch::QuietNearMatch || tonal(f, p))
+        .filter(|m| *m != ShortFadeMatch::OneBandDifference || tonal(f, p))
+}
+
+fn last_resort(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> bool {
+    match id {
+        TacticId::C01 | TacticId::C02 | TacticId::C03 | TacticId::C04 | TacticId::C07 => {
+            !f.pair.cut_band_matches.contains(&id)
+        }
+        TacticId::S02 => preferred_short_fade(f, p).is_none(),
+        TacticId::S03 if f.bar_frames.len() == 2 => preferred_short_fade(f, p).is_none(),
+        _ => false,
+    }
 }
 
 fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
     use TacticId::*;
+    if last_resort(id, f, p) {
+        // A mutually exclusive schedule has no overlapping clashes. That is
+        // safety evidence, not evidence of musical continuity across its cut.
+        return -1000.;
+    }
     let base = match id {
         M01 => 100.,
         M02 => 95.,
@@ -2607,7 +2644,7 @@ pub fn select_tactics(f: &CandidateFacts, p: &TacticPolicy) -> Result<TacticSele
             Ok(plan) => candidates.push(RankedTactic {
                 plan,
                 score: preference(id, &specialized, p),
-                last_resort: id == TacticId::S02 && preferred_short_fade(&specialized, p).is_none(),
+                last_resort: last_resort(id, &specialized, p),
             }),
             Err(e) => rejected.push(TacticRejection {
                 tactic_id: id,
@@ -2616,9 +2653,11 @@ pub fn select_tactics(f: &CandidateFacts, p: &TacticPolicy) -> Result<TacticSele
         }
     }
     candidates.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.plan.tactic_id.cmp(&b.plan.tactic_id))
+        a.last_resort.cmp(&b.last_resort).then_with(|| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.plan.tactic_id.cmp(&b.plan.tactic_id))
+        })
     });
     Ok(TacticSelection {
         candidates,
@@ -2680,6 +2719,7 @@ pub(crate) mod tests {
                 reconstruction_error: 0.01,
                 artifact_score: 0.02,
             }),
+            stem_leakage: None,
             stem_assets: all_lanes()
                 .iter()
                 .map(|&lane| StemAsset {
@@ -2749,6 +2789,7 @@ pub(crate) mod tests {
                 target_tempo_ratio: Some(1.5),
                 groove_similarity: Some(0.95),
                 short_fade_match: None,
+                cut_band_matches: BTreeSet::new(),
                 semantic_relation: Some(SemanticRelation {
                     relation: "answer".into(),
                     confidence_margin: 0.8,
@@ -3315,6 +3356,49 @@ pub(crate) mod tests {
         assert!(error
             .message
             .contains("concentrate their energy in the low band"));
+    }
+
+    #[test]
+    fn one_bar_bass_swap_cannot_bypass_the_short_fade_policy() {
+        let mut f = facts(1);
+        let p = policy();
+        assert!(last_resort(TacticId::S03, &f, &p));
+        assert!(preference(TacticId::S03, &f, &p) < preference(TacticId::S03, &facts(4), &p));
+        f.pair.short_fade_match = Some(ShortFadeMatch::OneBandDifference);
+        assert!(!last_resort(TacticId::S03, &f, &p));
+        assert!(!last_resort(TacticId::S03, &facts(2), &p));
+    }
+
+    #[test]
+    fn zero_overlap_clash_does_not_promote_unmatched_cuts() {
+        let mut cut = facts(2);
+        cut.pair.complementarity = Some(1.);
+        cut.pair.harmonic_distance = Some(0.);
+        cut.pair.lead_conflict = Some(0.);
+        let p = policy();
+        let blend = facts(4);
+        for id in [
+            TacticId::C01,
+            TacticId::C02,
+            TacticId::C03,
+            TacticId::C04,
+            TacticId::C07,
+        ] {
+            assert!(last_resort(id, &cut, &p));
+            assert!(preference(id, &cut, &p) < preference(TacticId::S04, &blend, &p));
+        }
+        // The one-band fade exception cannot promote a full-band cut.
+        cut.pair.short_fade_match = Some(ShortFadeMatch::OneBandDifference);
+        assert!(last_resort(TacticId::C01, &cut, &p));
+        cut.pair.cut_band_matches.insert(TacticId::C01);
+        assert!(last_resort(TacticId::C03, &cut, &p));
+        assert!(!last_resort(TacticId::C01, &cut, &p));
+        let selected = select_tactics(&cut, &p).unwrap();
+        assert!(selected
+            .candidates
+            .iter()
+            .filter(|c| c.plan.tactic_id == TacticId::C01)
+            .all(|c| !c.last_resort));
     }
 
     #[test]

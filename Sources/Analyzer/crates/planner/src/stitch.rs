@@ -561,16 +561,16 @@ pub fn tactic_stitch_candidates(
                         * f64::from(!ap.get(&pa.end).is_some_and(|p| p.boundary))
                         + 0.4 * f64::from(!bp.get(&pb.start).is_some_and(|p| p.boundary))
                         + 0.2 * f64::from(!ap.get(&pa.start).is_some_and(|p| p.boundary));
-                    let vocal_penalty = 0.8 * (f64::from(!a_voice) + f64::from(!*b_voice));
-                    let mut evidence_penalty = boundary_penalty + vocal_penalty;
-                    // Give quiet downbeat cuts a chance in the shortlist.
-                    // PCM, attack and schedule checks still decide admission.
-                    if overlap == incoming_overlap
-                        && pa.bar_beats == pb.bar_beats
-                        && a_gaps.iter().zip(b_gaps).any(|(a, b)| *a && *b)
-                    {
-                        evidence_penalty = evidence_penalty.min(0.55);
-                    }
+                    // Independent stem gates can finish A's line and admit B
+                    // later. Whole-window transcription is not a prerequisite
+                    // for considering that arrangement. Keep structural phrase
+                    // quality in the cost; a simultaneous quiet downbeat must
+                    // not override it and flood the shortlist with cuts.
+                    let a_gate = a_gaps.iter().skip(4).any(|gap| *gap);
+                    let b_gate = b_gaps.iter().skip(4).any(|gap| *gap);
+                    let vocal_penalty =
+                        0.8 * (f64::from(!a_voice && !a_gate) + f64::from(!*b_voice && !b_gate));
+                    let evidence_penalty = boundary_penalty + vocal_penalty;
                     let cost = 4. * skew
                         + deviation
                         + 0.3 * harmony

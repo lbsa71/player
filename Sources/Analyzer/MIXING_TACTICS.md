@@ -312,6 +312,9 @@ repeat or use the content of a line still require positive phrase evidence.
   useful upper layers. In stem mode distinguish bass from kick/drums.
 - **Reject** an energy hole or doubled low end. Do not assume a zero low-EQ
   setting produces perfect isolation.
+- A whole-arrangement exchange completed in one bar is subject to the same
+  last-resort policy as S02. Calling it a bass swap does not exempt it. Only
+  measured quiet matching audio or the supported band-match exceptions promote it.
 - **Status** Implemented bounded bass ownership exchange with measured upper-layer compatibility.
   [Bassline swap][basic].
 
@@ -453,6 +456,16 @@ phrase or vocal constraints.
 ### Sudden, structurally supported transitions
 
 #### C01 — Phrase cut
+
+Automatic selection treats C01/C02/C03/C04/C07 ownership cuts as last resorts
+unless mapped PCM closely matches in every frequency band at the actual landing.
+Matching tempo/key, vocal silence, or zero simultaneous clashes cannot promote
+a cut. A one-band-difference exception permits a short fade, not a full-band cut.
+These rules do not remove buildup, line-ending, grid or headroom checks.
+Automatic sets allow at most one last-resort join by default, including ordinary
+short fades and unmatched one-bar bass swaps. Exhausting that budget widens the cue search and can reject the set
+instead of silently producing a chain of cuts. The saved mixing-policy extension
+`max_last_resort_transitions` can explicitly change that budget.
 
 - **Given A** completes a musical statement, **and B** has a strong attack at
   the corresponding boundary.

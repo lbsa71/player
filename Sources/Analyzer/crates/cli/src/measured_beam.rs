@@ -34,7 +34,7 @@ fn measure_graph(
     context: usize,
     budget: usize,
     cancel: &Cancellation,
-) -> Result<Graph> {
+) -> Result<(Graph, Report)> {
     let n = pool.len();
     let pairs: Vec<_> = (0..n)
         .flat_map(|a| (0..n).filter(move |&b| a != b).map(move |b| (a, b)))
@@ -42,12 +42,13 @@ fn measure_graph(
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     let completed = AtomicUsize::new(0);
     let mut graph: Graph = (0..n * n).map(|_| vec![]).collect();
+    let mut diagnostics = vec![];
     std::thread::scope(|scope| -> Result<()> {
         let jobs: Vec<_> = (0..workers)
             .map(|worker| {
                 let pairs = &pairs;
                 let completed = &completed;
-                scope.spawn(move || -> Result<Vec<(usize, Vec<MeasuredEdge>)>> {
+                scope.spawn(move || -> Result<Vec<_>> {
                     let mut cache = CandidateEvidenceCache::new();
                     let mut measured = vec![];
                     for &(a, b) in pairs.iter().skip(worker).step_by(workers) {
@@ -78,16 +79,36 @@ fn measure_graph(
             })
             .collect();
         for job in jobs {
-            for (index, edges) in job
+            for (index, (edges, diagnostic)) in job
                 .join()
                 .map_err(|_| Error::new("TACTIC_WORKER", "measurement worker failed"))??
             {
                 graph[index] = edges;
+                diagnostics.push(diagnostic);
             }
         }
         Ok(())
     })?;
-    Ok(graph)
+    let mut by_tactic = BTreeMap::<String, usize>::new();
+    for edge in graph.iter().flatten() {
+        for tactic in read_tactics(&edge.plan)? {
+            *by_tactic
+                .entry(format!("{:?}", tactic.tactic_id))
+                .or_default() += 1;
+        }
+    }
+    eprintln!("stitch: admitted choices by tactic: {by_tactic:?}");
+    let mut report = Report::new("measured_graph");
+    report
+        .header
+        .extensions
+        .insert("pairs".into(), serde_json::json!(diagnostics));
+    report
+        .header
+        .extensions
+        .insert("admitted_by_tactic".into(), serde_json::json!(by_tactic));
+    report.counts.insert("cue_budget".into(), budget as u64);
+    Ok((graph, report))
 }
 
 #[derive(Clone, Copy)]
@@ -170,21 +191,28 @@ struct ExitBounds {
     earliest_infeasible: Option<u64>,
 }
 
-/// For timing feasibility alone, the earliest reachable entry into each
-/// unused track dominates later entries. Scored extensions still keep their
-/// actual cue and validate the complete assembled schedule.
+/// At equal fallback cost, the earliest reachable entry into each unused track
+/// dominates later entries for timing feasibility. Preserve both costs so an
+/// early fallback cannot erase a later clean entry needed to finish the set.
 struct Runway<'a> {
     graph: &'a Graph,
     solo: &'a [u64],
-    memo: BTreeMap<(u128, usize, usize), ExitBounds>,
+    memo: BTreeMap<(u128, usize, usize, usize), ExitBounds>,
 }
 
 impl Runway<'_> {
-    fn can_finish(&mut self, used: u128, last: usize, exit: u64, remaining: usize) -> bool {
+    fn can_finish(
+        &mut self,
+        used: u128,
+        last: usize,
+        exit: u64,
+        remaining: usize,
+        fallbacks: usize,
+    ) -> bool {
         if remaining == 0 {
             return true;
         }
-        let key = (used, last, remaining);
+        let key = (used, last, remaining, fallbacks);
         let mut bounds = self.memo.get(&key).copied().unwrap_or_default();
         if bounds.latest_feasible.is_some_and(|latest| exit <= latest) {
             return true;
@@ -198,12 +226,24 @@ impl Runway<'_> {
         let n = self.solo.len();
         let possible = (0..n).any(|to| {
             used & (1 << to) == 0
-                && self.graph[last * n + to]
-                    .iter()
-                    .filter(|edge| edge.exit >= exit)
-                    .map(|edge| edge.entry_end + self.solo[to])
-                    .min()
-                    .is_some_and(|next| self.can_finish(used | (1 << to), to, next, remaining - 1))
+                && [false, true].into_iter().any(|fallback| {
+                    let cost = usize::from(fallback);
+                    cost <= fallbacks
+                        && self.graph[last * n + to]
+                            .iter()
+                            .filter(|edge| edge.exit >= exit && edge.last_resort == fallback)
+                            .map(|edge| edge.entry_end + self.solo[to])
+                            .min()
+                            .is_some_and(|next| {
+                                self.can_finish(
+                                    used | (1 << to),
+                                    to,
+                                    next,
+                                    remaining - 1,
+                                    fallbacks - cost,
+                                )
+                            })
+                })
         });
         if possible {
             bounds.latest_feasible = Some(exit);
@@ -235,6 +275,7 @@ fn search(
     pool: &[Track],
     count: usize,
     width: usize,
+    max_fallbacks: usize,
     cancel: &Cancellation,
 ) -> Result<Option<MixPlan>> {
     let n = pool.len();
@@ -257,9 +298,9 @@ fn search(
     if n <= 16
         && !beam
             .iter()
-            .any(|r| runway.can_finish(r.used, r.last, 0, count - 1))
+            .any(|r| runway.can_finish(r.used, r.last, 0, count - 1, max_fallbacks))
     {
-        eprintln!("stitch: measured cues have no distinct-track route with enough solo time");
+        eprintln!("stitch: measured cues have no distinct-track route with enough solo time within the last-resort budget");
         return Ok(None);
     }
     for size in 2..=count {
@@ -275,8 +316,10 @@ fn search(
                     continue;
                 };
                 for (edge, choice) in graph[route.last * n + to].iter().enumerate() {
+                    let quality = route.quality.extend(choice.score, choice.last_resort);
                     if choice.exit < route.next_exit
                         || choice.entry_end + solo_frames(track) > latest
+                        || quality.fallbacks > max_fallbacks
                     {
                         continue;
                     }
@@ -284,7 +327,7 @@ fn search(
                         prefix,
                         to,
                         edge,
-                        quality: route.quality.extend(choice.score, choice.last_resort),
+                        quality,
                         region: (
                             to,
                             choice.entry_end / (8 * u64::from(track.format.sample_rate_hz)),
@@ -305,7 +348,13 @@ fn search(
             let used = parent.used | (1 << choice.to);
             let next_exit = edge.entry_end + solo[choice.to];
             let lookahead = if n <= 16 { remaining } else { remaining.min(3) };
-            if !runway.can_finish(used, choice.to, next_exit, lookahead) {
+            if !runway.can_finish(
+                used,
+                choice.to,
+                next_exit,
+                lookahead,
+                max_fallbacks - choice.quality.fallbacks,
+            ) {
                 return Ok(None);
             }
             let plan = match chain::extend_measured(
@@ -400,23 +449,48 @@ pub(super) fn choose(
         ),
     )?;
     let snapshot = store.read_snapshot();
+    // A set assembled almost entirely from escape hatches is not a successful
+    // continuous mix. Widen cue search before accepting repeated fallbacks.
+    let max_fallbacks = policy
+        .header
+        .extensions
+        .get("max_last_resort_transitions")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .min((count - 1) as u64) as usize;
     for budget in [24, 64] {
         eprintln!(
             "stitch: building measured choices from {} tracks, up to {budget} cue windows per pair",
             pool.len()
         );
-        let graph = measure_graph(&snapshot, &pool, policy, context, budget, cancel)?;
+        let (graph, report) = measure_graph(&snapshot, &pool, policy, context, budget, cancel)?;
+        snapshot.verify_read_snapshot(cancel)?;
+        store.report(&report)?;
+        eprintln!(
+            "stitch: cue and tactic diagnostics: reports/{}.json",
+            report.report_id
+        );
         let edges: usize = graph.iter().map(Vec::len).sum();
         eprintln!("stitch: {edges} admitted cue/tactic choices");
         for width in [policy.beam_width, policy.beam_width.saturating_mul(4)] {
-            let Some(mut plan) = search(&snapshot, &graph, &pool, count, width, cancel)? else {
+            let Some(mut plan) = search(
+                &snapshot,
+                &graph,
+                &pool,
+                count,
+                width,
+                max_fallbacks,
+                cancel,
+            )?
+            else {
                 continue;
             };
             snapshot.verify_read_snapshot(cancel)?;
-            plan.planner_version = "measured-cue-beam/1".into();
+            plan.planner_version = "measured-cue-beam/2".into();
             plan.header.extensions.insert("library_pick".into(), serde_json::json!({
                 "analyzed_tracks": pool.len(), "measured_choices": edges, "cue_budget_per_pair": budget,
                 "beam_width": width, "track_ids": plan.placements.iter().map(|p| &p.track_id).collect::<Vec<_>>(),
+                "max_last_resort_transitions": max_fallbacks,
             }));
             return Ok(plan);
         }
@@ -425,7 +499,7 @@ pub(super) fn choose(
     Err(Error::new(
         "TACTIC_NO_COMPLETE_ROUTE",
         format!(
-            "measured beam found no complete {count}-track route from {} prepared recordings",
+            "measured beam found no complete {count}-track route within the limit of {max_fallbacks} last-resort transitions from {} prepared recordings",
             pool.len()
         ),
     ))
@@ -434,6 +508,49 @@ pub(super) fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachability_keeps_clean_entries_and_rejects_chains_of_fallbacks() {
+        let plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        let edge = |exit, entry_end, last_resort| MeasuredEdge {
+            plan: plan.clone(),
+            exit,
+            entry_end,
+            score: 50.,
+            last_resort,
+        };
+        let mut graph: Graph = (0..9).map(|_| vec![]).collect();
+        graph[1] = vec![edge(30, 100, true), edge(30, 150, false)];
+        graph[5] = vec![edge(210, 20, true)];
+        let mut runway = Runway {
+            graph: &graph,
+            solo: &[45; 3],
+            memo: BTreeMap::new(),
+        };
+        assert!(runway.can_finish(1, 0, 0, 2, 1));
+        assert!(!runway.can_finish(1, 0, 0, 2, 0));
+        graph[1].pop();
+        let mut runway = Runway {
+            graph: &graph,
+            solo: &[45; 3],
+            memo: BTreeMap::new(),
+        };
+        assert!(!runway.can_finish(1, 0, 0, 2, 1));
+        assert!(runway.can_finish(1, 0, 0, 2, 2));
+    }
+
+    #[test]
+    fn fallback_free_routes_outrank_even_high_scoring_cut_chains() {
+        let mut cuts = Quality::EMPTY;
+        let mut blends = Quality::EMPTY;
+        for _ in 0..7 {
+            cuts = cuts.extend(100., true);
+            blends = blends.extend(15., false);
+        }
+        assert!(blends.best_first(cuts).is_lt());
+        assert_eq!(cuts.fallbacks, 7);
+    }
 
     #[test]
     fn a_better_local_join_can_leave_too_little_runway() {
@@ -459,8 +576,8 @@ mod tests {
             solo: &[45; 3],
             memo: BTreeMap::new(),
         };
-        assert!(!runway.can_finish(0b011, 1, 195, 1));
-        assert!(runway.can_finish(0b011, 1, 145, 1));
-        assert!(!runway.can_finish(0b111, 1, 145, 1));
+        assert!(!runway.can_finish(0b011, 1, 195, 1, 0));
+        assert!(runway.can_finish(0b011, 1, 145, 1, 0));
+        assert!(!runway.can_finish(0b111, 1, 145, 1, 0));
     }
 }

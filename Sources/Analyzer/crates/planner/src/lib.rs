@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod phrase;
 mod short_fade;
+mod stem_audibility;
 mod stitch;
 mod tactic_cues;
 mod tactic_pair_evidence;
