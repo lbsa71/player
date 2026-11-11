@@ -8,6 +8,97 @@ pub(super) struct PairSelection {
     pub examined: Vec<serde_json::Value>,
 }
 
+pub(super) struct MeasuredEdge {
+    pub plan: MixPlan,
+    pub exit: u64,
+    pub entry_end: u64,
+    pub score: f64,
+    pub last_resort: bool,
+}
+
+/// Measure independent alternatives. The chain search owns the decision about
+/// how much runway a preceding join leaves for each one.
+pub(super) fn measure_edges(
+    store: &Store,
+    request: &mixlib_planner::StitchRequest<'_>,
+    mixing: &MixingConfig,
+    cache: &mut mixlib_planner::CandidateEvidenceCache,
+    budget: usize,
+    cancel: &Cancellation,
+) -> Result<Vec<MeasuredEdge>> {
+    let mut admission = policy(
+        mixing
+            .header
+            .extensions
+            .get("allow_expressive_tactics")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    );
+    admission.normal_speed_deviation = mixing.max_speed_deviation;
+    let candidates =
+        match mixlib_planner::tactic_stitch_candidates(store, request, mixing, budget, cancel) {
+            Ok(candidates) => candidates,
+            Err(error)
+                if matches!(error.code.as_str(), "STITCH_INFEASIBLE" | "STITCH_EXCLUDED") =>
+            {
+                return Ok(vec![])
+            }
+            Err(error) => return Err(error),
+        };
+    let mut edges = vec![];
+    for candidate in candidates {
+        cancel.check()?;
+        let facts = match cache.candidate_facts(store, &candidate, 0, cancel) {
+            Ok(facts) => facts,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "TACTIC_FACTS"
+                        | "TACTIC_GRID"
+                        | "TACTIC_BAR_WINDOW"
+                        | "TACTIC_NATIVE_GRID"
+                        | "TACTIC_BOUNDARIES"
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        let selection = mixlib_planner::select_tactics(&facts, &admission)?;
+        let t = &candidate.transitions[0];
+        let exit = candidate.placements[0]
+            .time_map
+            .source_at(t.start_output_frame as f64)
+            .round() as u64;
+        let entry_end = candidate.placements[1]
+            .time_map
+            .source_at(t.end_output_frame as f64)
+            .round() as u64;
+        for ranked in selection.candidates {
+            let mut plan = candidate.clone();
+            if write_tactics(&mut plan, vec![ranked.plan]).is_err() {
+                continue;
+            }
+            plan.renderer_version = mixlib_audio::TACTIC_RENDERER.into();
+            plan.validate()?;
+            edges.push(MeasuredEdge {
+                plan,
+                exit,
+                entry_end,
+                score: ranked.score,
+                last_resort: ranked.last_resort,
+            });
+        }
+    }
+    Ok(edges)
+}
+
+#[derive(Clone, Copy)]
+enum Search<'a> {
+    Ranked { next_track: Option<&'a str> },
+    FirstValid,
+}
+
 pub(super) fn choose_pair(
     store: &Store,
     request: &mixlib_planner::StitchRequest<'_>,
@@ -17,16 +108,27 @@ pub(super) fn choose_pair(
 ) -> Result<PairSelection> {
     let snapshot = store.read_snapshot();
     let mut evidence_cache = mixlib_planner::CandidateEvidenceCache::new();
-    let result = choose_pair_inner(
+    let mut selection = choose_pair_inner(
         &snapshot,
         request,
         mixing,
-        next_track,
+        Search::Ranked { next_track },
         &mut evidence_cache,
+        24,
         cancel,
-    );
+    )?;
+    if selection.selected.is_none() && !selection.missing_analysis {
+        selection = choose_pair_inner(
+            &snapshot,
+            request,
+            mixing,
+            Search::Ranked { next_track },
+            &mut evidence_cache,
+            64,
+            cancel,
+        )?;
+    }
     snapshot.verify_read_snapshot(cancel)?;
-    let selection = result?;
     if selection.selected.is_none() && !selection.missing_analysis {
         let mut report = Report::new("tactic_search");
         report
@@ -56,8 +158,9 @@ fn choose_pair_inner(
     store: &Store,
     request: &mixlib_planner::StitchRequest<'_>,
     mixing: &MixingConfig,
-    next_track: Option<&str>,
+    search: Search<'_>,
     evidence_cache: &mut mixlib_planner::CandidateEvidenceCache,
+    candidate_budget: usize,
     cancel: &Cancellation,
 ) -> Result<PairSelection> {
     for id in [request.from, request.to] {
@@ -87,8 +190,9 @@ fn choose_pair_inner(
     let mut examined = Vec::new();
     let mut best: Option<(f64, MixPlan)> = None;
     let mut successor_cache = std::collections::BTreeMap::new();
+    let mut successor_witness: Option<u64> = None;
     for mut candidate in
-        mixlib_planner::tactic_stitch_candidates(store, request, mixing, 24, cancel)?
+        mixlib_planner::tactic_stitch_candidates(store, request, mixing, candidate_budget, cancel)?
     {
         cancel.check()?;
         let measured = evidence_cache
@@ -124,7 +228,10 @@ fn choose_pair_inner(
                 continue;
             }
             trial.renderer_version = mixlib_audio::TACTIC_RENDERER.into();
-            if let Some(next) = next_track {
+            if let Search::Ranked {
+                next_track: Some(next),
+            } = search
+            {
                 let incoming = &trial.placements[1];
                 let after = incoming
                     .time_map
@@ -139,18 +246,33 @@ fn choose_pair_inner(
                     context_beats: request.context_beats,
                     outgoing_after_frame: after,
                 };
-                let safe = if let Some(safe) = successor_cache.get(&after) {
+                let safe = if successor_witness.is_some_and(|frame| frame >= after) {
+                    true
+                } else if let Some(safe) = successor_cache.get(&after) {
                     *safe
                 } else {
                     let safe = match choose_pair_inner(
                         store,
                         &future,
                         mixing,
-                        None,
+                        Search::FirstValid,
                         evidence_cache,
+                        candidate_budget,
                         cancel,
                     ) {
-                        Ok(selection) => selection.selected.is_some(),
+                        Ok(selection) => {
+                            if let Some(plan) = selection.selected {
+                                let source = plan.placements[0]
+                                    .time_map
+                                    .source_at(plan.transitions[0].start_output_frame as f64)
+                                    .floor() as u64;
+                                successor_witness =
+                                    Some(successor_witness.map_or(source, |old| old.max(source)));
+                                true
+                            } else {
+                                false
+                            }
+                        }
                         Err(error)
                             if matches!(
                                 error.code.as_str(),
@@ -169,6 +291,13 @@ fn choose_pair_inner(
                 }
             }
             trial.validate()?;
+            if matches!(search, Search::FirstValid) {
+                return Ok(PairSelection {
+                    selected: Some(trial),
+                    missing_analysis: false,
+                    examined: vec![],
+                });
+            }
             accepted = Some((ranked.score, trial));
             break;
         }

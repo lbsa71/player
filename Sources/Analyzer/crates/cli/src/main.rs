@@ -1,4 +1,5 @@
 mod chain;
+mod measured_beam;
 mod tactic_analysis;
 mod tactics;
 
@@ -459,7 +460,6 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                     context_beats.unwrap_or(12),
                     count,
                     separator_python.as_deref(),
-                    max_stretch.is_none(),
                     cancel,
                 )?;
                 return render_stitch(&store, plan, output, *overwrite, cancel);

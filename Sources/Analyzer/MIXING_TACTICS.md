@@ -284,6 +284,12 @@ limits are this specification's design inferences.
 - **Status** Implemented phrase-length EQ scheduling and full-window measured admission.
   [Phrase beatmixing][basic], [phrase structure][phrase].
 
+Dry schedules check vocal audibility after the lane gains and cut times are
+known. An unclassified vocal can continue on its own deck. An opening or
+closing vocal gate requires a PCM-verified quiet pocket, and possible vocal
+activity on opposite decks must keep the 300 ms guard. Tactics that capture,
+repeat or use the content of a line still require positive phrase evidence.
+
 #### S02 — Short phrase crossfade
 
 - **Given A** is ready to finish, **and B** has a clean entrance with similar
@@ -712,8 +718,10 @@ not force a worse transition just to use another tactic.
 First and last tracks need the same musical scrutiny. Start at an intentional
 entry with pickup support, and let the final track reach a complete statement
 or natural exit. Neither requirement forces playback from file start to EOF.
-The current chain's 45-second solo-source reserve and one-step exit check are
-engineering heuristics, not sufficient proof of musical completeness.
+The automatic picker carries multiple measured entries in a bounded beam
+and validates the assembled route with a 45-second solo-source reserve.
+Explicit ordered chains use one-join lookahead. Both approaches still
+require listening to assess musical completeness.
 
 ### Emergency policy
 

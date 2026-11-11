@@ -660,21 +660,26 @@ fn passage_facts(
         });
         roles.insert(TacticRole::Outro, 1.);
     }
+    let attack_at = |frame: u64| {
+        let source = p.time_map.source_at(frame as f64);
+        let radius = f64::from(s.track.format.sample_rate_hz) * 0.075;
+        let lo = s
+            .features
+            .partition_point(|f| (f.source_frame as f64) < source - radius);
+        s.features[lo..]
+            .iter()
+            .take_while(|f| f.source_frame as f64 <= source + radius)
+            .any(|f| f.rms >= 0.01 && f.onset >= f.rms * 0.18)
+    };
     let arrival_frame = phrase_boundaries
         .iter()
         .filter(|b| b.complete && b.kind != BoundaryKind::Exit)
-        .find_map(|boundary| {
-            let source = p.time_map.source_at(boundary.output_frame as f64);
-            let radius = f64::from(s.track.format.sample_rate_hz) * 0.075;
-            s.features
-                .iter()
-                .any(|f| {
-                    (f.source_frame as f64 - source).abs() <= radius
-                        && f.rms >= 0.01
-                        && f.onset >= f.rms * 0.18
-                })
-                .then_some(boundary.output_frame)
-        });
+        .find_map(|boundary| attack_at(boundary.output_frame).then_some(boundary.output_frame));
+    let cut_attacks = anchors
+        .iter()
+        .copied()
+        .filter(|&frame| attack_at(frame))
+        .collect();
     evidence.push("basic stereo analysis does not establish isolated-stem quality; supplementary source-aligned evidence is required".into());
     PassageFacts {
         placement: index,
@@ -689,6 +694,7 @@ fn passage_facts(
         roles,
         phrase_boundaries,
         vocal_phrases,
+        vocal_quiet: None,
         stems: None,
         stem_assets: vec![],
         loop_candidates: vec![],
@@ -696,6 +702,7 @@ fn passage_facts(
         version_identity: None,
         natural_end_frame,
         arrival_frame,
+        cut_attacks,
         build_release_frame: None,
         ready_buffer_frames: 0,
         evidence,

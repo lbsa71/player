@@ -160,7 +160,22 @@ pub(super) fn stitch_chain(
             "tactic_search": choice.examined,
         }));
     }
-    let mut plan = chain.expect("validated chain has joins");
+    finish_chain(
+        store,
+        chain.expect("validated chain has joins"),
+        joins,
+        chain_tactics,
+        cancel,
+    )
+}
+
+fn finish_chain(
+    store: &Store,
+    mut plan: MixPlan,
+    joins: Vec<serde_json::Value>,
+    chain_tactics: Vec<TacticPlan>,
+    cancel: &Cancellation,
+) -> Result<MixPlan> {
     plan.objective = "stitch_chain".into();
     plan.planner_version = "beat-stitch-chain/1".into();
     plan.renderer_version = if plan.prepared_patches.is_empty() {
@@ -189,6 +204,78 @@ pub(super) fn stitch_chain(
     plan.policy_hash = canonical_hash(&plan.policy)?;
     plan.validate()?;
     Ok(plan)
+}
+
+/// Extend a measured partial route without reopening cue or tactic selection.
+/// Validate the joined time map and translated schedules before it enters the beam.
+pub(super) fn extend_measured(
+    prefix: Option<&MixPlan>,
+    pair: &MixPlan,
+    score: f64,
+    last_resort: bool,
+) -> Result<MixPlan> {
+    let mut pair_tactics = read_tactics(pair)?;
+    require(
+        pair_tactics.len() == 1,
+        "TACTIC_PLAN",
+        "each beam join needs a measured tactic",
+    )?;
+    let transition = &pair.transitions[0];
+    let start = transition.start_output_frame;
+    let mut join = serde_json::json!({
+        "from": transition.from_track_id,
+        "to": transition.to_track_id,
+        "outgoing_cue_frame": pair.placements[0].time_map.source_at(start as f64).round() as u64,
+        "incoming_cue_frame": pair.placements[1].source_start_frame,
+        "choice": pair_tactics[0].tactic_id,
+        "score": score,
+        "last_resort": last_resort,
+    });
+    let mut plan = prefix.unwrap_or(pair).clone();
+    let mut joins = plan
+        .header
+        .extensions
+        .remove("chain_joins")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let offset = if prefix.is_some() {
+        let mut existing = read_tactics(&plan)?;
+        let index = plan.placements.len() - 1;
+        let offset = append_pair(&mut plan, pair.clone())?;
+        for tactic in pair_tactics {
+            existing.push(tactic.translated(offset, index)?);
+        }
+        pair_tactics = existing;
+        offset
+    } else {
+        0
+    };
+    join["start_output_frame"] = serde_json::json!(start + offset);
+    join["pair_output_offset"] = serde_json::json!(offset);
+    joins.push(join);
+    plan.header
+        .extensions
+        .insert("chain_joins".into(), serde_json::json!(joins));
+    plan.policy_hash = canonical_hash(&plan.policy)?;
+    write_tactics(&mut plan, pair_tactics)?;
+    plan.validate()?;
+    Ok(plan)
+}
+
+pub(super) fn finish_measured(
+    store: &Store,
+    mut plan: MixPlan,
+    cancel: &Cancellation,
+) -> Result<MixPlan> {
+    let tactics = read_tactics(&plan)?;
+    let joins = plan
+        .header
+        .extensions
+        .remove("chain_joins")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    plan.plan_id = id();
+    finish_chain(store, plan, joins, tactics, cancel)
 }
 
 fn apply_bookends(store: &Store, plan: &mut MixPlan, cancel: &Cancellation) -> Result<u64> {
@@ -308,61 +395,49 @@ pub(super) fn pick_chain(
     context_beats: usize,
     track_count: usize,
     separator: Option<&Path>,
-    default_stretch: bool,
     cancel: &Cancellation,
 ) -> Result<MixPlan> {
-    let pick = mixlib_planner::pick_tracks(store, policy, context_beats, track_count, cancel)?;
-    let mut last_failure = None;
-    for (attempt, order) in pick.orders.iter().enumerate() {
-        cancel.check()?;
-        let ids: Vec<_> = order.iter().map(String::as_str).collect();
-        match stitch_chain(
-            store,
-            &ids,
-            policy,
-            context_beats,
-            separator,
-            default_stretch,
-            &[],
-            cancel,
-        ) {
-            Ok(mut plan) => {
-                plan.header.extensions.insert(
-                    "library_pick".into(),
-                    serde_json::json!({
-                        "analyzed_tracks": pick.analyzed_tracks,
-                        "track_ids": order,
-                        "routes_attempted": attempt + 1,
-                    }),
-                );
-                plan.diagnostics.push(format!(
-                    "selected and ordered {track_count} tracks from {} analyzed recordings",
-                    pick.analyzed_tracks,
-                ));
-                return Ok(plan);
-            }
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "STITCH_INFEASIBLE"
-                        | "STITCH_AUTO_INFEASIBLE"
-                        | "CHAIN_CUES"
-                        | "TIME_MAP_SPEED"
-                        | "TIME_MAP_ACCELERATION"
-                        | "TACTIC_NO_SAFE_JOIN"
-                ) =>
-            {
-                last_failure = Some(error)
-            }
-            Err(error) => return Err(error),
-        }
+    let pool = measured_beam::prepared_pool(&store.read_snapshot())?;
+    let result = measured_beam::choose(
+        store,
+        policy,
+        context_beats,
+        track_count,
+        pool.clone(),
+        cancel,
+    );
+    let (Some(python), Err(error)) = (separator, &result) else {
+        return result;
+    };
+    if !matches!(
+        error.code.as_str(),
+        "CHAIN_POOL" | "TACTIC_NO_COMPLETE_ROUTE"
+    ) {
+        return result;
     }
-    Err(last_failure.unwrap_or_else(|| {
-        Error::new(
-            "CHAIN_POOL_INFEASIBLE",
-            "no selected route could be stitched",
-        )
-    }))
+    let shortlist = mixlib_planner::pick_tracks(store, policy, context_beats, track_count, cancel)?;
+    let mut seen: std::collections::BTreeSet<_> =
+        pool.iter().map(|track| track.track_id.clone()).collect();
+    let ids: Vec<_> = shortlist
+        .orders
+        .into_iter()
+        .flatten()
+        .filter(|id| seen.insert(id.clone()))
+        .take(track_count.saturating_sub(pool.len()).max(4))
+        .collect();
+    if ids.is_empty() {
+        return result;
+    }
+    eprintln!(
+        "stitch: preparing {} additional recordings from the automatic shortlist",
+        ids.len()
+    );
+    tactic_analysis::ensure_tactic_analysis(store, &ids, python, cancel)?;
+    let expanded = measured_beam::prepared_pool(&store.read_snapshot())?;
+    if expanded.len() == pool.len() {
+        return result;
+    }
+    measured_beam::choose(store, policy, context_beats, track_count, expanded, cancel)
 }
 
 pub(super) fn try_quiet_linger(

@@ -67,6 +67,7 @@ pub(crate) fn apply_cached_tactic_facts(
         record.tactic_analysis_id, record.cache_key.digest
     ));
     facts.evidence.extend(record.limitations.iter().cloned());
+    facts.vocal_quiet = mapped_quiet_spans(store, record, p, anchors, cancel)?;
     facts.vocal_phrases =
         cached_vocal_phrases(store, record, p, anchors, &mut facts.evidence, cancel)?;
     let rows = window_rows(record, p, anchors);
@@ -267,6 +268,20 @@ fn cached_vocal_phrases(
     }
     let source_start = p.time_map.source_at(anchors[0] as f64).floor() as u64;
     let source_end = p.time_map.source_at(*anchors.last().unwrap() as f64).ceil() as u64;
+    if track
+        .get("phrases")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+        && track.get("instrumental").and_then(Value::as_bool) != Some(true)
+        && !verified_absence(
+            track,
+            source_start,
+            source_end,
+            record.source_sample_rate_hz,
+        )
+    {
+        return Ok(None);
+    }
     let Some(asset) = record.stems.get(&StemLane::Vocals) else {
         return Ok(None);
     };
@@ -408,12 +423,12 @@ fn cached_vocal_phrases(
 
 /// Affirmative provider spans must cover the entire selected source interval.
 /// Gaps between spans remain unknown, even if ASR returned no words there.
-fn verified_absence(track: &Value, start: u64, end: u64, rate: u32) -> bool {
+pub(crate) fn source_quiet_spans(track: &Value, rate: u32) -> Vec<(u64, u64)> {
     let Some(spans) = track
         .get("verified_absence_spans")
         .and_then(Value::as_array)
     else {
-        return false;
+        return vec![];
     };
     let mut intervals: Vec<_> = spans
         .iter()
@@ -431,8 +446,12 @@ fn verified_absence(track: &Value, start: u64, end: u64, rate: u32) -> bool {
         })
         .collect();
     intervals.sort_unstable();
+    intervals
+}
+
+fn verified_absence(track: &Value, start: u64, end: u64, rate: u32) -> bool {
     let mut cursor = start;
-    for (a, b) in intervals {
+    for (a, b) in source_quiet_spans(track, rate) {
         if a > cursor {
             return false;
         }
@@ -444,6 +463,92 @@ fn verified_absence(track: &Value, start: u64, end: u64, rate: u32) -> bool {
         }
     }
     false
+}
+
+fn mapped_quiet_spans(
+    store: &Store,
+    record: &TacticTrackAnalysis,
+    p: &Placement,
+    anchors: &[u64],
+    cancel: &Cancellation,
+) -> Result<Option<Vec<[u64; 2]>>> {
+    let Some(track) = record.vocal_evidence.get("track") else {
+        return Ok(None);
+    };
+    let Some(asset) = record.stems.get(&StemLane::Vocals) else {
+        return Ok(None);
+    };
+    let rate = record.source_sample_rate_hz;
+    let map = &p.time_map;
+    let first = map.anchors.first().unwrap();
+    let last = map.anchors.last().unwrap();
+    let slopes = map.slopes();
+    let rate_ratio = f64::from(map.output_sample_rate_hz) / f64::from(rate);
+    let map_gap = |source: u64| {
+        output_at(map, source as f64)
+            .unwrap_or_else(|| {
+                let (anchor, speed) = if source < first.source_frame {
+                    (first, slopes[0])
+                } else {
+                    (last, *slopes.last().unwrap())
+                };
+                anchor.output_frame as f64
+                    + (source as f64 - anchor.source_frame as f64) * rate_ratio / speed
+            })
+            .max(0.)
+    };
+    let pad = u64::from(rate) / 2;
+    let start = (map.source_at(anchors[0] as f64).floor() as u64).saturating_sub(pad);
+    let end = ((map.source_at(*anchors.last().unwrap() as f64).ceil() as u64) + pad)
+        .min(record.source_frames);
+    let mut result: Vec<[u64; 2]> = vec![];
+    let mut wav = WavReader::open(&store.path(&asset.path)?)?;
+    require(
+        wav.format.sample_rate_hz == rate
+            && wav.format.frames == record.source_frames
+            && wav.format.channels == 2,
+        "TACTIC_STEM_FORMAT",
+        "vocal gap source timebase changed",
+    )?;
+    let block = u64::from((rate / 50).max(1));
+    for (a, b) in source_quiet_spans(track, rate) {
+        let (a, b) = (a.max(start), b.min(end));
+        if a >= b {
+            continue;
+        }
+        wav.seek_frame(a)?;
+        let mut at = a;
+        let mut verified = true;
+        while at < b {
+            cancel.check()?;
+            let count = block.min(b - at) as usize;
+            let frames = wav.read_frames(count)?;
+            require(
+                frames.len() == count,
+                "TACTIC_STEM_FORMAT",
+                "vocal gap source ended early",
+            )?;
+            let energy: f64 = frames.iter().flatten().map(|x| f64::from(*x).powi(2)).sum();
+            if energy >= 2. * count as f64 * 0.0005f64.powi(2)
+                || frames.iter().flatten().any(|x| x.abs() >= 0.003)
+            {
+                verified = false;
+                break;
+            }
+            at += count as u64;
+        }
+        if verified {
+            let [lo, hi] = [map_gap(a).ceil() as u64, map_gap(b).floor() as u64];
+            if lo < hi {
+                if let Some(last) = result.last_mut().filter(|last| last[1] >= lo) {
+                    last[1] = last[1].max(hi);
+                } else {
+                    result.push([lo, hi]);
+                }
+            }
+        }
+    }
+    Ok(Some(result))
 }
 
 fn apply_loops(

@@ -457,12 +457,45 @@ pub fn tactic_stitch_candidates(
     };
     let av = cached(&a)?;
     let bv = cached(&b)?;
-    let summary = |features: &ReturnFeatures, p: &Passage| {
+    let quiet = |record: Option<&TacticTrackAnalysis>| {
+        record
+            .and_then(|r| {
+                r.vocal_evidence.get("track").map(|track| {
+                    crate::cached_tactic_evidence::source_quiet_spans(
+                        track,
+                        r.source_sample_rate_hz,
+                    )
+                })
+            })
+            .unwrap_or_default()
+    };
+    let aq = quiet(av.as_ref());
+    let bq = quiet(bv.as_ref());
+    let summary = |features: &ReturnFeatures,
+                   p: &Passage,
+                   record: Option<&TacticTrackAnalysis>,
+                   quiet: &[(u64, u64)]| {
         let frames = features.between(p.start, p.end);
         let norm = frames.iter().map(|f| f.rms).sum::<f64>().max(1e-9);
         let chroma: [f64; 12] =
             std::array::from_fn(|c| frames.iter().map(|f| f.chroma[c] * f.rms).sum::<f64>() / norm);
-        (chroma, features.rms(p.start, p.end))
+        let guard = (0.17 * features.rate).ceil() as u64;
+        let gaps: Vec<_> = p
+            .downbeats
+            .iter()
+            .map(|&beat| {
+                let frame = p.beat_frames[beat];
+                quiet
+                    .iter()
+                    .any(|&(a, b)| a <= frame.saturating_sub(guard) && b >= frame + guard)
+            })
+            .collect();
+        (
+            chroma,
+            features.rms(p.start, p.end),
+            crate::tactic_cues::vocal_window_supported(record, p.start, p.end),
+            gaps,
+        )
     };
     let meters = |track: &Analyzed| {
         let ids: BTreeSet<_> = track.beats.downbeat_ids.iter().collect();
@@ -504,14 +537,17 @@ pub fn tactic_stitch_candidates(
                 cancel,
             )?;
             let mut ranked = Vec::new();
-            let bs: Vec<_> = incoming.iter().map(|p| summary(&bf, p)).collect();
+            let bs: Vec<_> = incoming
+                .iter()
+                .map(|p| summary(&bf, p, bv.as_ref(), &bq))
+                .collect();
             for pa in outgoing
                 .iter()
                 .filter(|p| p.start >= request.outgoing_after_frame)
             {
                 cancel.check()?;
-                let (ac, ar) = summary(&af, pa);
-                for (pb, (bc, br)) in incoming.iter().zip(&bs) {
+                let (ac, ar, a_voice, a_gaps) = summary(&af, pa, av.as_ref(), &aq);
+                for (pb, (bc, br, b_voice, b_gaps)) in incoming.iter().zip(&bs) {
                     let Some((duration, deviation, skew)) = mapped_pair_timing(pa, pb, policy)
                     else {
                         continue;
@@ -525,29 +561,38 @@ pub fn tactic_stitch_candidates(
                         * f64::from(!ap.get(&pa.end).is_some_and(|p| p.boundary))
                         + 0.4 * f64::from(!bp.get(&pb.start).is_some_and(|p| p.boundary))
                         + 0.2 * f64::from(!ap.get(&pa.start).is_some_and(|p| p.boundary));
-                    let vocal_penalty =
-                        0.8 * f64::from(!crate::tactic_cues::vocal_window_supported(
-                            av.as_ref(),
-                            pa.start,
-                            pa.end,
-                        )) + 0.8
-                            * f64::from(!crate::tactic_cues::vocal_window_supported(
-                                bv.as_ref(),
-                                pb.start,
-                                pb.end,
-                            ));
+                    let vocal_penalty = 0.8 * (f64::from(!a_voice) + f64::from(!*b_voice));
+                    let mut evidence_penalty = boundary_penalty + vocal_penalty;
+                    // Give quiet downbeat cuts a chance in the shortlist.
+                    // PCM, attack and schedule checks still decide admission.
+                    if overlap == incoming_overlap
+                        && pa.bar_beats == pb.bar_beats
+                        && a_gaps.iter().zip(b_gaps).any(|(a, b)| *a && *b)
+                    {
+                        evidence_penalty = evidence_penalty.min(0.55);
+                    }
                     let cost = 4. * skew
                         + deviation
                         + 0.3 * harmony
                         + 0.2 * level
-                        + boundary_penalty
-                        + vocal_penalty;
+                        + evidence_penalty
+                        + 0.12 * pb.start as f64 / b.track.format.frames as f64;
                     ranked.push((cost, pa.start, pb.start, pa.bar_beats));
                 }
             }
             ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            // Give distinct parts of both recordings a turn before keeping
+            // several nearly interchangeable variants of the same cues.
+            let mut regions = BTreeSet::new();
+            let (distinct, nearby): (Vec<_>, Vec<_>) =
+                ranked.into_iter().partition(|&(_, a_frame, b_frame, _)| {
+                    regions.insert((
+                        a_frame / (30 * u64::from(a.track.format.sample_rate_hz)),
+                        b_frame / (30 * u64::from(b.track.format.sample_rate_hz)),
+                    ))
+                });
             let mut selected: Vec<(u64, u64)> = Vec::new();
-            for (cost, outgoing, incoming, meter) in ranked {
+            for (cost, outgoing, incoming, meter) in distinct.into_iter().chain(nearby) {
                 let separation = u64::from(a.track.format.sample_rate_hz) * 2;
                 if selected.iter().any(|&(x, y)| {
                     x.abs_diff(outgoing) < separation && y.abs_diff(incoming) < separation
@@ -587,8 +632,9 @@ pub fn tactic_stitch_candidates(
             overlap_beats: overlap,
             ..*request
         };
-        let (mut plan, _) = build_stitch(
+        let (mut plan, _) = match build_stitch_from_tracks(
             store,
+            [&a, &b],
             &pinned,
             policy,
             None,
@@ -599,7 +645,18 @@ pub fn tactic_stitch_candidates(
                 incoming_overlap,
             },
             cancel,
-        )?;
+        ) {
+            Ok(plan) => plan,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "STITCH_INFEASIBLE" | "TIME_MAP_SPEED" | "TIME_MAP_ACCELERATION"
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
         plan.header.extensions.insert("tactic_cue_candidate".into(),serde_json::json!({
             "outgoing_source_frame":outgoing,"incoming_source_frame":incoming,"overlap_beats":overlap,
             "incoming_overlap_beats":incoming_overlap,"pulse_ratio":incoming_overlap as f64/overlap as f64,
@@ -803,7 +860,7 @@ fn find_band_stitch(
     Ok(None)
 }
 
-fn apply_band_exchange(state: &mut State, tracks: &[Analyzed], output_beats: &[u64]) {
+fn apply_band_exchange(state: &mut State, tracks: [&Analyzed; 2], output_beats: &[u64]) {
     let transition = &state.transitions[0];
     let start = transition.start_output_frame;
     let end = transition.end_output_frame;
@@ -832,7 +889,7 @@ fn apply_band_exchange(state: &mut State, tracks: &[Analyzed], output_beats: &[u
                 output_at(beat),
                 AutomationPoint {
                     output_frame: output_at(beat),
-                    gain_linear: gain(&tracks[index]),
+                    gain_linear: gain(tracks[index]),
                     bands_linear: bands,
                     mute: false,
                 },
@@ -1490,6 +1547,7 @@ pub struct ChainPick {
 struct PoolWindow {
     passage: Passage,
     tile: BarTile,
+    unsupported_vocals: bool,
     lead: Option<[SegmentRole; 2]>,
     mashup_bars: Vec<BarTile>,
 }
@@ -1497,6 +1555,7 @@ struct PoolWindow {
 fn pool_windows(
     track: &Analyzed,
     features: &ReturnFeatures,
+    tactic_analysis: Option<&TacticTrackAnalysis>,
     overlap: usize,
     context: usize,
     outgoing: bool,
@@ -1532,6 +1591,13 @@ fn pool_windows(
                 vec![]
             };
             PoolWindow {
+                unsupported_vocals: tactic_analysis.is_some_and(|record| {
+                    !crate::tactic_cues::vocal_window_supported(
+                        Some(record),
+                        passage.start,
+                        passage.end,
+                    )
+                }),
                 passage,
                 tile,
                 lead,
@@ -1584,6 +1650,29 @@ pub fn pick_tracks(
     track_count: usize,
     cancel: &Cancellation,
 ) -> Result<ChainPick> {
+    pick_tracks_in_pool(store, policy, context, track_count, false, cancel)
+}
+
+/// Restrict a route search to recordings with full tactic evidence when the
+/// caller has no analyzer configured to prepare missing evidence.
+pub fn pick_prepared_tracks(
+    store: &Store,
+    policy: &MixingConfig,
+    context: usize,
+    track_count: usize,
+    cancel: &Cancellation,
+) -> Result<ChainPick> {
+    pick_tracks_in_pool(store, policy, context, track_count, true, cancel)
+}
+
+fn pick_tracks_in_pool(
+    store: &Store,
+    policy: &MixingConfig,
+    context: usize,
+    track_count: usize,
+    prepared_only: bool,
+    cancel: &Cancellation,
+) -> Result<ChainPick> {
     require(
         (3..=8).contains(&track_count),
         "CHAIN_TRACKS",
@@ -1599,17 +1688,19 @@ pub fn pick_tracks(
     let mut hashes = BTreeSet::new();
     for track in store.tracks()? {
         cancel.check()?;
-        if matches!(track.lifecycle, Lifecycle::Available)
-            && track.active_analysis.is_some()
-            && hashes.insert(track.audio_hash.digest.clone())
-        {
-            pool.push(load_analyzed(store, track)?);
+        if matches!(track.lifecycle, Lifecycle::Available) && track.active_analysis.is_some() {
+            let analyzed = load_analyzed(store, track)?;
+            if (!prepared_only || analyzed.analysis.artifacts.contains_key("tactic_analysis"))
+                && hashes.insert(analyzed.track.audio_hash.digest.clone())
+            {
+                pool.push(analyzed);
+            }
         }
     }
     require(
         pool.len() >= track_count,
         "CHAIN_POOL",
-        format!("analyze at least {track_count} distinct available tracks"),
+        format!("analyze at least {track_count} distinct available tracks for the requested pool"),
     )?;
     require(
         pool.len() <= 128,
@@ -1621,17 +1712,34 @@ pub fn pick_tracks(
         .map(|track| ReturnFeatures::read(store, track, cancel))
         .collect::<Result<Vec<_>>>()?;
     let count = pool.len();
+    let evidence = pool
+        .iter()
+        .map(|track| {
+            track
+                .analysis
+                .artifacts
+                .get("tactic_analysis")
+                .map(|r| store.read_ref::<TacticTrackAnalysis>(r))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut edges = vec![vec![Vec::<PoolEdge>::new(); count]; count];
-    for overlap in [LINGER_BEATS, 16, 12, 8] {
+    for overlap in [LINGER_BEATS, 16, 12, 8, 4] {
         let exits = pool
             .iter()
             .zip(&features)
-            .map(|(track, f)| pool_windows(track, f, overlap, context, true, cancel))
+            .zip(&evidence)
+            .map(|((track, f), record)| {
+                pool_windows(track, f, record.as_ref(), overlap, context, true, cancel)
+            })
             .collect::<Result<Vec<_>>>()?;
         let entries = pool
             .iter()
             .zip(&features)
-            .map(|(track, f)| pool_windows(track, f, overlap, context, false, cancel))
+            .zip(&evidence)
+            .map(|((track, f), record)| {
+                pool_windows(track, f, record.as_ref(), overlap, context, false, cancel)
+            })
             .collect::<Result<Vec<_>>>()?;
         for (from, track) in pool.iter().enumerate() {
             for (to, incoming) in pool.iter().enumerate() {
@@ -1670,6 +1778,9 @@ pub fn pick_tracks(
                                 + 0.05 * harmonic
                                 + level_weight * level
                                 + 0.04 * entry_fraction
+                                + 0.08
+                                    * (f64::from(a.unsupported_vocals)
+                                        + f64::from(b.unsupported_vocals))
                                 + 16_usize.saturating_sub(overlap) as f64 * 0.003
                                 - if drum_lead { breathing_room } else { 0. };
                             Some(PoolEdge {
@@ -1883,6 +1994,31 @@ fn build_stitch(
     style: StitchStyle,
     cancel: &Cancellation,
 ) -> Result<(MixPlan, Option<DrumHandoff>)> {
+    let a = load_analyzed(store, store.track(request.from)?)?;
+    let b = load_analyzed(store, store.track(request.to)?)?;
+    build_stitch_from_tracks(
+        store,
+        [&a, &b],
+        request,
+        policy,
+        lead_bars,
+        cue,
+        style,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stitch_from_tracks(
+    store: &Store,
+    tracks: [&Analyzed; 2],
+    request: &StitchRequest<'_>,
+    policy: &MixingConfig,
+    lead_bars: Option<usize>,
+    cue: Option<BeatReturnCue>,
+    style: StitchStyle,
+    cancel: &Cancellation,
+) -> Result<(MixPlan, Option<DrumHandoff>)> {
     policy.validate()?;
     require(
         (2..=if matches!(style, StitchStyle::PinnedTactic { .. }) {
@@ -1900,10 +2036,6 @@ fn build_stitch(
         "DUPLICATE_AUDIO",
         "choose two different tracks",
     )?;
-    let tracks = [
-        load_analyzed(store, store.track(request.from)?)?,
-        load_analyzed(store, store.track(request.to)?)?,
-    ];
     require(
         tracks[0].track.audio_hash != tracks[1].track.audio_hash,
         "DUPLICATE_AUDIO",
@@ -1933,7 +2065,7 @@ fn build_stitch(
         })
     } else {
         cue.as_ref()
-            .map(|cue| beat_return(store, &tracks[0], cue.outgoing_near, cue, cancel))
+            .map(|cue| beat_return(store, tracks[0], cue.outgoing_near, cue, cancel))
             .transpose()?
     };
     let overlap_beats = beat_return.map_or(request.overlap_beats, |span| span.overlap);
@@ -1946,10 +2078,10 @@ fn build_stitch(
             .map(|bars| bars.to_vec())
     };
     let mut outgoing = if linger {
-        linger_outgoing(&tracks[0], request.context_beats, cancel)?
+        linger_outgoing(tracks[0], request.context_beats, cancel)?
     } else {
         passages(
-            &tracks[0],
+            tracks[0],
             overlap_beats,
             request.context_beats,
             true,
@@ -1974,7 +2106,7 @@ fn build_stitch(
         _ => overlap_beats,
     };
     let mut incoming = passages(
-        &tracks[1],
+        tracks[1],
         incoming_overlap,
         request.context_beats,
         false,
@@ -2009,8 +2141,8 @@ fn build_stitch(
     }
 
     let (outgoing_low, incoming_profiles): (BTreeMap<_, _>, BTreeMap<_, _>) = if bands {
-        let outgoing_features = ReturnFeatures::read(store, &tracks[0], cancel)?;
-        let incoming_features = ReturnFeatures::read(store, &tracks[1], cancel)?;
+        let outgoing_features = ReturnFeatures::read(store, tracks[0], cancel)?;
+        let incoming_features = ReturnFeatures::read(store, tracks[1], cancel)?;
         let rms = tracks[1].analysis.rms.max(1e-6);
         // Leave space for the outgoing track during the first bar.
         let incoming_profiles = incoming
@@ -2233,8 +2365,8 @@ fn build_stitch(
     let mut state = State {
         used: vec![0, 1],
         placements: vec![
-            placement(&tracks[0], outgoing_map),
-            placement(&tracks[1], incoming_map),
+            placement(tracks[0], outgoing_map),
+            placement(tracks[1], incoming_map),
         ],
         transitions: vec![Transition {
             transition_id: id(),
@@ -2255,11 +2387,11 @@ fn build_stitch(
         cost: best_cost,
         tie: 0,
     };
-    for i in 0..state.placements.len() {
-        state.placements[i].automation = automation_for(i, &state, &tracks, rate);
+    for (i, track) in tracks.iter().enumerate() {
+        state.placements[i].automation = automation_for(i, &state, track, rate);
     }
     if bands {
-        apply_band_exchange(&mut state, &tracks, &beat_output);
+        apply_band_exchange(&mut state, tracks, &beat_output);
     }
     let handoff = if beat_return.is_some() {
         // A short de-click on the departing layer leaves the cut at the downbeat.
@@ -2276,7 +2408,7 @@ fn build_stitch(
             end - (u64::from(rate) / 200).min(overlap / 2)
         };
         state.placements[1].automation[0].mute = false;
-        state.placements[1].automation[0].gain_linear = gain(&tracks[1]);
+        state.placements[1].automation[0].gain_linear = gain(tracks[1]);
         Some(DrumHandoff {
             output_frame,
             source_frame,

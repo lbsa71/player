@@ -203,12 +203,16 @@ For a chain, repeat `--then`, or use `--pick-four` / `--pick-eight`:
 ./scripts/mixlib stitch --pick-eight --output ./renders/eight-tracks.wav
 ```
 
-Route ranking considers local beat windows, stretch, chroma, energy, remaining
-runway and the next join. Each admitted join retains its own tactic and evidence.
-Middle tracks remain continuous in source time, with a 45-second solo reserve
-between joins and a checked outgoing continuation. Opening and closing cues
-seek an intentional entry and a supported ending. Those are conservative
-planning heuristics, not proof that a whole route is musically complete.
+The automatic picker builds a measured beam from the fully prepared pool.
+Each edge retains its cue, tactic, and evidence. Each partial route carries
+its entry point and assembled time maps, so separate entries into the same
+track can survive. Extensions require 45 seconds of solo source time and
+validate the translated schedules together, including vocal tails. Complete
+routes rank by fewest last-resort fades, then weakest join, then total score.
+Cue budgets and beam width bound the search. The export records those bounds
+and the measured pool size. Opening and closing cues are selected as part of
+validating a complete route. Explicit ordered chains still use their own
+per-pair search with one-join lookahead.
 
 `inspect --track TRACK_ID --bars` exposes one- to four-bar segment roles and
 measurements. Reliable downbeats/meter determine bars; the engine does not

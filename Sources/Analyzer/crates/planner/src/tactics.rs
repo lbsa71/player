@@ -122,6 +122,10 @@ pub struct PassageFacts {
     pub phrase_boundaries: Vec<PhraseBoundary>,
     /// None means unknown; Some([]) is affirmative measured absence.
     pub vocal_phrases: Option<Vec<VocalPhrase>>,
+    /// Affirmative, PCM-checked quiet intervals in mapped output frames.
+    /// Outside these intervals the vocal lane may contain a line.
+    #[serde(default)]
+    pub vocal_quiet: Option<Vec<[u64; 2]>>,
     pub stems: Option<StemEvidence>,
     pub stem_assets: Vec<StemAsset>,
     pub loop_candidates: Vec<LoopEvidence>,
@@ -130,6 +134,9 @@ pub struct PassageFacts {
     pub natural_end_frame: Option<u64>,
     /// Verified drop/attack arrival, rather than a role label over a whole window.
     pub arrival_frame: Option<u64>,
+    /// Downbeats with a measured attack, before phrase or vocal admission.
+    #[serde(default)]
+    pub cut_attacks: Vec<u64>,
     /// End of a measured build touching the window, or a frame past the
     /// window when the current placement cannot reach the release.
     #[serde(default)]
@@ -296,6 +303,8 @@ pub struct TacticRejection {
 pub struct RankedTactic {
     pub plan: TacticPlan,
     pub score: f64,
+    #[serde(default)]
+    pub last_resort: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TacticSelection {
@@ -646,6 +655,14 @@ impl CandidateFacts {
                     "invalid vocal evidence intervals",
                 )?;
             }
+            if let Some(quiet) = &p.vocal_quiet {
+                require(
+                    quiet.iter().all(|&[a, b]| a < b && b <= MAX_FRAME)
+                        && quiet.windows(2).all(|w| w[0][1] <= w[1][0]),
+                    "TACTIC_FACTS",
+                    "invalid vocal quiet intervals",
+                )?;
+            }
         }
         Ok(())
     }
@@ -663,7 +680,9 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
     let start = f.bar_frames[0];
     let end = *f.bar_frames.last().unwrap();
     let bars = f.bar_frames.len() - 1;
-    let landing = if id == C08 {
+    let landing = if id == C01 {
+        phrase_cut_landing(f).unwrap_or(start)
+    } else if id == C08 {
         f.pair
             .shared_motif
             .as_ref()
@@ -685,10 +704,6 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
     need(
         capabilities(id).is_subset(&p.capabilities),
         "required renderer capability is unavailable",
-    );
-    need(
-        f.a.vocal_phrases.is_some() && f.b.vocal_phrases.is_some(),
-        "vocal evidence is unknown",
     );
     need(
         known(f.pair.predicted_peak_dbfs, |v| v <= p.max_peak_dbfs),
@@ -731,8 +746,11 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         );
         let a_exit = if cut { landing } else { end };
         let b_entry = if cut { landing } else { start };
+        let local_cut = id == C01
+            && f.bar_frames.contains(&landing)
+            && crate::vocal_audibility::quiet_landing(f, landing);
         need(
-            boundary(&f.a, a_exit, false, p) && boundary(&f.b, b_entry, true, p),
+            local_cut || boundary(&f.a, a_exit, false, p) && boundary(&f.b, b_entry, true, p),
             "supported complete entry/exit phrase boundaries are missing",
         );
     }
@@ -973,7 +991,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         }
         C01 => {
             need(
-                f.b.arrival_frame.is_some_and(|v| v >= start && v <= end),
+                phrase_cut_landing(f).is_some_and(|v| v >= start && v <= end),
                 "phrase cut needs a supported incoming attack",
             );
         }
@@ -1130,11 +1148,25 @@ fn curve(start: u64, end: u64, points: &[(u64, f64)]) -> Vec<ScalarPoint> {
         })
         .collect()
 }
-fn transfer(start: u64, end: u64, from: u64, to: u64, incoming: bool) -> Vec<ScalarPoint> {
+fn phrase_cut_landing(f: &CandidateFacts) -> Option<u64> {
+    f.b.cut_attacks
+        .iter()
+        .copied()
+        .find(|at| f.bar_frames.contains(at) && crate::vocal_audibility::quiet_landing(f, *at))
+        .or(f.b.arrival_frame)
+}
+
+pub(crate) fn transfer(
+    start: u64,
+    end: u64,
+    from: u64,
+    to: u64,
+    incoming: bool,
+) -> Vec<ScalarPoint> {
     let (a, b) = if incoming { (0., 1.) } else { (1., 0.) };
     curve(start, end, &[(start, a), (from, a), (to, b), (end, b)])
 }
-fn constant(start: u64, end: u64, value: f64) -> Vec<ScalarPoint> {
+pub(crate) fn constant(start: u64, end: u64, value: f64) -> Vec<ScalarPoint> {
     curve(start, end, &[(start, value), (end, value)])
 }
 fn lane(placement: usize, lane: StemLane, gain: Vec<ScalarPoint>) -> LaneSchedule {
@@ -1617,11 +1649,6 @@ pub(crate) fn candidate_tactic_schedule(
     f.validate()?;
     p.validate()?;
     require(
-        f.a.vocal_phrases.is_some() && f.b.vocal_phrases.is_some(),
-        "TACTIC_VOCALS",
-        "processing shape requires known vocal occupancy on both sources",
-    )?;
-    require(
         !id.is_modifier(),
         "TACTIC_MODIFIER",
         "tempo modifiers need an arrangement",
@@ -1636,6 +1663,7 @@ pub(crate) fn candidate_tactic_schedule(
     };
     let shape_known = match id {
         TacticId::M01 => count == 8,
+        TacticId::M06 => f.a.vocal_phrases.is_some() && f.b.vocal_phrases.is_some(),
         TacticId::S04 => count >= 3 && band_exchange_order(f).is_some(),
         TacticId::M04 => motif_known(&f.a),
         TacticId::S12 => {
@@ -1692,7 +1720,12 @@ pub(crate) fn candidate_tactic_schedule(
         .min((end - start) / 8);
     let a = f.a.placement;
     let b = f.b.placement;
-    let landing = f.b.arrival_frame.unwrap_or(end).clamp(start, end);
+    let arrival = if id == C01 {
+        phrase_cut_landing(f)
+    } else {
+        f.b.arrival_frame
+    };
+    let landing = arrival.unwrap_or(end).clamp(start, end);
     let exit = match id {
         M01 => f.bar_frames[6],
         M02 => f.bar_frames[bars - 1],
@@ -2418,8 +2451,15 @@ pub(crate) fn candidate_tactic_schedule(
     for e in &plan.source_edits {
         e.validate()?;
     }
-    let vocal_facts = remap_edited_vocals(&plan, f)?;
-    apply_vocal_contract(&mut plan, &vocal_facts, p)?;
+    if !crate::vocal_audibility::apply(&mut plan, f)? {
+        require(
+            f.a.vocal_phrases.is_some() && f.b.vocal_phrases.is_some(),
+            "TACTIC_VOCALS",
+            "vocal evidence is unknown for this schedule",
+        )?;
+        let vocal_facts = remap_edited_vocals(&plan, f)?;
+        apply_vocal_contract(&mut plan, &vocal_facts, p)?;
+    }
     let method = match id {
         M01 => "dense selected layers remain compatible; six complete hold bars and a fixed two-bar accompaniment exit",
         M02 => "spacious retained bed and measured incoming arrival support a one-bar resolution",
@@ -2567,6 +2607,7 @@ pub fn select_tactics(f: &CandidateFacts, p: &TacticPolicy) -> Result<TacticSele
             Ok(plan) => candidates.push(RankedTactic {
                 plan,
                 score: preference(id, &specialized, p),
+                last_resort: id == TacticId::S02 && preferred_short_fade(&specialized, p).is_none(),
             }),
             Err(e) => rejected.push(TacticRejection {
                 tactic_id: id,
@@ -2632,6 +2673,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
             vocal_phrases: Some(vec![]),
+            vocal_quiet: None,
             stems: Some(StemEvidence {
                 available: all_lanes().into_iter().collect(),
                 max_vocal_leakage_db: -45.,
@@ -2683,6 +2725,7 @@ pub(crate) mod tests {
             version_identity: Some("verified-version-family".into()),
             natural_end_frame: Some(end),
             arrival_frame: Some(end),
+            cut_attacks: vec![],
             build_release_frame: None,
             ready_buffer_frames: BAR,
             evidence: vec![format!("measured-fixture/{placement}")],
@@ -3316,5 +3359,47 @@ pub(crate) mod tests {
         assert_eq!(cut.hold_end_frame, BAR);
         assert_eq!(curve_value(&cut.lanes[0].gain, BAR), 1.);
         assert_eq!(curve_value(&cut.lanes[1].gain, BAR), 0.);
+    }
+
+    #[test]
+    fn measured_cut_ignores_muted_lines_and_requires_a_gap_on_both_decks() {
+        let mut f = facts(2);
+        f.a.phrase_boundaries.clear();
+        f.b.phrase_boundaries.clear();
+        f.b.arrival_frame = None;
+        f.b.cut_attacks = vec![BAR];
+        f.a.vocal_phrases = None;
+        f.b.vocal_phrases = None;
+        let gap = [BAR - u64::from(RATE) / 4, BAR + u64::from(RATE) / 4];
+        f.a.vocal_quiet = Some(vec![gap]);
+        f.b.vocal_quiet = Some(vec![gap]);
+        let cut = schedule_tactic(TacticId::C01, &f, &policy()).unwrap();
+        assert_eq!(cut.hold_end_frame, BAR);
+        assert_eq!(cut.vocal_occupancy.len(), 2);
+        assert_eq!(cut.vocal_occupancy[0].end_frame, gap[0]);
+        assert_eq!(cut.vocal_occupancy[1].start_frame, gap[1]);
+        f.b.arrival_frame = Some(BAR);
+        f.b.vocal_quiet = Some(vec![]);
+        f.a.phrase_boundaries = facts(2).a.phrase_boundaries;
+        f.b.phrase_boundaries = facts(2).b.phrase_boundaries;
+        assert!(schedule_tactic(TacticId::C01, &f, &policy())
+            .unwrap_err()
+            .message
+            .contains("between-lines gap"));
+    }
+
+    #[test]
+    fn dry_fade_rejects_possible_vocals_on_both_audible_decks() {
+        let mut f = facts(2);
+        f.a.vocal_phrases = None;
+        f.b.vocal_phrases = None;
+        f.a.vocal_quiet = Some(vec![[2 * BAR - u64::from(RATE), 2 * BAR + u64::from(RATE)]]);
+        f.b.vocal_quiet = Some(vec![[0, u64::from(RATE)]]);
+        assert!(schedule_tactic(TacticId::S02, &f, &policy())
+            .unwrap_err()
+            .message
+            .contains("vocals overlap"));
+        f.a.vocal_quiet = Some(vec![[0, 2 * BAR + u64::from(RATE)]]);
+        assert!(schedule_tactic(TacticId::S02, &f, &policy()).is_ok());
     }
 }

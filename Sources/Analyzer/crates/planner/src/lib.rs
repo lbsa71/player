@@ -11,6 +11,7 @@ mod stitch;
 mod tactic_cues;
 mod tactic_pair_evidence;
 mod tactics;
+mod vocal_audibility;
 pub use tactics::*;
 mod tactic_evidence;
 pub use tactic_evidence::{candidate_facts, CandidateEvidenceCache};
@@ -18,9 +19,9 @@ mod cached_tactic_evidence;
 pub use cached_tactic_evidence::load_tactic_track_analysis;
 pub use stitch::{
     automatic_cues, band_stitch, beat_return_stitch, choose_chain_bookends, describe_bar_tiles,
-    drum_stitch, pick_four_tracks, pick_tracks, preferred_band_stitch, quiet_linger_candidates,
-    quiet_linger_stitch, stitch, tactic_stitch_candidates, BeatReturnCue, ChainPick, DrumHandoff,
-    StitchRequest, CHAIN_SOLO_SECONDS,
+    drum_stitch, pick_four_tracks, pick_prepared_tracks, pick_tracks, preferred_band_stitch,
+    quiet_linger_candidates, quiet_linger_stitch, stitch, tactic_stitch_candidates, BeatReturnCue,
+    ChainPick, DrumHandoff, StitchRequest, CHAIN_SOLO_SECONDS,
 };
 
 pub const PLANNER: &str = "region-beam/1";
@@ -431,11 +432,11 @@ fn gain(t: &Analyzed) -> f64 {
         .min(0.35 / t.analysis.peak.max(1e-6))
         .min(2.)
 }
-fn automation_for(i: usize, s: &State, tracks: &[Analyzed], rate: u32) -> Vec<AutomationPoint> {
+fn automation_for(i: usize, s: &State, track: &Analyzed, rate: u32) -> Vec<AutomationPoint> {
     let p = &s.placements[i];
     let start = p.time_map.anchors[0].output_frame;
     let end = p.time_map.anchors.last().unwrap().output_frame;
-    let g = gain(&tracks[s.used[i]]);
+    let g = gain(track);
     let mut points: BTreeMap<u64, AutomationPoint> = BTreeMap::new();
     let mut add = |frame: u64, scale: f64, bands: [f64; 3]| {
         points.insert(
@@ -703,8 +704,12 @@ pub fn plan(
         diagnostics.push("search budget exhausted; best feasible result returned".into());
     }
     for i in 0..best.placements.len() {
-        best.placements[i].automation =
-            automation_for(i, &best, &tracks, policy.output_sample_rate_hz);
+        best.placements[i].automation = automation_for(
+            i,
+            &best,
+            &tracks[best.used[i]],
+            policy.output_sample_rate_hz,
+        );
     }
     diagnostics.extend(best.transitions.iter().filter_map(|t| {
         t.fallback_reason
