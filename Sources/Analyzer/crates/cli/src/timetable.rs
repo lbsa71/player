@@ -217,7 +217,16 @@ pub(super) fn build(
                 )
             };
             let p = &t["profile"];
-            let evidence = format!("A: {}; B: {}. Complementarity {}; harmonic distance {}; lead conflict {}; density {}; A/B layer stability {} / {}. {}", roles(&t["outgoing_roles"]),roles(&t["incoming_roles"]),metric(p,"complementarity"),metric(p,"harmonic_distance"),metric(p,"lead_conflict"),range(p,"selected_composite_density"),range(p,"outgoing_layer_stability"),range(p,"incoming_layer_stability"),t["selection_reason"].as_str().unwrap_or(""));
+            let mut evidence = format!("A: {}; B: {}. Complementarity {}; harmonic distance {}; lead conflict {}; density {}; A/B layer stability {} / {}. {}", roles(&t["outgoing_roles"]),roles(&t["incoming_roles"]),metric(p,"complementarity"),metric(p,"harmonic_distance"),metric(p,"lead_conflict"),range(p,"selected_composite_density"),range(p,"outgoing_layer_stability"),range(p,"incoming_layer_stability"),t["selection_reason"].as_str().unwrap_or(""));
+            if let Some(pacing) = t["route_contribution"].get("pacing") {
+                evidence.push_str(&format!(
+                    " Pacing: {:.2}s solo, {} complete bars; {:.2} quality-second penalty. {}",
+                    pacing["solo_seconds"].as_f64().unwrap_or(0.),
+                    pacing["complete_bars"],
+                    pacing["penalty_quality_seconds"].as_f64().unwrap_or(0.),
+                    pacing["evidence"].as_str().unwrap_or("")
+                ));
+            }
             (
                 format!(
                     "{} · {} ({})",
@@ -240,7 +249,7 @@ pub(super) fn build(
             cell(&evidence)
         ));
     }
-    markdown.push_str("\nHigher complementarity/stability and lower harmonic distance/lead conflict are preferable. Density and stability ranges cover the candidate bars; the saved JSON preserves their individual values and exact vocal schedules.\n\n## Full-set alternatives\n\nThe search minimizes fallbacks, then weak joins, then maximizes quality-weighted sustained seconds, weakest-join score and total score, in that order. These comparisons concern measured candidates within the saved search budget.\n\n| Anchor | Result | First deciding criterion | Problem joins |\n|---|---|---|---|\n");
+    markdown.push_str("\nHigher complementarity/stability and lower harmonic distance/lead conflict are preferable. Density and stability ranges cover the candidate bars; the saved JSON preserves their individual values and exact vocal schedules.\n\n## Full-set alternatives\n\nThe search minimizes fallbacks, then weak joins, then maximizes quality-weighted sustained seconds minus saved pacing penalties, weakest-join score and total score, in that order. These comparisons concern measured candidates within the saved search budget.\n\n| Anchor | Result | First deciding criterion | Problem joins |\n|---|---|---|---|\n");
     if let Some(comparisons) = comparisons.as_array() {
         for comparison in comparisons {
             let anchor = &comparison["anchor"];

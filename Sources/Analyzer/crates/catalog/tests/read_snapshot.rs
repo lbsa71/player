@@ -136,3 +136,91 @@ fn changed_or_corrupt_logical_records_never_escape_revalidation() {
     );
     assert!(store.read_snapshot().track(&track.track_id).is_err());
 }
+
+#[test]
+fn long_track_evidence_round_trips_without_relaxing_control_record_limits() {
+    use std::collections::BTreeMap;
+    let (_dir, store, track) = setup();
+    let reference = FileRef {
+        path: "models/fixture.bin".into(),
+        hash: hash_bytes(b"fixture"),
+    };
+    let models = ["stem_htdemucs", "vocal_phrase_whisper"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.into(),
+                ModelAsset {
+                    model_id: name.into(),
+                    file: reference.clone(),
+                    upstream_url: "fixture://local".into(),
+                    revision: "fixture".into(),
+                    code_license: "fixture".into(),
+                    weight_license: "fixture".into(),
+                    attribution: "fixture".into(),
+                    redistribution: "fixture".into(),
+                },
+            )
+        })
+        .collect();
+    let payload = "x".repeat(9 * 1024 * 1024);
+    let mut record = TacticTrackAnalysis {
+        header: Header::default(),
+        tactic_analysis_id: id(),
+        track_id: track.track_id.clone(),
+        audio_hash: track.audio_hash.clone(),
+        audio_revision: track.audio_revision,
+        source_sample_rate_hz: track.format.sample_rate_hz,
+        source_frames: track.format.frames,
+        base_analysis: reference.clone(),
+        beat_artifact: reference.clone(),
+        override_revision: 0,
+        method: TACTIC_ANALYSIS_METHOD.into(),
+        implementation_hash: hash_bytes(b"fixture"),
+        component_hashes: BTreeMap::new(),
+        cache_key: hash_bytes(b"fixture"),
+        models,
+        stems: [
+            StemLane::Drums,
+            StemLane::Bass,
+            StemLane::Other,
+            StemLane::Vocals,
+        ]
+        .into_iter()
+        .map(|lane| (lane, reference.clone()))
+        .collect(),
+        vocal_evidence: serde_json::json!({"method":"fixture/1"}),
+        signal_evidence: serde_json::json!({"method":"fixture/1","sample_rate_hz":track.format.sample_rate_hz,
+            "source_start_frame":0,"source_end_frame":track.format.frames,"payload":payload}),
+        limitations: vec![],
+        created_at: now(),
+    };
+    let path = format!("staging/{}/tactic-analysis.json", track.track_id);
+    let saved = store.write(&path, &record).unwrap();
+    let snapshot = store.read_snapshot();
+    assert_eq!(
+        store
+            .read_ref::<TacticTrackAnalysis>(&saved)
+            .unwrap()
+            .signal_evidence,
+        record.signal_evidence
+    );
+    assert_eq!(
+        snapshot
+            .read_ref::<TacticTrackAnalysis>(&saved)
+            .unwrap()
+            .signal_evidence,
+        record.signal_evidence
+    );
+    snapshot
+        .verify_read_snapshot(&Cancellation::default())
+        .unwrap();
+    let mut ordinary = Report::new("fixture");
+    ordinary
+        .header
+        .extensions
+        .insert("payload".into(), record.signal_evidence["payload"].clone());
+    assert_eq!(encode(&ordinary).unwrap_err().code, "RECORD_TOO_LARGE");
+    record.signal_evidence["payload"] = serde_json::json!("x".repeat(33 * 1024 * 1024));
+    assert_eq!(encode(&record).unwrap_err().code, "RECORD_TOO_LARGE");
+}

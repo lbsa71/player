@@ -42,14 +42,17 @@ pub(super) fn stitch_chain(
     let mut chain_tactics = Vec::new();
     for (index, names) in tracks.windows(2).enumerate() {
         cancel.check()?;
-        let outgoing_after_frame = if let Some(p) = chain.as_ref() {
-            let middle = p.placements.last().unwrap();
-            let entry_end = middle
+        let previous_join_end = chain.as_ref().map_or(0, |p| {
+            p.placements
+                .last()
+                .unwrap()
                 .time_map
                 .source_at(p.transitions.last().unwrap().end_output_frame as f64)
-                .round() as u64;
-            mixlib_planner::read_track_pacing(store, &middle.track_id, cancel)?
-                .earliest_exit(entry_end)
+                .round() as u64
+        });
+        let outgoing_after_frame = if previous_join_end > 0 {
+            mixlib_planner::read_track_pacing(store, names[0], cancel)?
+                .earliest_exit(previous_join_end)
         } else {
             0
         };
@@ -72,6 +75,7 @@ pub(super) fn stitch_chain(
                 &request,
                 policy,
                 tracks.get(index + 2).copied(),
+                previous_join_end,
                 cancel,
             )?
         };
@@ -128,6 +132,7 @@ pub(super) fn stitch_chain(
         }
         let local_start = pair.transitions[0].start_output_frame;
         let objective = pair.objective.clone();
+        let pacing = pair.header.extensions.get("pacing").cloned();
         let vocal_handoff = pair.header.extensions.get("vocal_handoff").cloned();
         let mashup = pair.header.extensions.get("mashup").cloned();
         let phrase_entry = pair.header.extensions.get("phrase_entry").cloned();
@@ -159,7 +164,7 @@ pub(super) fn stitch_chain(
             "start_output_frame": local_start + offset, "vocal_handoff_local": vocal_handoff,
             "pair_output_offset": offset, "bar_bpm": bar_bpm, "mashup_local": mashup, "phrase_entry": phrase_entry,
             "stem_evidence": stem_evidence, "prepared_tactic_id": prepared_tactic_id,
-            "tactic_search": choice.examined,
+            "tactic_search": choice.examined, "pacing":pacing,
         }));
     }
     finish_chain(
@@ -480,7 +485,18 @@ pub(super) fn try_quiet_linger(
                 outgoing_after_frame: after,
             };
             match mixlib_planner::stitch(store, &next, policy, cancel) {
-                Ok(_) => (),
+                Ok(next_plan) => {
+                    let exit = next_plan.placements[0]
+                        .time_map
+                        .source_at(next_plan.transitions[0].start_output_frame as f64)
+                        .round() as u64;
+                    if mixlib_planner::read_track_pacing(store, request.to, cancel)?
+                        .assess(entry_end, exit)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                }
                 Err(error) if error.code == "STITCH_INFEASIBLE" => continue,
                 Err(error) => return Err(error),
             }

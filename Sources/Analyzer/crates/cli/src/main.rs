@@ -65,6 +65,12 @@ enum Command {
         /// Include one- to four-bar texture and timing descriptions.
         #[arg(long, requires = "track")]
         bars: bool,
+        /// Previous incoming transition end, in source time, for a pacing audit.
+        #[arg(long, requires_all=["track","pacing_exit"], value_parser=parse_duration)]
+        pacing_after: Option<f64>,
+        /// Proposed next transition start, in source time.
+        #[arg(long, requires_all=["track","pacing_after"], value_parser=parse_duration)]
+        pacing_exit: Option<f64>,
     },
     Plan {
         #[arg(long, conflicts_with = "duration")]
@@ -342,7 +348,12 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                 )?)?
             }
         }
-        Command::Inspect { track, bars } => {
+        Command::Inspect {
+            track,
+            bars,
+            pacing_after,
+            pacing_exit,
+        } => {
             if let Some(id) = track {
                 let t = store.track(id)?;
                 let analysis = t
@@ -358,6 +369,20 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                 let overrides = store.overrides(&t)?;
                 let recording = store.recording_metadata(&t)?;
                 let mut result = serde_json::json!({"track":t,"recording":recording,"analysis":analysis,"regions":regions,"overrides":overrides});
+                if let (Some(after), Some(exit)) = (pacing_after, pacing_exit) {
+                    let rate = f64::from(t.format.sample_rate_hz);
+                    require(
+                        *exit <= t.format.frames as f64 / rate && after <= exit,
+                        "PACING_WINDOW",
+                        "pacing interval must lie inside the recording",
+                    )?;
+                    let pacing = mixlib_planner::read_track_pacing(&store, id, cancel)?;
+                    let entry_end = (after * rate).round() as u64;
+                    let decision = pacing.assess(entry_end, (exit * rate).round() as u64);
+                    result["pacing"] = serde_json::json!({"admitted":decision.is_some(),"decision":decision,
+                        "earliest_possible_exit_seconds":pacing.earliest_exit(entry_end) as f64/rate,
+                        "scope":"Pacing only; concrete tactic vocal, buildup, layer and overlap admission remains required"});
+                }
                 if *bars {
                     result["segments"] = analysis
                         .as_ref()
@@ -568,7 +593,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                         "TACTIC_ANALYSIS",
                         "tactic analysis failed; inspect its saved report",
                     )?;
-                    let choice = tactics::choose_pair(&store, &request, &policy, None, cancel)?;
+                    let choice = tactics::choose_pair(&store, &request, &policy, None, 0, cancel)?;
                     let mut plan = if let Some(plan) = choice.selected {
                         plan
                     } else {
@@ -593,7 +618,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                     (plan, None)
                 }
                 (None, None) if overlap_beats.is_none() => {
-                    let choice = tactics::choose_pair(&store, &request, &policy, None, cancel)?;
+                    let choice = tactics::choose_pair(&store, &request, &policy, None, 0, cancel)?;
                     (
                         match choice.selected {
                             Some(plan) => plan,

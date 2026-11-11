@@ -269,6 +269,7 @@ pub(super) fn choose_pair(
     request: &mixlib_planner::StitchRequest<'_>,
     mixing: &MixingConfig,
     next_track: Option<&str>,
+    previous_join_end: u64,
     cancel: &Cancellation,
 ) -> Result<PairSelection> {
     let snapshot = store.read_snapshot();
@@ -278,6 +279,7 @@ pub(super) fn choose_pair(
         request,
         mixing,
         Search::Ranked { next_track },
+        previous_join_end,
         &mut evidence_cache,
         24,
         cancel,
@@ -288,6 +290,7 @@ pub(super) fn choose_pair(
             request,
             mixing,
             Search::Ranked { next_track },
+            previous_join_end,
             &mut evidence_cache,
             64,
             cancel,
@@ -319,11 +322,13 @@ pub(super) fn choose_pair(
     Ok(selection)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn choose_pair_inner(
     store: &Store,
     request: &mixlib_planner::StitchRequest<'_>,
     mixing: &MixingConfig,
     search: Search<'_>,
+    previous_join_end: u64,
     evidence_cache: &mut mixlib_planner::CandidateEvidenceCache,
     candidate_budget: usize,
     cancel: &Cancellation,
@@ -344,6 +349,21 @@ fn choose_pair_inner(
             });
         }
     }
+    let outgoing_pacing = (previous_join_end > 0)
+        .then(|| mixlib_planner::read_track_pacing(store, request.from, cancel))
+        .transpose()?;
+    let incoming_pacing = if matches!(
+        search,
+        Search::Ranked {
+            next_track: Some(_)
+        }
+    ) {
+        Some(mixlib_planner::read_track_pacing(
+            store, request.to, cancel,
+        )?)
+    } else {
+        None
+    };
     let allow_expressive = mixing
         .header
         .extensions
@@ -361,6 +381,19 @@ fn choose_pair_inner(
     let mut queue = CandidateQueue::new(seeds, candidate_budget);
     while let Some(candidate) = queue.pending.pop_front() {
         cancel.check()?;
+        let pacing = if let Some(policy) = &outgoing_pacing {
+            let exit = candidate.placements[0]
+                .time_map
+                .source_at(candidate.transitions[0].start_output_frame as f64)
+                .round() as u64;
+            let Some(decision) = policy.assess(previous_join_end, exit) else {
+                examined.push(serde_json::json!({"cue":candidate.header.extensions.get("tactic_cue_candidate"),"pacing_rejection":"no complete measured phrase at this early exit; insufficient conservative runway"}));
+                continue;
+            };
+            Some(decision)
+        } else {
+            None
+        };
         let measured = evidence_cache
             .candidate_facts(store, &candidate, 0, cancel)
             .and_then(|facts| {
@@ -406,8 +439,7 @@ fn choose_pair_inner(
                     .time_map
                     .source_at(trial.transitions[0].end_output_frame as f64)
                     .round() as u64;
-                let after = mixlib_planner::read_track_pacing(store, &incoming.track_id, cancel)?
-                    .earliest_exit(entry_end);
+                let after = incoming_pacing.as_ref().unwrap().earliest_exit(entry_end);
                 let future = mixlib_planner::StitchRequest {
                     from: request.to,
                     to: next,
@@ -415,9 +447,15 @@ fn choose_pair_inner(
                     context_beats: request.context_beats,
                     outgoing_after_frame: after,
                 };
-                let safe = if successor_witness.is_some_and(|frame| frame >= after) {
+                let safe = if successor_witness.is_some_and(|frame| {
+                    incoming_pacing
+                        .as_ref()
+                        .unwrap()
+                        .assess(entry_end, frame)
+                        .is_some()
+                }) {
                     true
-                } else if let Some(safe) = successor_cache.get(&after) {
+                } else if let Some(safe) = successor_cache.get(&entry_end) {
                     *safe
                 } else {
                     let safe = match choose_pair_inner(
@@ -425,6 +463,7 @@ fn choose_pair_inner(
                         &future,
                         mixing,
                         Search::FirstValid,
+                        entry_end,
                         evidence_cache,
                         candidate_budget,
                         cancel,
@@ -452,12 +491,18 @@ fn choose_pair_inner(
                         }
                         Err(error) => return Err(error),
                     };
-                    successor_cache.insert(after, safe);
+                    successor_cache.insert(entry_end, safe);
                     safe
                 };
                 if !safe {
                     continue;
                 }
+            }
+            if let Some(decision) = &pacing {
+                trial
+                    .header
+                    .extensions
+                    .insert("pacing".into(), serde_json::to_value(decision)?);
             }
             trial.validate()?;
             if matches!(search, Search::FirstValid) {
@@ -467,7 +512,10 @@ fn choose_pair_inner(
                     examined: vec![],
                 });
             }
-            accepted = Some((ranked.score, trial));
+            accepted = Some((
+                ranked.score - pacing.as_ref().map_or(0., |p| p.penalty_quality_seconds),
+                trial,
+            ));
             break;
         }
         examined.push(serde_json::json!({"cue":candidate.header.extensions.get("tactic_cue_candidate"),

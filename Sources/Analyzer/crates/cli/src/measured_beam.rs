@@ -835,6 +835,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pacing_is_a_bounded_preference_not_a_replacement_for_tactic_quality() {
+        let exceptional = Quality::EMPTY.extend(50., false, 20., 0.).paced(2.25);
+        let ordinary = Quality::EMPTY.extend(35., false, 8., 0.);
+        assert!(exceptional.best_first(ordinary).is_lt());
+        assert!(ordinary.best_first(ordinary.paced(0.75)).is_lt());
+        let fallback = exceptional.extend(100., true, 100., 0.);
+        assert!(ordinary.best_first(fallback).is_lt());
+    }
+
+    #[test]
     fn evidence_explains_fallback_before_better_sustained_quality() {
         let winner = Quality::EMPTY.extend(35., false, 10., 0.);
         let candidate = Quality::EMPTY
