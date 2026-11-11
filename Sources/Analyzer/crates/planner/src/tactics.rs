@@ -138,6 +138,8 @@ pub struct PassageFacts {
     pub stems: Option<StemEvidence>,
     #[serde(default)]
     pub stem_leakage: Option<Vec<StemLeakageWindow>>,
+    #[serde(default)]
+    pub endpoint_reasons: Vec<String>,
     pub stem_assets: Vec<StemAsset>,
     pub loop_candidates: Vec<LoopEvidence>,
     pub motif: Option<MotifEvidence>,
@@ -339,8 +341,15 @@ fn role(p: &PassageFacts, roles: &[TacticRole]) -> bool {
 fn stable(p: &PassageFacts) -> bool {
     !p.bars.is_empty() && p.bars.iter().all(|b| known(b.stability, |v| v >= 0.65))
 }
-// A three-way split offers little musical separation if both passages carry
-// most of their measured energy in the low band.
+fn stable_hold(p: &PassageFacts, bars: usize) -> bool {
+    bars > 0
+        && p.bars.len() >= bars
+        && p.bars[..bars]
+            .iter()
+            .all(|b| known(b.stability, |v| v >= 0.65))
+}
+// Shared low-band dominance is a ranking risk, not a substitute for measuring
+// collisions in the scheduled band allocation.
 pub(crate) fn shared_low_band_dominance(a: f64, b: f64) -> bool {
     a >= 0.70 && b >= 0.70
 }
@@ -804,14 +813,19 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
     }
     match id {
         M01 => {
-            need(bars == 8, "dense mashup requires an eight-bar candidate");
+            need(
+                bars >= 8,
+                "dense mashup needs at least six hold bars and a two-bar resolution",
+            );
             need(
                 role(&f.a, &[R::SustainedTexture, R::VocalForeground, R::Mixed])
                     && role(&f.b, &[R::SteadyGroove]),
                 "dense mashup needs a retained bed and incoming groove",
             );
             need(
-                stable(&f.a) && stable(&f.b) && complementary(f),
+                stable_hold(&f.a, bars.saturating_sub(2))
+                    && stable_hold(&f.b, bars.saturating_sub(2))
+                    && complementary(f),
                 "mashup layers do not remain complementary through the full window",
             );
             need(
@@ -819,14 +833,14 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                     v.len() == bars
                         && v.len() >= 6
                         && v.iter().all(|x| x.is_finite() && (0.0..=1.).contains(x))
-                        && v[..6].iter().all(|x| *x >= 0.62)
+                        && v[..bars.saturating_sub(2)].iter().all(|x| *x >= 0.62)
                 }),
                 "selected-layer density is unknown or not high through the hold",
             );
         }
         M02 => {
             need(
-                (5..=16).contains(&bars),
+                bars >= 5,
                 "brisk mashup needs at least four hold bars plus its exit",
             );
             need(
@@ -835,7 +849,9 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 "spacious mashup requires a texture and stable incoming drums",
             );
             need(
-                stable(&f.a) && stable(&f.b) && complementary(f),
+                stable_hold(&f.a, bars.saturating_sub(1))
+                    && stable_hold(&f.b, bars.saturating_sub(1))
+                    && complementary(f),
                 "mashup does not remain stable/complementary",
             );
             need(
@@ -917,10 +933,6 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 "three-band exchange needs three measured bars and complete low/mid/high occupancy",
             );
             need(
-                exchange.is_some_and(|(_, [a, b])| !shared_low_band_dominance(a[0], b[0])),
-                "both passages concentrate their energy in the low band",
-            );
-            need(
                 complementary(f),
                 "band exchange requires compatible remaining upper layers",
             );
@@ -930,7 +942,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 bars >= 4
                     && role(&f.a, &[R::LowPercussionBed, R::Breakdown])
                     && role(&f.b, &[R::SteadyGroove])
-                    && stable(&f.b),
+                    && stable_hold(&f.b, bars.saturating_sub(2)),
                 "drum linger requires a quiet outgoing bed and stable incoming groove",
             );
         }
@@ -942,7 +954,9 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 "drum replacement must coincide with A's supported return",
             );
             need(
-                role(&f.b, &[R::SteadyGroove]) && stable(&f.b),
+                bars >= 4
+                    && role(&f.b, &[R::SteadyGroove])
+                    && stable_hold(&f.b, bars.saturating_sub(2)),
                 "drum replacement needs a stable B groove",
             );
         }
@@ -1237,9 +1251,7 @@ fn apply_vocal_contract(plan: &mut TacticPlan, f: &CandidateFacts, p: &TacticPol
                 | TacticId::C14
         )
     {
-        let minimum = if plan.tactic_id == TacticId::M01 {
-            plan.bar_frames[6]
-        } else if matches!(plan.tactic_id, TacticId::M02) {
+        let minimum = if matches!(plan.tactic_id, TacticId::M01 | TacticId::M02) {
             plan.hold_end_frame
         } else {
             plan.bar_frames[(plan.bar_frames.len() - 1).min(4)]
@@ -1679,7 +1691,7 @@ pub(crate) fn candidate_tactic_schedule(
         })
     };
     let shape_known = match id {
-        TacticId::M01 => count == 8,
+        TacticId::M01 => count >= 8,
         TacticId::M06 => f.a.vocal_phrases.is_some() && f.b.vocal_phrases.is_some(),
         TacticId::S04 => count >= 3 && band_exchange_order(f).is_some(),
         TacticId::M04 => motif_known(&f.a),
@@ -1744,9 +1756,9 @@ pub(crate) fn candidate_tactic_schedule(
     };
     let landing = arrival.unwrap_or(end).clamp(start, end);
     let exit = match id {
-        M01 => f.bar_frames[6],
+        M01 => f.bar_frames[bars - 2],
         M02 => f.bar_frames[bars - 1],
-        S05 | S06 => f.bar_frames[2.min(bars)],
+        S05 | S06 => f.bar_frames[bars.saturating_sub(2)],
         _ => start,
     };
     let arrangement = match id {
@@ -2479,7 +2491,7 @@ pub(crate) fn candidate_tactic_schedule(
     }
     crate::stem_audibility::validate(&mut plan, f)?;
     let method = match id {
-        M01 => "dense selected layers remain compatible; six complete hold bars and a fixed two-bar accompaniment exit",
+        M01 => "dense selected layers remain compatible through the hold; resolve over the final two bars at the selected endpoint",
         M02 => "spacious retained bed and measured incoming arrival support a one-bar resolution",
         M03 => "complete A vocal phrase over isolated B accompaniment",
         M04 => "isolated A motif occupies a complementary B register",
@@ -2560,7 +2572,7 @@ fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
         S05 => 90.,
         S06 => 94.,
         S04 => 72.,
-        S03 => 70.,
+        S03 => 45.,
         S01 => 65.,
         S02 if preferred_short_fade(f, p).is_some() => 50.,
         S02 => -1000.,
@@ -2579,7 +2591,33 @@ fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
     };
     // Tactic preferences break close calls. A strong measured fit can
     // outrank a more elaborate but less compatible schedule.
-    0.20 * base + 40. * f.pair.complementarity.unwrap_or(0.)
+    let held_bars = match id {
+        M01 | S05 | S06 => (f.bar_frames.len() - 1).saturating_sub(2),
+        M02 => (f.bar_frames.len() - 1).saturating_sub(1),
+        _ => 0,
+    };
+    // Reward an established musical combination, not just the absence of
+    // collisions after most of the outgoing layers have been removed.
+    let sustain = 18. * (1. - (-(held_bars as f64) / 8.).exp());
+    let endpoint = if held_bars > 0
+        && (!f.a.endpoint_reasons.is_empty() || !f.b.endpoint_reasons.is_empty())
+    {
+        4.
+    } else {
+        0.
+    };
+    let band_risk = if id == S04 {
+        band_exchange_order(f).map_or(0., |(_, [a, b])| {
+            if shared_low_band_dominance(a[0], b[0]) {
+                5. * ((a[0].min(b[0]) - 0.70) / 0.30).clamp(0., 1.)
+            } else {
+                0.
+            }
+        })
+    } else {
+        0.
+    };
+    0.20 * base + sustain + endpoint - band_risk + 40. * f.pair.complementarity.unwrap_or(0.)
         - 40. * f.pair.harmonic_distance.unwrap_or(0.5)
         - 30. * f.pair.lead_conflict.unwrap_or(0.5)
 }
@@ -2720,6 +2758,7 @@ pub(crate) mod tests {
                 artifact_score: 0.02,
             }),
             stem_leakage: None,
+            endpoint_reasons: vec![],
             stem_assets: all_lanes()
                 .iter()
                 .map(|&lane| StemAsset {
@@ -3031,6 +3070,50 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn supported_sustained_mix_outranks_isolating_one_collision_free_motif() {
+        let mut held = facts(8);
+        held.a.endpoint_reasons = vec!["measured rhythm change".into()];
+        held.pair.complementarity = Some(0.70);
+        held.pair.harmonic_distance = Some(0.25);
+        held.pair.lead_conflict = Some(0.15);
+        let mut motif = held.clone();
+        motif.pair.complementarity = Some(1.);
+        motif.pair.lead_conflict = Some(0.);
+        assert!(
+            preference(TacticId::M01, &held, &policy())
+                > preference(TacticId::M04, &motif, &policy())
+        );
+        held.pair.complementarity = Some(0.50);
+        held.pair.harmonic_distance = Some(0.50);
+        assert!(
+            preference(TacticId::M01, &held, &policy())
+                < preference(TacticId::M04, &motif, &policy()),
+            "duration must not outweigh a poor musical fit"
+        );
+    }
+
+    #[test]
+    fn long_mashup_keeps_the_supported_endpoint_and_its_vocal_line() {
+        let mut f = facts(12);
+        role_set(&mut f.a, &[TacticRole::Mixed]);
+        role_set(&mut f.b, &[TacticRole::SteadyGroove]);
+        f.a.vocal_phrases = Some(vec![vocal(9 * BAR, 11 * BAR)]);
+        let t = schedule_tactic(TacticId::M01, &f, &policy()).unwrap();
+        assert_eq!(t.hold_end_frame, 10 * BAR);
+        assert_eq!(t.exit_start_frame, 10 * BAR);
+        assert_eq!(t.end_frame, 12 * BAR);
+        validate_compiled(&t, &f);
+        assert!(t
+            .vocal_occupancy
+            .iter()
+            .any(|v| v.placement == f.a.placement && v.end_frame == 11 * BAR));
+        assert!(
+            preference(TacticId::M01, &f, &policy())
+                > preference(TacticId::M01, &facts(8), &policy())
+        );
+    }
+
+    #[test]
     fn brisk_mashup_and_drum_linger_remain_distinct() {
         let mut f = facts(8);
         role_set(
@@ -3041,8 +3124,10 @@ pub(crate) mod tests {
         let t = schedule_tactic(TacticId::M02, &f, &policy()).unwrap();
         assert_eq!(t.exit_start_frame, 7 * BAR);
         let t = schedule_tactic(TacticId::S05, &f, &policy()).unwrap();
-        assert_eq!(t.exit_start_frame, 2 * BAR);
+        assert_eq!(t.exit_start_frame, 6 * BAR);
         f.b.bars[7].stability = Some(0.1);
+        assert!(schedule_tactic(TacticId::M02, &f, &policy()).is_ok());
+        f.b.bars[6].stability = Some(0.1);
         assert!(schedule_tactic(TacticId::M02, &f, &policy()).is_err());
     }
     #[test]
@@ -3345,17 +3430,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn band_exchange_rejects_two_bass_dominant_passages() {
+    fn low_band_energy_penalizes_but_does_not_veto_a_compatible_exchange() {
         let mut f = facts(4);
+        let baseline = preference(TacticId::S04, &f, &policy());
         for bar in f.a.bars.iter_mut().chain(&mut f.b.bars) {
             bar.low_occupancy = Some(0.82);
             bar.mid_occupancy = Some(0.14);
             bar.high_occupancy = Some(0.04);
         }
-        let error = schedule_tactic(TacticId::S04, &f, &policy()).unwrap_err();
-        assert!(error
-            .message
-            .contains("concentrate their energy in the low band"));
+        schedule_tactic(TacticId::S04, &f, &policy()).unwrap();
+        assert!(preference(TacticId::S04, &f, &policy()) < baseline);
+        f.pair.lead_conflict = Some(0.8);
+        assert!(schedule_tactic(TacticId::S04, &f, &policy()).is_err());
+        f.pair.lead_conflict = Some(0.1);
+        f.pair.complementarity = None;
+        assert!(schedule_tactic(TacticId::S04, &f, &policy()).is_err());
     }
 
     #[test]

@@ -93,7 +93,7 @@ pub(crate) fn validate(plan: &mut TacticPlan, f: &CandidateFacts) -> Result<()> 
                                 w.iter().all(|at| curve_value(&v.gain, *at) >= 0.999)
                             });
                         require(quiet || same_line, "TACTIC_STEM_LEAKAGE",
-                            format!("audible {:?} has suspected or unassessed bleed while its own vocal is suppressed", lane.lane))?;
+                            format!("placement {} audible {:?} has suspected or unassessed bleed at output {}..{} while its own vocal is suppressed", lane.placement, lane.lane, w[0], w[1]))?;
                     }
                 }
             }

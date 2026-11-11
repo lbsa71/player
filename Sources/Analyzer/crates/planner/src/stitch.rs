@@ -32,6 +32,32 @@ fn passages(
     pickup: bool,
     cancel: &Cancellation,
 ) -> Result<Vec<Passage>> {
+    passages_for_clock(track, overlap, context, outgoing, pickup, true, cancel)
+}
+
+fn reliable_clock(grid: &Beats, first: usize, last: usize, pulse: f64) -> bool {
+    let excerpt = &grid.events[first..=last];
+    let rate = f64::from(grid.source_sample_rate_hz);
+    excerpt.iter().all(|b| b.score >= 0.5)
+        && excerpt.windows(2).all(|w| {
+            let interval = (w[1].source_frame - w[0].source_frame) as f64 / rate;
+            (0.8 * pulse..=1.2 * pulse).contains(&interval)
+        })
+        && !grid.unreliable_intervals.iter().any(|r| {
+            r.start_frame < excerpt.last().unwrap().source_frame
+                && r.end_frame > excerpt[0].source_frame
+        })
+}
+
+fn passages_for_clock(
+    track: &Analyzed,
+    overlap: usize,
+    context: usize,
+    outgoing: bool,
+    pickup: bool,
+    sync_context: bool,
+    cancel: &Cancellation,
+) -> Result<Vec<Passage>> {
     let beats = &track.beats.events;
     let downbeats: BTreeSet<_> = track.beats.downbeat_ids.iter().collect();
     let rate = track.track.format.sample_rate_hz as f64;
@@ -46,21 +72,18 @@ fn passages(
         if j.max(k) >= beats.len() || (!pickup && !downbeats.contains(&beats[j].event_id)) {
             continue;
         }
-        let excerpt = &beats[i.min(k)..=j.max(k)];
         let start = beat.source_frame;
         let end = beats[j].source_frame;
         let seconds = (end - start) as f64 / rate;
         let pulse = seconds / overlap as f64;
-        if excerpt.iter().any(|b| b.score < 0.5)
-            || excerpt.windows(2).any(|w| {
-                let interval = (w[1].source_frame - w[0].source_frame) as f64 / rate;
-                !(0.8 * pulse..=1.2 * pulse).contains(&interval)
-            })
-            || track.beats.unreliable_intervals.iter().any(|r| {
-                r.start_frame < excerpt.last().unwrap().source_frame
-                    && r.end_frame > excerpt[0].source_frame
-            })
-        {
+        // Solo context need not keep the overlap's rhythm: an incoming beat
+        // change can be precisely the musical reason to finish the handoff here.
+        let (first, last) = if sync_context {
+            (i.min(k), j.max(k))
+        } else {
+            (i, j)
+        };
+        if !reliable_clock(&track.beats, first, last, pulse) {
             continue;
         }
         let mut accents: Vec<_> = beats[i..=j]
@@ -523,15 +546,24 @@ pub fn tactic_stitch_candidates(
     let mut choices = Vec::new();
     // Include short exits and long holds in each evidenced common meter.
     for overlap in lengths {
-        let outgoing = passages(&a, overlap, request.context_beats, true, false, cancel)?;
+        let outgoing = passages_for_clock(
+            &a,
+            overlap,
+            request.context_beats,
+            true,
+            false,
+            false,
+            cancel,
+        )?;
         for incoming_overlap in [overlap, overlap * 2, overlap / 2] {
             if !(2..=256).contains(&incoming_overlap) {
                 continue;
             }
-            let incoming = passages(
+            let incoming = passages_for_clock(
                 &b,
                 incoming_overlap,
                 request.context_beats,
+                false,
                 false,
                 false,
                 cancel,
@@ -694,6 +726,143 @@ pub fn tactic_stitch_candidates(
 }
 
 type TacticCueChoice = (usize, f64, u64, u64, usize, usize);
+
+/// Keep a promising entry alive and ask where the music gives it an ending.
+/// Event endpoints are proposals, never authorization to bypass admission.
+pub fn tactic_continuations(
+    store: &Store,
+    request: &StitchRequest<'_>,
+    policy: &MixingConfig,
+    seed: &MixPlan,
+    limit: usize,
+    cancel: &Cancellation,
+) -> Result<Vec<MixPlan>> {
+    if limit == 0 {
+        return Ok(vec![]);
+    }
+    let a = load_analyzed(store, store.track(request.from)?)?;
+    let b = load_analyzed(store, store.track(request.to)?)?;
+    let tracks = [&a, &b];
+    let transition = &seed.transitions[0];
+    let starts: [u64; 2] = std::array::from_fn(|i| {
+        seed.placements[i]
+            .time_map
+            .source_at(transition.start_output_frame as f64)
+            .round() as u64
+    });
+    let index = |track: &Analyzed, frame: u64| {
+        track
+            .beats
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                b.source_frame.abs_diff(frame)
+                    <= u64::from(track.track.format.sample_rate_hz) * 8 / 100
+            })
+            .min_by_key(|(_, b)| b.source_frame.abs_diff(frame))
+            .map(|(i, _)| i)
+    };
+    let Some(indices) = index(&a, starts[0]).zip(index(&b, starts[1])) else {
+        return Ok(vec![]);
+    };
+    let indices = [indices.0, indices.1];
+    let initial: [usize; 2] = std::array::from_fn(|i| {
+        index(
+            tracks[i],
+            seed.placements[i]
+                .time_map
+                .source_at(transition.end_output_frame as f64)
+                .round() as u64,
+        )
+        .unwrap_or(indices[i])
+        .saturating_sub(indices[i])
+    });
+    if initial.contains(&0) {
+        return Ok(vec![]);
+    }
+    let mut endpoints = vec![];
+    for (side, track) in tracks.iter().enumerate() {
+        let Some(reference) = track.analysis.artifacts.get("tactic_analysis") else {
+            continue;
+        };
+        let record: TacticTrackAnalysis = store.read_ref(reference)?;
+        for event in crate::transition_endpoints::measured(&record) {
+            let Some(at) = index(track, event.frame) else {
+                continue;
+            };
+            let count = at.saturating_sub(indices[side]);
+            if count <= initial[side] || count > 256 {
+                continue;
+            }
+            let numerator = count * initial[1 - side];
+            if numerator % initial[side] != 0 {
+                continue;
+            }
+            let other = numerator / initial[side];
+            if !(2..=256).contains(&other) {
+                continue;
+            }
+            let lengths = if side == 0 {
+                [count, other]
+            } else {
+                [other, count]
+            };
+            endpoints.push((lengths, side, event));
+        }
+    }
+    endpoints.sort_by_key(|(counts, _, _)| counts[0]);
+    endpoints.dedup_by_key(|(counts, _, _)| *counts);
+    let mut result = vec![];
+    for (counts, side, endpoint) in endpoints {
+        cancel.check()?;
+        let pinned = StitchRequest {
+            overlap_beats: counts[0],
+            ..*request
+        };
+        let (mut plan, _) = match build_stitch_from_tracks(
+            store,
+            [&a, &b],
+            &pinned,
+            policy,
+            None,
+            None,
+            StitchStyle::PinnedTactic {
+                outgoing: starts[0],
+                incoming: starts[1],
+                incoming_overlap: counts[1],
+            },
+            cancel,
+        ) {
+            Ok(plan) => plan,
+            Err(e)
+                if matches!(
+                    e.code.as_str(),
+                    "STITCH_INFEASIBLE" | "TIME_MAP_SPEED" | "TIME_MAP_ACCELERATION"
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        if (plan.transitions[0].end_output_frame - plan.transitions[0].start_output_frame) as f64
+            / f64::from(plan.output.sample_rate_hz)
+            > 120.
+        {
+            continue;
+        }
+        plan.header.extensions.insert("tactic_cue_candidate".into(),serde_json::json!({
+            "outgoing_source_frame":starts[0],"incoming_source_frame":starts[1],
+            "overlap_beats":counts[0],"incoming_overlap_beats":counts[1],"timing_basis":"bars",
+            "endpoint":{"placement":side,"source_frame":endpoint.frame,"reason":endpoint.reason},
+        }));
+        result.push(plan);
+        if result.len() >= limit {
+            break;
+        }
+    }
+    Ok(result)
+}
 
 fn distribute_tactic_durations(choices: Vec<TacticCueChoice>) -> Vec<TacticCueChoice> {
     // Preserve ranking within each duration, but give every evidenced duration
@@ -2080,12 +2249,13 @@ fn build_stitch_from_tracks(
     let mut outgoing = if linger {
         linger_outgoing(tracks[0], request.context_beats, cancel)?
     } else {
-        passages(
+        passages_for_clock(
             tracks[0],
             overlap_beats,
             request.context_beats,
             true,
             beat_return.is_some(),
+            !matches!(style, StitchStyle::PinnedTactic { .. }),
             cancel,
         )?
     };
@@ -2105,12 +2275,13 @@ fn build_stitch_from_tracks(
         } => incoming_overlap,
         _ => overlap_beats,
     };
-    let mut incoming = passages(
+    let mut incoming = passages_for_clock(
         tracks[1],
         incoming_overlap,
         request.context_beats,
         false,
         beat_return.is_some() && !linger,
+        !matches!(style, StitchStyle::PinnedTactic { .. }),
         cancel,
     )?;
 
@@ -2559,6 +2730,39 @@ fn build_stitch_from_tracks(
 #[cfg(test)]
 mod mashup_tests {
     use super::*;
+
+    #[test]
+    fn beat_change_after_handoff_does_not_invalidate_synchronized_overlap() {
+        let mut grid = Beats {
+            header: Header::default(),
+            beats_id: "test".into(),
+            source_sample_rate_hz: 1000,
+            source_frames: 6000,
+            events: (0..=12)
+                .map(|n| Beat {
+                    event_id: n.to_string(),
+                    source_frame: n * 500,
+                    score: 1.,
+                    local_bpm: Some(120.),
+                })
+                .collect(),
+            downbeat_ids: vec![],
+            meter_segments: vec![],
+            unreliable_intervals: vec![],
+            score_semantics: "synthetic test".into(),
+        };
+        grid.events[9].source_frame += 180;
+        assert!(!reliable_clock(&grid, 0, 12, 0.5));
+        assert!(
+            reliable_clock(&grid, 0, 8, 0.5),
+            "solo beat changes are allowed after the mix ends"
+        );
+        grid.events[7].source_frame += 180;
+        assert!(
+            !reliable_clock(&grid, 0, 8, 0.5),
+            "overlapping beats must still be reliable"
+        );
+    }
 
     #[test]
     fn cue_budget_preserves_long_windows_before_tactic_admission() {

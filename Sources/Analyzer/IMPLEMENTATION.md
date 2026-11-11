@@ -166,14 +166,34 @@ by the snapshot is unchanged; rendering independently verifies pinned source
 and stem content. This reduces repeated sidecar parsing without making stale
 evidence authoritative.
 
-M01 holds the selected mashup for six complete bars and crossfades accompaniment
-from elapsed bar 6 to bar 8. B drums stay steady, A drums stay absent, bass has
-an explicit exchange, and vocal gates follow independent supported phrases
-with at least a 300 ms guard. M02 retains the spacious bed and brisk exit.
-Density and compatibility are measured after choosing the audible lanes; loud
-source files alone do not establish a mashup. Uncertain vocals or separation
-can reject both choices. Local Whisper timing and acoustic support are evidence
-for sung phrases, not a guarantee that the transcription or phrase is correct.
+The measured picker now extends admitted entries to endings proposed from
+persisted sustained drum energy/pattern changes and structural events. Each pair
+has a separate bounded continuation budget equal to its seed budget, with half
+reserved for mashups and staged handoffs. A single fill cannot certify a rhythm
+change. Proposals go through the same PCM, vocal, timing and layer admission as
+seeds. Per-window reports retain the cue, duration, profiles and exact rejections.
+
+M01 can hold longer than six bars, preserving a final two-bar resolution. S05/S06
+keep their selected layers until that resolution instead of exiting at bar two.
+Stability uses the hold as its reference and is checked separately from the exit.
+Longer admitted holds receive a bounded score benefit, as do measured end events.
+Bass swaps have lower tactic preference; shared low-band energy penalizes S04
+but cannot by itself reject a measured-compatible band allocation.
+
+Pinned tactic windows validate beat reliability over their synchronized overlap;
+solo lead-in/runout can change rhythm without invalidating that overlap. The
+vocal scheduler tests later verified gaps when closing at the first pocket
+would leave suspected vocal bleed in an audible accompaniment lane. It never
+moves accompaniment automation or waives leakage checks to make a gate fit.
+
+M01 holds the selected mashup for at least six complete bars and resolves over
+the final two bars of its measured window. B drums stay steady, A drums stay
+absent, bass has an explicit exchange, and vocal gates follow independent
+supported phrases with at least a 300 ms guard. M02 retains the spacious bed
+and brisk exit. Density and compatibility are measured after choosing audible
+lanes; loud source files alone do not establish a mashup. Uncertain vocals or
+separation can reject both choices. Local Whisper timing and acoustic support
+are evidence for sung phrases, not a guarantee of correct transcription.
 
 To inspect or apply tactics to a saved plan:
 
@@ -212,7 +232,8 @@ routes rank by fewest last-resort transitions, then weakest join, then total sco
 Unmatched ownership cuts and ordinary short fades share a default budget of one
 last-resort join per set. All-band mapped PCM agreement can promote a cut. Each
 measurement pass saves a `measured_graph` report with per-pair tactic admissions
-and rejection reasons. The cue shortlist does not privilege simultaneous vocal
+and rejection reasons, linking to separate detailed window reports so the graph
+does not exceed the catalog record-size limit. The cue shortlist does not privilege simultaneous vocal
 gaps over structural phrase quality.
 Dry stem handoffs apply persisted leakage vetoes to the audible lane intervals.
 Unknown or suspected bleed is rejected when that deck's vocal is suppressed,
@@ -475,7 +496,7 @@ in `tests/fixtures`; example analysis/plan JSON is in `examples/`.
 
 
 Tactic tests cover all 38 contract IDs and every processing family with positive
-and negative fixtures: fixed six-plus-two envelopes, independent vocal gates,
+and negative fixtures: event-bounded holds with two-bar resolutions, independent vocal gates,
 selected-layer compatibility, native/structural timing, bounded effects and wet
 tails, explicit source edits/pitch sampling, offline emergency refusal and live
 recovery. Storage tests exercise component invalidation, checksum failures,

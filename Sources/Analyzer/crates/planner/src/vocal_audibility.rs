@@ -89,41 +89,68 @@ pub(crate) fn apply(plan: &mut TacticPlan, f: &CandidateFacts) -> Result<bool> {
             return Ok(false);
         }
         let minimum = match plan.tactic_id {
-            TacticId::M01 => plan.bar_frames[6],
-            TacticId::M02 => plan.hold_end_frame,
+            TacticId::M01 | TacticId::M02 => plan.hold_end_frame,
             _ => plan.bar_frames[(plan.bar_frames.len() - 1).min(4)],
         };
         let ramp = (u64::from(f.output_sample_rate_hz) / 200).max(1);
-        let off = first_gap(a, (minimum + ramp).min(end), end, half).ok_or_else(|| {
-            Error::new(
-                "TACTIC_VOCALS",
-                "no measured gap after the outgoing vocal hold",
-            )
-        })?;
-        let earliest = possible_vocals([start, off], a)
-            .last()
-            .map_or(start, |last| (last[1] + guard).max(start));
-        let on = first_gap(b, earliest, end, half).ok_or_else(|| {
-            Error::new("TACTIC_VOCALS", "no measured gap for incoming vocal entry")
-        })?;
-        for lane in plan
-            .lanes
-            .iter_mut()
-            .filter(|lane| lane.lane == StemLane::Vocals)
-        {
-            lane.gain = if lane.placement == f.a.placement {
-                transfer(
-                    start,
-                    end,
-                    off.saturating_sub(ramp).max(minimum),
-                    off,
-                    false,
-                )
-            } else if on == end {
-                constant(start, end, 0.)
-            } else {
-                transfer(start, end, on, (on + ramp).min(end), true)
+        let mut alternatives = vec![];
+        for &[a, b] in a {
+            let first = (minimum + ramp).min(end).max(a + half);
+            let last = end.min(b.saturating_sub(half));
+            if first <= last {
+                alternatives.push(first);
+                if first != last {
+                    alternatives.push(last);
+                }
+            }
+        }
+        let mut failure = Error::new(
+            "TACTIC_VOCALS",
+            "no measured gap after the outgoing vocal hold",
+        );
+        let mut accepted = false;
+        for off in alternatives {
+            let earliest = possible_vocals([start, off], a)
+                .last()
+                .map_or(start, |last| (last[1] + guard).max(start));
+            let Some(on) = first_gap(b, earliest, end, half) else {
+                failure = Error::new("TACTIC_VOCALS", "no measured gap for incoming vocal entry");
+                continue;
             };
+            let mut trial = plan.clone();
+            for lane in trial
+                .lanes
+                .iter_mut()
+                .filter(|lane| lane.lane == StemLane::Vocals)
+            {
+                lane.gain = if lane.placement == f.a.placement {
+                    transfer(
+                        start,
+                        end,
+                        off.saturating_sub(ramp).max(minimum),
+                        off,
+                        false,
+                    )
+                } else if on == end {
+                    constant(start, end, 0.)
+                } else {
+                    transfer(start, end, on, (on + ramp).min(end), true)
+                };
+            }
+            // A silent pocket is not necessarily the end of vocal ownership:
+            // retained accompaniment can carry the next line's bleed. Try a
+            // later supported pocket before discarding the entire long hold.
+            match crate::stem_audibility::validate(&mut trial, f) {
+                Ok(()) => {
+                    plan.lanes = trial.lanes;
+                    accepted = true;
+                    break;
+                }
+                Err(error) => failure = error,
+            }
+        }
+        if !accepted {
+            return Err(failure);
         }
     }
     let mut occupancy: Vec<VocalOccupancy> = vec![];
@@ -203,4 +230,53 @@ pub(crate) fn apply(plan: &mut TacticPlan, f: &CandidateFacts) -> Result<bool> {
     plan.vocal_occupancy = occupancy;
     plan.evidence.push("audible-lane vocal check: PCM-verified gaps at gates, conservative possible activity elsewhere; no lyric transcription inferred".into());
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tactics::{
+        candidate_tactic_schedule, tests::facts, StemLeakageWindow, TacticPolicy,
+    };
+
+    #[test]
+    fn later_vocal_pocket_preserves_a_long_hold_with_audible_bleed() {
+        let mut f = facts(8);
+        let mut plan =
+            candidate_tactic_schedule(TacticId::M01, &f, &TacticPolicy::default()).unwrap();
+        let bar = plan.bar_frames[1];
+        f.a.vocal_phrases = None;
+        f.b.vocal_phrases = None;
+        f.a.vocal_quiet = Some(vec![[0, bar * 6 + bar / 3], [bar * 7, bar * 9]]);
+        f.b.vocal_quiet = Some(vec![[0, bar * 9]]);
+        f.a.stem_leakage = Some(
+            [StemLane::Bass, StemLane::Other]
+                .into_iter()
+                .map(|lane| StemLeakageWindow {
+                    lane,
+                    start_frame: 0,
+                    end_frame: plan.end_frame,
+                    suspect_spans: None,
+                })
+                .collect(),
+        );
+        let exit = plan.exit_start_frame;
+        apply(&mut plan, &f).unwrap();
+        crate::stem_audibility::validate(&mut plan, &f).unwrap();
+        let voice = plan
+            .lanes
+            .iter()
+            .find(|l| l.placement == f.a.placement && l.lane == StemLane::Vocals)
+            .unwrap();
+        assert_eq!(crate::tactics::curve_value(&voice.gain, bar * 7), 1.);
+        assert_eq!(
+            plan.exit_start_frame, exit,
+            "vocal pocket does not move the accompaniment exit"
+        );
+        f.a.vocal_quiet = Some(vec![[0, bar * 6 + bar / 3]]);
+        assert!(
+            apply(&mut plan, &f).is_err(),
+            "missing final safe pocket remains a rejection"
+        );
+    }
 }

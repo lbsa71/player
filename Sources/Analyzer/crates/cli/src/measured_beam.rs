@@ -34,7 +34,7 @@ fn measure_graph(
     context: usize,
     budget: usize,
     cancel: &Cancellation,
-) -> Result<(Graph, Report)> {
+) -> Result<(Graph, Report, Vec<Report>)> {
     let n = pool.len();
     let pairs: Vec<_> = (0..n)
         .flat_map(|a| (0..n).filter(move |&b| a != b).map(move |b| (a, b)))
@@ -98,6 +98,27 @@ fn measure_graph(
         }
     }
     eprintln!("stitch: admitted choices by tactic: {by_tactic:?}");
+    // Each pair owns detailed window evidence. Keeping every profile in one
+    // graph record can exceed the catalog's 8 MiB record limit before search.
+    let mut pair_reports = vec![];
+    for diagnostic in &mut diagnostics {
+        if let Some(details) = diagnostic
+            .as_object_mut()
+            .and_then(|d| d.remove("window_details"))
+        {
+            let mut pair = Report::new("measured_pair_windows");
+            pair.header
+                .extensions
+                .insert("from".into(), diagnostic["from"].clone());
+            pair.header
+                .extensions
+                .insert("to".into(), diagnostic["to"].clone());
+            pair.header.extensions.insert("windows".into(), details);
+            diagnostic["window_report"] =
+                serde_json::json!(format!("reports/{}.json", pair.report_id));
+            pair_reports.push(pair);
+        }
+    }
     let mut report = Report::new("measured_graph");
     report
         .header
@@ -108,7 +129,7 @@ fn measure_graph(
         .extensions
         .insert("admitted_by_tactic".into(), serde_json::json!(by_tactic));
     report.counts.insert("cue_budget".into(), budget as u64);
-    Ok((graph, report))
+    Ok((graph, report, pair_reports))
 }
 
 #[derive(Clone, Copy)]
@@ -460,11 +481,15 @@ pub(super) fn choose(
         .min((count - 1) as u64) as usize;
     for budget in [24, 64] {
         eprintln!(
-            "stitch: building measured choices from {} tracks, up to {budget} cue windows per pair",
+            "stitch: building measured choices from {} tracks, up to {budget} seed and {budget} event-ending windows per pair",
             pool.len()
         );
-        let (graph, report) = measure_graph(&snapshot, &pool, policy, context, budget, cancel)?;
+        let (graph, report, pair_reports) =
+            measure_graph(&snapshot, &pool, policy, context, budget, cancel)?;
         snapshot.verify_read_snapshot(cancel)?;
+        for pair in pair_reports {
+            store.report(&pair)?;
+        }
         store.report(&report)?;
         eprintln!(
             "stitch: cue and tactic diagnostics: reports/{}.json",
@@ -486,9 +511,10 @@ pub(super) fn choose(
                 continue;
             };
             snapshot.verify_read_snapshot(cancel)?;
-            plan.planner_version = "measured-cue-beam/2".into();
+            plan.planner_version = "measured-cue-beam/3".into();
             plan.header.extensions.insert("library_pick".into(), serde_json::json!({
-                "analyzed_tracks": pool.len(), "measured_choices": edges, "cue_budget_per_pair": budget,
+                "analyzed_tracks": pool.len(), "measured_choices": edges, "cue_budget_per_pair": budget*2,
+                "seed_cue_budget_per_pair":budget,"continuation_budget_per_pair":budget,
                 "beam_width": width, "track_ids": plan.placements.iter().map(|p| &p.track_id).collect::<Vec<_>>(),
                 "max_last_resort_transitions": max_fallbacks,
             }));

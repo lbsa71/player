@@ -754,6 +754,7 @@ fn passage_facts(
         vocal_quiet: None,
         stems: None,
         stem_leakage: None,
+        endpoint_reasons: vec![],
         stem_assets: vec![],
         loop_candidates: vec![],
         motif: None,

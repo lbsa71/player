@@ -71,8 +71,9 @@ fn interval_distance(a: &[f64; 12], b: &[f64; 12]) -> Option<f64> {
     )
 }
 
-fn layer_stability(levels: &[f64]) -> Vec<f64> {
-    let mean = levels.iter().sum::<f64>() / levels.len().max(1) as f64;
+fn layer_stability(levels: &[f64], held_bars: usize) -> Vec<f64> {
+    let held = &levels[..held_bars.max(1).min(levels.len())];
+    let mean = held.iter().sum::<f64>() / held.len().max(1) as f64;
     levels
         .iter()
         .map(|level| {
@@ -646,7 +647,12 @@ fn profile(
         densities.push(per_density.into_iter().fold(1., f64::min));
         beds.push(per_bed.into_iter().fold(0., f64::max));
     }
-    Some(PairProfile{method:METHOD.into(),evidence:vec![format!("source analysis {} / {}; actual {:?} lane curves, edit captures and bounded FX; harmony is added incompatible pitch-class interval mass over within-passage baselines plus baseline-weighted spectral disagreement; stability uses separate sustained-lane source RMS before intentional fades; summaries are measured heuristics, summed peak is an upper bound, RMS combination assumes uncorrelated layers",records[0].tactic_analysis_id,records[1].tactic_analysis_id,t.tactic_id)],harmonic_distance:Some(harmonic),lead_conflict:Some(conflict.clamp(0.,1.)),complementarity:Some((1.-collision).clamp(0.,1.)),predicted_peak_dbfs:Some(db(peak)),selected_composite_density:Some(densities),retained_bed_density:Some(beds),outgoing_layer_stability:measure_stability.then(||layer_stability(&held_levels[0])),incoming_layer_stability:measure_stability.then(||layer_stability(&held_levels[1]))})
+    let held_bars = t
+        .bar_frames
+        .iter()
+        .take_while(|&&at| at < t.hold_end_frame)
+        .count();
+    Some(PairProfile{method:METHOD.into(),evidence:vec![format!("source analysis {} / {}; actual {:?} lane curves, edit captures and bounded FX; harmony is added incompatible pitch-class interval mass over within-passage baselines plus baseline-weighted spectral disagreement; stability uses separate sustained-lane source RMS before intentional fades; summaries are measured heuristics, summed peak is an upper bound, RMS combination assumes uncorrelated layers",records[0].tactic_analysis_id,records[1].tactic_analysis_id,t.tactic_id)],harmonic_distance:Some(harmonic),lead_conflict:Some(conflict.clamp(0.,1.)),complementarity:Some((1.-collision).clamp(0.,1.)),predicted_peak_dbfs:Some(db(peak)),selected_composite_density:Some(densities),retained_bed_density:Some(beds),outgoing_layer_stability:measure_stability.then(||layer_stability(&held_levels[0], held_bars)),incoming_layer_stability:measure_stability.then(||layer_stability(&held_levels[1], held_bars))})
 }
 
 #[derive(Clone, Debug)]

@@ -1,6 +1,6 @@
 # Mixing tactics
 
-Specification version 1.1 · 10 November 2026
+Specification version 1.2 · 11 November 2026
 
 This is the decision contract for choosing cues, layer ownership, transition
 duration and exit treatment. It extends [the analyzer specification](README.md).
@@ -22,18 +22,37 @@ application policy to evaluate against the collection. They are not universal
 DJ rules. The rules below remain the decision contract; implementation status
 and remaining validation are recorded separately.
 
+## Choose the entry and ending from the music
+
+A tactic's duration follows its measured start and end. Short seed windows are
+search probes, not a menu of allowed transition lengths. Once a combination is
+admitted, keep that entry alive and test later sustained drum-pattern/energy
+changes, drops, drum returns and build releases. Measure the complete proposed
+hold and resolution again. A single fill is not a sustained change. A rhythm change after the overlap
+MUST NOT invalidate an otherwise synchronized overlap.
+
+Minimum holds, phrase alignment, vocal completion and bounded rendering still
+apply. Longer safe holds receive preference; they are not extended through a
+failed vocal, harmony, separation or timing check. Stability is assessed over
+the retained layers during the hold, separately from the intentional resolution.
+Vocal gaps are choices too: test later supported gaps when the first would
+leave vocal bleed in retained accompaniment. Keep accompaniment automation
+independent and recheck audible vocal ownership.
+Bass swaps remain available but receive less preference than a useful mashup or
+staged handoff. Tactic variety alone is not evidence of a better mix.
+
 ## The dense-mashup rule
 
 **Given A has a stable, intense passage whose vocals and accompaniment work
 over B's drums, and B has a stable drum passage with a compatible arrival,
-prefer six complete bars of mashup followed by two bars of accompaniment
-crossfade, within an eight-bar transition.**
+hold the mashup until a supported ending, then resolve across the final two
+bars. Keep at least six complete hold bars.**
 
 This preference applies only after checking the actual selected layers. Two
 loud songs do not necessarily make a dense composite, and two individually good
 passages can still clash. Overcrowded doubles should instead use a simpler
 layer allocation, another cue or a drop replacement. Human instruction supports
-that distinction. The exact six-plus-two schedule is this app's policy.
+that distinction. Six-plus-two is the shortest dense-mashup example, not a maximum length.
 [Double-drop guidance][double-drop]
 
 Use zero-based elapsed bars throughout this document. `t = 6` is the start of
@@ -53,8 +72,9 @@ validated local meter and shared tempo map. The example below assumes 4/4.
 require playing both complete stereo mixes. An onset-sized de-click ramp is
 allowed at the drum replacement and does not consume a musical hold bar.
 
-The accompaniment fade MUST start at `t = 6` and finish at `t = 8`. Its endpoints
-MUST NOT move when a vocal pocket moves. Vocal gates are a separate schedule.
+In this eight-bar example, the accompaniment fade MUST start at `t = 6` and
+finish at `t = 8`. Longer event-bounded windows keep the final two bars for
+resolution. Accompaniment endpoints MUST NOT move when a vocal pocket moves. Vocal gates are a separate schedule.
 A's vocals must survive at least the first four bars when a continuing vocal
 phrase is present, and the default mashup keeps them available through all six
 hold bars. Never extend a finished phrase artificially just to fill that time.
@@ -78,9 +98,9 @@ It is neither a six-bar transition nor six bars plus an exit appended after
 bar eight. With variable tempo, bar boundaries are mapped to output frames;
 they are not approximated using a single average BPM.
 
-M01 now implements this fixed six-plus-two schedule. M02 retains the spacious
+M01 implements an event-bounded hold with a final two-bar resolution. M02 retains the spacious
 hold and brisk exit. Automatic choice checks density after lane selection,
-full-window stability, actual phrase/gate timing, separation evidence and
+hold stability, full-window compatibility, actual phrase/gate timing, separation evidence and
 headroom. A candidate without sufficient evidence is rejected; the presence
 of an M01 renderer does not make every dense pair eligible.
 
@@ -203,12 +223,13 @@ limits are this specification's design inferences.
 
 - **Given A** has a stable vocal/texture/bass passage whose drums can be removed,
   **and B** supplies a complementary, steady groove and compatible resolution.
-- **Use** the six-plus-two schedule above when the selected composite is dense
+- **Use** an event-bounded hold with a final two-bar resolution (the six-plus-two
+  schedule above is the minimum) when the selected composite is dense
   but clear. Keep B's drums stable, preserve A's phrase, then transfer the other
   layers over the final two bars. Character `subtle`.
 - **Reject** crowding, unreliable isolation or a vocal finish outside the safe
   window. Try another cue or S04/S05; never reward density alone.
-- **Status** Implemented fixed six-plus-two accompaniment exit, independent phrase-safe vocal gates and measured selected-layer density admission.
+- **Status** Implemented variable-length holds with a final two-bar accompaniment exit, independent phrase-safe vocal gates and measured selected-layer density admission.
   [Double-drop density guidance][double-drop], [stem controls][stems].
 
 #### M02 — Spacious drum-and-texture mashup with a brisk resolution
@@ -326,8 +347,10 @@ repeat or use the content of a line still require positive phrase evidence.
   gains. Choose ordering from occupancy rather than treating it as universal.
 - **Reject** vocal collisions hidden by band-level reasoning. Prefer stem
   handoffs when frequency bands cannot separate the competing material.
-  Skip automatic band exchanges when both passages place at least 70% of
-  their measured band energy in the lows.
+  Penalize shared low-band dominance when both passages place at least 70%
+  of their measured band energy in the lows. This is not a hard veto. Actual
+  scheduled upper-layer harmony, lead conflict, complementarity, vocal gates
+  and headroom must still pass.
 - **Status** Implemented staged three-band scheduling and measured compatibility checks. Further listening-based ordering refinements remain possible.
   [EQ transition foundation][basic].
 
@@ -348,7 +371,9 @@ repeat or use the content of a line still require positive phrase evidence.
 - **Given A** has a break followed by a supported drum-return boundary,
   **and B** has a compatible groove ready at that point.
 - **Use** the return as the exact drum handoff. Remove A drums, introduce B
-  drums, preserve A's useful vocals/texture, then use S04, M01 or M02 to resolve.
+  drums and preserve A's useful vocals/texture until the selected musical ending.
+  S06 resolves over the final two bars rather than always starting its exit
+  two bars after entry. The measured longer window must pass admission again.
 - **Reject** entry before the intended phrase boundary or after an ambiguous
   pickup. Never replace A's entire stereo mix just to remove its drums.
 - **Status** Implemented source-event drum replacement and phrase-safe resolution, including the earlier prepared-handoff path.
@@ -835,7 +860,7 @@ checks cannot certify that a transition is pleasant or imperceptible.
 
 | Capability | Executable implementation | Validation boundary |
 | --- | --- | --- |
-| M01/M02 and stem handoffs | Independent drum/bass/other/vocal schedules; exact six-plus-two or spacious brisk exit | ASR/separation/density uncertainty can reject a real candidate; no title-specific exceptions |
+| M01/M02 and stem handoffs | Independent drum/bass/other/vocal schedules; event-bounded hold with two-bar resolution or spacious brisk exit | ASR/separation/density uncertainty can reject a real candidate; no title-specific exceptions |
 | Blend, EQ and structural cuts | Per-tactic admission, ownership schedules, explicit natural/phrase arrivals and selected-lane profiles | Role/phrase/headroom heuristics need broader listening calibration |
 | Tempo modifiers | Validated cubic maps, shared bar trajectories, measured half/double-pulse hierarchy and independent C14 clock | No synthetic meter or large-speed exception disguised as normal beatmatching |
 | Filter, echo, reverb, freeze, gate, noise, spiral | Versioned bounded effect specifications, state, automation, captures and wet-tail validation | Numerical tests establish DSP behavior, not musical taste |

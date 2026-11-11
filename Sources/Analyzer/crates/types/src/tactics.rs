@@ -800,11 +800,11 @@ impl TacticPlan {
         if self.tactic_id == TacticId::M01 {
             require(
                 self.timing_basis == TacticTimingBasis::Bars
-                    && self.bar_frames.len() == 9
-                    && self.hold_end_frame == self.bar_frames[6]
-                    && self.exit_start_frame == self.bar_frames[6],
+                    && self.bar_frames.len() >= 9
+                    && self.hold_end_frame == self.bar_frames[self.bar_frames.len() - 3]
+                    && self.exit_start_frame == self.hold_end_frame,
                 "TACTIC_MASHUP",
-                "M01 must hold six bars and resolve over bars seven and eight",
+                "M01 must hold at least six bars and resolve over the final two bars",
             )?;
         }
         if matches!(
@@ -1045,7 +1045,7 @@ impl TacticPlan {
                                 && g.last().is_some_and(|p| p.value == final_gain)
                         }),
                         "TACTIC_MASHUP",
-                        "M01 accompaniment cannot move before six complete bars",
+                        "M01 accompaniment cannot move before the selected hold ends",
                     )?;
                 }
             }

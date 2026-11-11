@@ -16,6 +16,111 @@ pub(super) struct MeasuredEdge {
     pub last_resort: bool,
 }
 
+struct CandidateQueue {
+    pending: std::collections::VecDeque<MixPlan>,
+    seen: std::collections::BTreeSet<[u64; 4]>,
+    extended: std::collections::BTreeMap<[u64; 2], usize>,
+    remaining: usize,
+    hold_reserve: usize,
+}
+
+fn cue_key(plan: &MixPlan) -> [u64; 4] {
+    let t = &plan.transitions[0];
+    [
+        plan.placements[0]
+            .time_map
+            .source_at(t.start_output_frame as f64)
+            .round() as u64,
+        plan.placements[1]
+            .time_map
+            .source_at(t.start_output_frame as f64)
+            .round() as u64,
+        plan.placements[0]
+            .time_map
+            .source_at(t.end_output_frame as f64)
+            .round() as u64,
+        plan.placements[1]
+            .time_map
+            .source_at(t.end_output_frame as f64)
+            .round() as u64,
+    ]
+}
+
+impl CandidateQueue {
+    fn new(plans: Vec<MixPlan>, budget: usize) -> Self {
+        Self {
+            seen: plans.iter().map(cue_key).collect(),
+            pending: plans.into(),
+            extended: Default::default(),
+            remaining: budget,
+            hold_reserve: budget / 2,
+        }
+    }
+}
+
+fn extend_cues(
+    store: &Store,
+    request: &mixlib_planner::StitchRequest<'_>,
+    mixing: &MixingConfig,
+    candidate: &MixPlan,
+    selection: &mixlib_planner::TacticSelection,
+    queue: &mut CandidateQueue,
+    cancel: &Cancellation,
+) -> Result<()> {
+    let held = selection.candidates.iter().any(|c| {
+        matches!(
+            c.plan.tactic_id,
+            TacticId::M01 | TacticId::M02 | TacticId::S04 | TacticId::S05 | TacticId::S06
+        )
+    });
+    let blend = selection.candidates.iter().any(|c| {
+        !c.last_resort
+            && matches!(
+                c.plan.tactic_id,
+                TacticId::S01 | TacticId::S03 | TacticId::S08
+            )
+    });
+    let limit = if held {
+        queue.remaining.min(8)
+    } else if blend {
+        queue.remaining.saturating_sub(queue.hold_reserve).min(4)
+    } else {
+        0
+    };
+    if limit == 0 {
+        return Ok(());
+    }
+    let key = cue_key(candidate);
+    if queue
+        .extended
+        .get(&[key[0], key[1]])
+        .is_some_and(|old| *old >= limit)
+    {
+        return Ok(());
+    }
+    queue.extended.insert([key[0], key[1]], limit);
+    for plan in
+        mixlib_planner::tactic_continuations(store, request, mixing, candidate, limit, cancel)?
+    {
+        if queue.seen.insert(cue_key(&plan)) {
+            queue.pending.push_back(plan);
+            queue.remaining -= 1;
+        }
+    }
+    Ok(())
+}
+
+fn window_diagnostic(
+    candidate: &MixPlan,
+    facts: &mixlib_planner::CandidateFacts,
+    selection: &mixlib_planner::TacticSelection,
+) -> serde_json::Value {
+    serde_json::json!({"cue":candidate.header.extensions.get("tactic_cue_candidate"),
+        "bars":facts.bar_frames.len()-1,"accepted":selection.candidates.iter().map(|c|c.plan.tactic_id).collect::<Vec<_>>(),
+        "profiles":facts.pair.profiles,"a_roles":facts.a.roles,"b_roles":facts.b.roles,
+        "a_endpoint":facts.a.endpoint_reasons,"b_endpoint":facts.b.endpoint_reasons,"rejected":selection.rejected})
+}
+
 /// Measure independent alternatives. The chain search owns the decision about
 /// how much runway a preceding join leaves for each one.
 pub(super) fn measure_edges(
@@ -48,8 +153,11 @@ pub(super) fn measure_edges(
     let mut edges = vec![];
     let mut admitted = std::collections::BTreeMap::<String, usize>::new();
     let mut rejected = std::collections::BTreeMap::<String, usize>::new();
-    let windows = candidates.len();
-    for candidate in candidates {
+    let mut queue = CandidateQueue::new(candidates, budget);
+    let mut windows = 0;
+    let mut details = vec![];
+    while let Some(candidate) = queue.pending.pop_front() {
+        windows += 1;
         cancel.check()?;
         let facts = match cache.candidate_facts(store, &candidate, 0, cancel) {
             Ok(facts) => facts,
@@ -69,6 +177,10 @@ pub(super) fn measure_edges(
             Err(error) => return Err(error),
         };
         let selection = mixlib_planner::select_tactics(&facts, &admission)?;
+        details.push(window_diagnostic(&candidate, &facts, &selection));
+        extend_cues(
+            store, request, mixing, &candidate, &selection, &mut queue, cancel,
+        )?;
         for profile in facts
             .pair
             .profiles
@@ -116,7 +228,7 @@ pub(super) fn measure_edges(
     Ok((
         edges,
         serde_json::json!({"from":request.from,"to":request.to,
-        "windows":windows,"admitted":admitted,"rejected":rejected}),
+        "windows":windows,"admitted":admitted,"rejected":rejected,"window_details":details}),
     ))
 }
 
@@ -218,9 +330,10 @@ fn choose_pair_inner(
     let mut best: Option<(f64, MixPlan)> = None;
     let mut successor_cache = std::collections::BTreeMap::new();
     let mut successor_witness: Option<u64> = None;
-    for mut candidate in
-        mixlib_planner::tactic_stitch_candidates(store, request, mixing, candidate_budget, cancel)?
-    {
+    let seeds =
+        mixlib_planner::tactic_stitch_candidates(store, request, mixing, candidate_budget, cancel)?;
+    let mut queue = CandidateQueue::new(seeds, candidate_budget);
+    while let Some(candidate) = queue.pending.pop_front() {
         cancel.check()?;
         let measured = evidence_cache
             .candidate_facts(store, &candidate, 0, cancel)
@@ -247,6 +360,9 @@ fn choose_pair_inner(
             Err(error) => return Err(error),
         };
         let mut accepted = None;
+        extend_cues(
+            store, request, mixing, &candidate, &selection, &mut queue, cancel,
+        )?;
         for ranked in &selection.candidates {
             let mut trial = candidate.clone();
             if let Err(error) = write_tactics(&mut trial, vec![ranked.plan.clone()]) {
@@ -328,7 +444,7 @@ fn choose_pair_inner(
             accepted = Some((ranked.score, trial));
             break;
         }
-        examined.push(serde_json::json!({"cue":candidate.header.extensions.remove("tactic_cue_candidate"),
+        examined.push(serde_json::json!({"cue":candidate.header.extensions.get("tactic_cue_candidate"),
             "selected":accepted.as_ref().map(|(_,p)|read_tactics(p).map(|t|t[0].tactic_id)).transpose()?,
             "evidence_summary":{"a_vocal_phrases":facts.a.vocal_phrases.as_ref().map(Vec::len),
                 "b_vocal_phrases":facts.b.vocal_phrases.as_ref().map(Vec::len),
@@ -338,6 +454,7 @@ fn choose_pair_inner(
                 "predicted_peak_dbfs":facts.pair.predicted_peak_dbfs,
                 "short_fade_match":facts.pair.short_fade_match,
                 "outgoing_build_release_frame":facts.a.build_release_frame},
+            "window_diagnostic":window_diagnostic(&candidate,&facts,&selection),
             "rejected_tactics":selection.rejected}));
         if let Some((score, trial)) = accepted {
             if best.as_ref().is_none_or(|(old, _)| score > *old) {

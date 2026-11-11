@@ -12,6 +12,7 @@ mod stitch;
 mod tactic_cues;
 mod tactic_pair_evidence;
 mod tactics;
+mod transition_endpoints;
 mod vocal_audibility;
 pub use tactics::*;
 mod tactic_evidence;
@@ -21,8 +22,9 @@ pub use cached_tactic_evidence::load_tactic_track_analysis;
 pub use stitch::{
     automatic_cues, band_stitch, beat_return_stitch, choose_chain_bookends, describe_bar_tiles,
     drum_stitch, pick_four_tracks, pick_prepared_tracks, pick_tracks, preferred_band_stitch,
-    quiet_linger_candidates, quiet_linger_stitch, stitch, tactic_stitch_candidates, BeatReturnCue,
-    ChainPick, DrumHandoff, StitchRequest, CHAIN_SOLO_SECONDS,
+    quiet_linger_candidates, quiet_linger_stitch, stitch, tactic_continuations,
+    tactic_stitch_candidates, BeatReturnCue, ChainPick, DrumHandoff, StitchRequest,
+    CHAIN_SOLO_SECONDS,
 };
 
 pub const PLANNER: &str = "region-beam/1";

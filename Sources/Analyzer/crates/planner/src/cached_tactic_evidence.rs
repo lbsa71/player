@@ -123,6 +123,23 @@ pub(crate) fn apply_cached_tactic_facts(
         }
     }
     apply_events(record, p, anchors, facts);
+    let end_source = p
+        .time_map
+        .source_at(*anchors.last().unwrap() as f64)
+        .round() as u64;
+    facts.endpoint_reasons = crate::transition_endpoints::measured(record)
+        .into_iter()
+        .filter(|e| {
+            e.frame.abs_diff(end_source) <= u64::from(record.source_sample_rate_hz) * 8 / 100
+        })
+        .map(|e| e.reason)
+        .collect();
+    facts.evidence.extend(
+        facts
+            .endpoint_reasons
+            .iter()
+            .map(|r| format!("measured transition endpoint: {r}")),
+    );
     apply_motif(record, p, anchors, facts);
     apply_loops(record, p, anchors, facts);
     Ok(())
