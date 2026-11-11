@@ -424,6 +424,7 @@ fn route_local(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
         "CHAIN_CUES"
+            | "CHAIN_PACING"
             | "TIME_MAP_SPEED"
             | "TIME_MAP_ACCELERATION"
             | "TIME_MAP"
@@ -833,6 +834,78 @@ pub(super) fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachability_uses_measured_phrases_instead_of_reapplying_a_time_minimum() {
+        let events: Vec<_> = (0..=128)
+            .map(|i| Beat {
+                event_id: format!("b{i}"),
+                source_frame: 100 + i * 100,
+                score: 1.,
+                local_bpm: Some(120.),
+            })
+            .collect();
+        let beats = Beats {
+            header: Header::default(),
+            beats_id: id(),
+            source_sample_rate_hz: 200,
+            source_frames: 13000,
+            downbeat_ids: events
+                .iter()
+                .step_by(4)
+                .map(|e| e.event_id.clone())
+                .collect(),
+            events,
+            meter_segments: vec![],
+            unreliable_intervals: vec![],
+            score_semantics: "fixture".into(),
+        };
+        let frames: Vec<_> = (0..32)
+            .map(|i| {
+                let level = if (i / 4) % 2 == 0 { 0.1 } else { 0.8 };
+                FeatureFrame {
+                    source_frame: 100 + i * 400,
+                    chroma: [1.; 12],
+                    band_energy: [level * level; 3],
+                    rms: level,
+                    peak: level,
+                    onset: level,
+                }
+            })
+            .collect();
+        let timing = mixlib_planner::TrackPacing::from_features(&beats, &frames);
+        assert_eq!(timing.assess(1700, 6500).unwrap().complete_bars, Some(12));
+        let plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        let edge = |exit, entry_end| MeasuredEdge {
+            plan: plan.clone(),
+            exit,
+            entry_end,
+            score: 50.,
+            last_resort: false,
+            dense_quality_seconds: 5.,
+            handoff_quality_seconds: 0.,
+        };
+        let mut graph: Graph = (0..9).map(|_| vec![]).collect();
+        graph[1] = vec![edge(100, 1700)];
+        graph[5] = vec![edge(6500, 1700)];
+        let policies = vec![timing; 3];
+        let mut runway = Runway {
+            graph: &graph,
+            pacing: &policies,
+            anchor: None,
+            memo: BTreeMap::new(),
+        };
+        assert!(runway.can_finish(1, 0, 0, 2, 0));
+        let unknown = vec![TrackPacing::unknown(200); 3];
+        let mut conservative = Runway {
+            graph: &graph,
+            pacing: &unknown,
+            anchor: None,
+            memo: BTreeMap::new(),
+        };
+        assert!(!conservative.can_finish(1, 0, 0, 2, 0));
+    }
 
     #[test]
     fn pacing_is_a_bounded_preference_not_a_replacement_for_tactic_quality() {

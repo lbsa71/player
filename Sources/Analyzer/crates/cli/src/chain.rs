@@ -114,6 +114,23 @@ pub(super) fn stitch_chain(
         } else {
             mixlib_planner::stitch(store, &request, policy, cancel)?
         };
+        if previous_join_end > 0 {
+            let exit = pair.placements[0]
+                .time_map
+                .source_at(pair.transitions[0].start_output_frame as f64)
+                .round() as u64;
+            let pacing = mixlib_planner::read_track_pacing(store, names[0], cancel)?
+                .assess(previous_join_end, exit)
+                .ok_or_else(|| {
+                    Error::new(
+                        "CHAIN_PACING",
+                        "selected early exit does not complete a measured phrase",
+                    )
+                })?;
+            pair.header
+                .extensions
+                .insert("pacing".into(), serde_json::to_value(pacing)?);
+        }
         let pair_tactics = read_tactics(&pair)?;
         pair.header.extensions.remove(TACTICS_EXTENSION);
         let mut patches = vec![];

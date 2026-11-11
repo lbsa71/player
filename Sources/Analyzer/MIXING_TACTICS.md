@@ -978,7 +978,7 @@ checks cannot certify that a transition is pleasant or imperceptible.
 | Loop, roll, reverse, tease and pitch sampling | Explicit finite source edits, transport rules, PCM seams and supported note/motif events | Missing loop/language/motif evidence prevents admission |
 | E01–E04 | Runtime-only contracts, verified PCM recovery API and activation audit; offline refusal | No normal emergency selection and no Player transport integration |
 | Full-track evidence | Pinned local models, four source-aligned stems, source-time ASR/acoustics, bar/unmetered descriptors and pair profiles | Scores are uncalibrated; unknown is retained |
-| Storage and cache | Immutable logical records in the one existing WAV sidecar; checksum-pinned binary stems; dependency-specific reuse and temporary recovery | 8 MiB per logical record, 256 MiB per sidecar; long-form sharding/GC remain unimplemented |
+| Storage and cache | Immutable logical records in the one existing WAV sidecar; checksum-pinned binary stems; dependency-specific reuse and temporary recovery | 8 MiB per ordinary logical record, 32 MiB per full-track tactic record, 256 MiB per sidecar; long-form sharding/GC remain unimplemented |
 
 The executable contract is in [types](crates/types/src/tactics.rs), with
 [eligibility and schedules](crates/planner/src/tactics.rs),
@@ -1099,3 +1099,19 @@ that an automatic transition will sound good.
 [rmx]: https://www.pioneerdj.com/en/product/dj-effectors/rmx-1000/
 [backspin-manual]: https://isotonikstudios.com/wp-content/uploads/backspin_manual-v1.0.2.pdf
 [serato-fx]: https://support.serato.com/hc/en-us/articles/10271055029263-DJ-FX-Channel-FX-list
+
+### Phrase-aware pacing between tactics
+
+Given a middle track has completed at least one reliably inferred phrase after
+its incoming transition, and the proposed outgoing cue lands on a supported
+phrase boundary, admit the earlier exit subject to all existing tactic safety
+checks. Prefer four complete phrases of solo development, with a bounded pacing
+penalty for shorter stays; do not discard an excellent mashup solely because the
+following track plays for less than 45 seconds. With uncertain phrase evidence,
+retain the conservative time-based runway. This changes route admission and
+ranking, not the selected tactic's vocal gates, buildup protection or gain curves.
+
+M01's measured rhythmic handoff remains the tactic for a compatible busy mashup
+that should hold until a late accent and resolve swiftly. A good example of this
+pattern is evidence for preserving the hold and seeking a better continuation,
+not permission to weaken a later incompatible join.

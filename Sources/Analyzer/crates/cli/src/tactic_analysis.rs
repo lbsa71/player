@@ -67,6 +67,7 @@ pub(super) fn ensure_tactic_analysis(
             Ok(cached) => report.count(if cached { "cached" } else { "analyzed" }),
             Err(error) if error.code == "CANCELLED" => return Err(error),
             Err(error) => {
+                eprintln!("tactic analysis: failed {track_id}: {error}");
                 report.count("failed");
                 report.error(&track_id, &error);
             }
@@ -90,31 +91,54 @@ pub(super) fn expand_pool(
         "tactic analysis: ranking new tracks by two-sided connections to {before} prepared tracks"
     );
     let shortlist = mixlib_planner::pick_tracks(store, &policy, 12, 8, cancel)?;
-    let mut attempts = Vec::new();
-    let mut added = 0;
+    let mut report = Report::new("tactic_pool_expansion");
+    report.header.extensions.insert("selection".into(), serde_json::json!({
+        "requested":count,"added":0,"prepared_before":before,"prepared_after":before,
+        "basic_analyzed_tracks":shortlist.analyzed_tracks,"shortlist":shortlist.preparation_candidates,
+        "attempts":[],"complete":false,"status":"running"
+    }));
+    store.report(&report)?;
+    let mut prepared = measured_beam::prepared_pool(store)?;
     for candidate in &shortlist.preparation_candidates {
-        if added >= count {
+        if prepared.len() >= before + count {
             break;
         }
         cancel.check()?;
         let id = candidate["track_id"].as_str().unwrap();
         let track = store.track(id)?;
+        if prepared.iter().any(|p| p.audio_hash == track.audio_hash) {
+            continue;
+        }
         let source = store.source(&track)?;
         eprintln!("tactic analysis: pool candidate {}", source.display());
-        let report = ensure_tactic_analysis(store, &[id.to_owned()], python, cancel)?;
-        let succeeded = report.counts.get("failed").copied().unwrap_or(0) == 0;
-        if succeeded {
-            added += 1;
-        }
-        attempts.push(serde_json::json!({"candidate":candidate,"source":source,"succeeded":succeeded,"report":report}));
+        let attempt = serde_json::json!({"candidate":candidate,"source":source,"status":"running"});
+        report.header.extensions.get_mut("selection").unwrap()["attempts"]
+            .as_array_mut()
+            .unwrap()
+            .push(attempt);
+        store.report(&report)?;
+        let analyzed = ensure_tactic_analysis(store, &[id.to_owned()], python, cancel)?;
+        prepared = measured_beam::prepared_pool(store)?;
+        let succeeded = prepared.iter().any(|p| p.audio_hash == track.audio_hash);
+        let selection = report.header.extensions.get_mut("selection").unwrap();
+        let attempt = selection["attempts"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap();
+        attempt["status"] = serde_json::json!(if succeeded { "published" } else { "failed" });
+        attempt["report"] = serde_json::to_value(analyzed)?;
+        selection["added"] = serde_json::json!(prepared.len().saturating_sub(before));
+        selection["prepared_after"] = serde_json::json!(prepared.len());
+        store.report(&report)?;
     }
-    let after = measured_beam::prepared_pool(store)?.len();
-    let mut report = Report::new("tactic_pool_expansion");
-    report.header.extensions.insert("selection".into(), serde_json::json!({
-        "requested":count,"added":after.saturating_sub(before),"prepared_before":before,"prepared_after":after,
-        "basic_analyzed_tracks":shortlist.analyzed_tracks,"shortlist":shortlist.preparation_candidates,
-        "attempts":attempts,"complete":after >= before + count
-    }));
+    let selection = report.header.extensions.get_mut("selection").unwrap();
+    selection["complete"] = serde_json::json!(prepared.len() >= before + count);
+    selection["status"] = serde_json::json!(if prepared.len() >= before + count {
+        "complete"
+    } else {
+        "shortlist_exhausted"
+    });
     store.report(&report)?;
     Ok(serde_json::to_value(report)?)
 }

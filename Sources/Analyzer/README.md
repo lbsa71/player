@@ -73,7 +73,8 @@ records through the catalogue storage adapter. All historical generations,
 feature chunks, corrections and job checkpoints stay in that single sidecar.
 
 Shards use two hexadecimal characters derived from record IDs. Numeric features
-remain chunked into logical records of at most 8 MiB; the complete sidecar is
+remain chunked into logical records of at most 8 MiB (full-track tactic evidence:
+32 MiB); the complete sidecar is
 limited to 256 MiB. Exceeding either limit fails while retaining the previous
 valid sidecar. Publishing a record atomically replaces the whole sidecar, so
 large analyses incur more write traffic. There is no giant JSON file containing

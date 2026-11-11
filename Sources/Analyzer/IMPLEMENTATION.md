@@ -149,7 +149,7 @@ Without an interpreter, existing valid full-track evidence can still be used.
 
 `analyze-tactics --expand-pool 4` chooses four additional distinct recordings
 using the app's basic-analysis graph. It ranks feasible entrances from and later
-exits to different prepared tracks, enforcing the same 45-second solo runway.
+exits to different prepared tracks, using the same phrase-aware pacing admission as set search.
 This is a preparation shortlist, not admission of those transitions: full stem,
 vocal and signal measurements still decide eligibility. Failed analyses are
 reported and replaced from the shortlist. The saved expansion report records
@@ -374,8 +374,8 @@ checks immutable asset collisions, atomically updates the active manifest,
 and removes completed staging files. Staging JSON is temporary recovery state,
 not another authoritative per-WAV metadata file.
 
-The persisted logical-record limit remains **8 MiB**, and a fused sidecar is
-bounded at 256 MiB. Staging results have a separate 64 MiB read bound. Selected
+Ordinary logical records remain bounded at **8 MiB**; full-track tactic
+evidence has a separate **32 MiB** bound. A fused sidecar is bounded at 256 MiB. Staging results have a separate 64 MiB read bound. Selected
 song records have passed these limits; long-form recordings may still exceed
 them. No automatic record sharding or garbage collection is implemented.
 
@@ -428,7 +428,8 @@ Migration validates and publishes sidecars before switching the layout, verifies
 that embedded record bytes match, then removes the separate per-track JSON files.
 Retrying finishes interrupted cleanup. Saved-plan hashes remain valid. Back up
 both the shared library and WAV sidecars, as both contain authoritative metadata.
-The sidecar limit is 256 MiB; each embedded record remains limited to 8 MiB.
+The sidecar limit is 256 MiB; ordinary embedded records are limited to 8 MiB
+and full-track tactic evidence to 32 MiB.
 Publishing a record rewrites the complete sidecar; large retained histories have
 higher write cost. The migration preflights all tracks in memory.
 
@@ -450,7 +451,7 @@ Original metadata chunks are never rewritten. The matrix tests cover 44.1, 48,
 Analysis uses one worker, with configurable settling time, duration cap and
 feature hop. A two-hour cap bounds feature and neural spectrogram storage.
 Feature chunks contain at most 1,024 windows and every JSON record is limited
-to 8 MiB. Stage identities include audio hash, implementation, relevant config,
+to 8 MiB (full-track tactic evidence: 32 MiB). Stage identities include audio hash, implementation, relevant config,
 and model checksums. A feature-profile update reuses valid rhythm output;
 model changes reuse valid spectral features. A saved plan retains its exact
 immutable analysis references.
@@ -602,3 +603,35 @@ Benchmark commands (run on a fixed reference machine and retain JSON reports):
 Record hardware, OS, power mode, source rates/durations, cold versus warm model
 load, and cache state. These commands provide measurement entry points; no
 unmeasured performance target is reported as achieved.
+
+## Phrase-aware set pacing
+
+`planner::pacing` owns source-time admission and the pacing preference used by
+full-set beam search, its reachability pruning, basic-analysis preparation
+shortlisting, and ordered-chain successor checks. Callers pass the previous
+join's end and the proposed next join's start. They do not add a fixed runway.
+
+With reliable phase evidence, an early exit must finish at least one complete
+inferred phrase after the previous join and land at a supported phrase boundary.
+Partial phrases and gaps in phase evidence do not count as completed phrases.
+The current phrase estimator supports reliable four-beat bars and inferred
+four-bar phrase phase. Other/uncertain material conservatively retains the
+45-second admission rule; unsupported phase is never invented.
+
+Four complete phrases are preferred. Each missing phrase contributes 0.75
+quality-seconds of pacing penalty (at most 2.25 for an admitted short stay).
+This is subtracted from the sustained dense-mashup/handoff objective after
+fallback and weak-join counts, before weakest-join and total-fit comparison.
+Tactic-specific vocal, buildup, layer compatibility and assembly/overlap checks
+remain mandatory. Incoming drum exposure during a mashup is not misreported as
+solo playback. Saved joins and the native timetable preserve the exact pacing
+measurements and penalty. The planner version is `phrase-paced-anchor-beam/6`.
+
+`inspect --track TRACK_ID --pacing-after SOURCE_TIME --pacing-exit SOURCE_TIME`
+reports the native pacing decision without selecting a tactic or changing the
+library. This is a pacing audit, not proof that an entire route can render.
+
+The search remains bounded beam search. A future anytime constraint solver can
+reuse these pure admission contracts, add lazy candidate measurement and
+optimistic bounds, and refine promising complete sets. The current implementation
+does not claim exhaustive combinations or a globally optimal set.
