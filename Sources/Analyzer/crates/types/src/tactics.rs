@@ -325,6 +325,22 @@ pub enum EmergencyReason {
     UnexpectedSourceLoss,
     UnexpectedDecodeFailure,
 }
+/// A short, measured resolution of an already sustained stem combination.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PhraseExit {
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub kind: PhraseExitKind,
+    pub evidence: String,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhraseExitKind {
+    AccompanimentPause,
+    CrescendoRelease,
+    RhythmicHandoff,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TacticPlan {
@@ -339,6 +355,8 @@ pub struct TacticPlan {
     pub start_frame: u64,
     pub hold_end_frame: u64,
     pub exit_start_frame: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase_exit: Option<PhraseExit>,
     pub end_frame: u64,
     pub bar_frames: Vec<u64>,
     #[serde(default)]
@@ -629,6 +647,10 @@ impl TacticPlan {
         ] {
             frame(value, output_offset)?;
         }
+        if let Some(exit) = &mut t.phrase_exit {
+            frame(&mut exit.start_frame, output_offset)?;
+            frame(&mut exit.end_frame, output_offset)?;
+        }
         for value in &mut t.bar_frames {
             frame(value, output_offset)?;
         }
@@ -797,14 +819,36 @@ impl TacticPlan {
                 "ordinary edit limits exceed the saved stretch policy",
             )?;
         }
+        if let Some(exit) = &self.phrase_exit {
+            let last_bar = self.bar_frames[self.bar_frames.len() - 2];
+            require(
+                matches!(
+                    self.tactic_id,
+                    TacticId::M01 | TacticId::M02 | TacticId::S05 | TacticId::S06
+                ) && (exit.kind != PhraseExitKind::RhythmicHandoff
+                    || self.tactic_id == TacticId::M01)
+                    && self.timing_basis == TacticTimingBasis::Bars
+                    && exit.start_frame >= last_bar + (self.end_frame - last_bar) / 2
+                    && exit.start_frame == self.hold_end_frame
+                    && exit.start_frame == self.exit_start_frame
+                    && exit.start_frame < exit.end_frame
+                    && exit.end_frame <= self.end_frame
+                    && exit.end_frame - exit.start_frame
+                        <= u64::from(plan.output.sample_rate_hz) * 120 / 1000
+                    && !exit.evidence.is_empty(),
+                "TACTIC_PHRASE_EXIT",
+                "swift resolution needs measured final-half-bar geometry",
+            )?;
+        }
         if self.tactic_id == TacticId::M01 {
             require(
                 self.timing_basis == TacticTimingBasis::Bars
                     && self.bar_frames.len() >= 9
-                    && self.hold_end_frame == self.bar_frames[self.bar_frames.len() - 3]
+                    && (self.hold_end_frame == self.bar_frames[self.bar_frames.len() - 3]
+                        || self.phrase_exit.is_some())
                     && self.exit_start_frame == self.hold_end_frame,
                 "TACTIC_MASHUP",
-                "M01 must hold at least six bars and resolve over the final two bars",
+                "M01 must hold at least six bars and use a two-bar or measured swift resolution",
             )?;
         }
         if matches!(
@@ -1012,6 +1056,59 @@ impl TacticPlan {
                     "TACTIC_EDIT",
                     "source edits overlap on the same lane",
                 )?;
+            }
+        }
+        if let Some(exit) = &self.phrase_exit {
+            for (placement, incoming) in [
+                (self.outgoing_placement, false),
+                (self.incoming_placement, true),
+            ] {
+                let gain = |stem| {
+                    self.lanes
+                        .iter()
+                        .find(|l| l.placement == placement && l.lane == stem)
+                        .map(|l| &l.gain)
+                };
+                require(
+                    gain(StemLane::Drums).is_some_and(|g| {
+                        g.iter().all(|p| p.value == if incoming { 1. } else { 0. })
+                    }),
+                    "TACTIC_PHRASE_EXIT",
+                    "swift exit must preserve complete drum ownership",
+                )?;
+                for stem in [StemLane::Bass, StemLane::Other] {
+                    let (held, final_gain) = if incoming { (0., 1.) } else { (1., 0.) };
+                    require(
+                        gain(stem).is_some_and(|g| {
+                            g.iter()
+                                .any(|p| p.output_frame >= exit.start_frame && p.value == held)
+                                && g.iter()
+                                    .filter(|p| p.output_frame <= exit.start_frame)
+                                    .all(|p| p.value == held)
+                                && g.iter().any(|p| {
+                                    p.output_frame <= exit.end_frame && p.value == final_gain
+                                })
+                                && g.iter()
+                                    .filter(|p| p.output_frame >= exit.end_frame)
+                                    .all(|p| p.value == final_gain)
+                        }),
+                        "TACTIC_PHRASE_EXIT",
+                        "swift accompaniment curves disagree with the measured exit",
+                    )?;
+                }
+                if !incoming {
+                    require(
+                        gain(StemLane::Vocals).is_some_and(|g| {
+                            g.iter()
+                                .any(|p| p.output_frame <= exit.end_frame && p.value == 0.)
+                                && g.iter()
+                                    .filter(|p| p.output_frame >= exit.end_frame)
+                                    .all(|p| p.value == 0.)
+                        }),
+                        "TACTIC_PHRASE_EXIT",
+                        "outgoing vocal exceeds swift resolution",
+                    )?;
+                }
             }
         }
         if self.tactic_id == TacticId::M01 {
@@ -1363,6 +1460,7 @@ mod tests {
             start_frame: 0,
             hold_end_frame: 0,
             exit_start_frame: 0,
+            phrase_exit: None,
             end_frame: end,
             bar_frames: vec![0, end / 2, end],
             timing_basis: TacticTimingBasis::Bars,

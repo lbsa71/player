@@ -22,8 +22,21 @@ public actor SpotifyClient {
     private let auth: any AccessTokenProvider
     private let http: any HTTPTransport
     private let gate = RequestGate()
+    private let modeConfirmationAttempts: Int
+    private let modeConfirmationDelay: @Sendable () async throws -> Void
     private var retryAfter = Date.distantPast
-    public init(auth: any AccessTokenProvider, http: any HTTPTransport = SpotifyHTTP()) { self.auth = auth; self.http = http }
+    public init(auth: any AccessTokenProvider, http: any HTTPTransport = SpotifyHTTP()) {
+        self.auth = auth; self.http = http
+        modeConfirmationAttempts = 11
+        modeConfirmationDelay = { try await Task.sleep(for:.milliseconds(500)) }
+    }
+    // Internal injection keeps asynchronous propagation tests deterministic and fast.
+    init(auth: any AccessTokenProvider, http: any HTTPTransport,
+         modeConfirmationAttempts: Int, modeConfirmationDelay: @escaping @Sendable () async throws -> Void) {
+        self.auth = auth; self.http = http
+        self.modeConfirmationAttempts = max(1,min(modeConfirmationAttempts,11))
+        self.modeConfirmationDelay = modeConfirmationDelay
+    }
 
     public func devices() async throws -> [SpotifyDevice] {
         guard let data = try await request(path: "devices"),
@@ -62,14 +75,32 @@ public actor SpotifyClient {
             try await self.command(.repeatOff, deviceID: deviceID)
             // Commands can be applied asynchronously by Spotify. Observe the modes
             // before starting; do not claim ordered playback from HTTP success alone.
-            let observed = try await playback()
-            guard observed?.device?.id == deviceID, observed?.shuffle_state == false, observed?.repeat_state == "off" else {
-                throw SpotifyFailure.setup("Shuffle/repeat changes are not yet confirmed on this Mac. Check Spotify, then try Play playlist again.")
-            }
+            try await confirmOrderedPlaybackModes(deviceID:deviceID)
             path = "play"
             body = try JSONSerialization.data(withJSONObject: ["context_uri": uri, "offset": ["position": 0], "position_ms": 0])
         }
         _ = try await request(path: path, method: method, query: query, body: body)
+    }
+
+    private func confirmOrderedPlaybackModes(deviceID: String) async throws {
+        let clock = ContinuousClock(), deadline = ContinuousClock.now.advanced(by:.seconds(5))
+        for attempt in 0..<modeConfirmationAttempts {
+            try Task.checkCancellation()
+            if attempt > 0 {
+                guard clock.now < deadline else { break }
+                try await modeConfirmationDelay()
+                try Task.checkCancellation()
+                guard clock.now < deadline else { break }
+            }
+            // Only observations repeat. HTTP/auth/rate-limit failures propagate;
+            // no second shuffle, repeat, or play command is issued here.
+            let observed = try await playback()
+            try Task.checkCancellation()
+            if observed?.device?.id == deviceID, observed?.shuffle_state == false, observed?.repeat_state == "off" {
+                return
+            }
+        }
+        throw SpotifyFailure.setup("Shuffle/repeat changes were not confirmed on this Mac. Check Spotify, then try Play playlist again.")
     }
 
     private func request(path: String, method: String = "GET", query: [URLQueryItem] = [], body: Data? = nil) async throws -> Data? {

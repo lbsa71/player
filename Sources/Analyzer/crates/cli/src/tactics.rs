@@ -14,6 +14,8 @@ pub(super) struct MeasuredEdge {
     pub entry_end: u64,
     pub score: f64,
     pub last_resort: bool,
+    pub dense_quality_seconds: f64,
+    pub handoff_quality_seconds: f64,
 }
 
 struct CandidateQueue {
@@ -58,21 +60,34 @@ impl CandidateQueue {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extend_cues(
     store: &Store,
     request: &mixlib_planner::StitchRequest<'_>,
     mixing: &MixingConfig,
     candidate: &MixPlan,
     selection: &mixlib_planner::TacticSelection,
+    facts: &mixlib_planner::CandidateFacts,
     queue: &mut CandidateQueue,
     cancel: &Cancellation,
 ) -> Result<()> {
-    let held = selection.candidates.iter().any(|c| {
-        matches!(
-            c.plan.tactic_id,
-            TacticId::M01 | TacticId::M02 | TacticId::S04 | TacticId::S05 | TacticId::S06
-        )
+    let promising_dense = facts.pair.profiles.get(&TacticId::M01).is_some_and(|p| {
+        p.predicted_peak_dbfs.is_some_and(|v| v <= -1.)
+            && p.complementarity.is_some_and(|v| v >= 0.65)
+            && p.harmonic_distance.is_some_and(|v| v <= 0.30)
+            && p.lead_conflict.is_some_and(|v| v <= 0.20)
+            && p.selected_composite_density
+                .as_ref()
+                .is_some_and(|v| v.len() >= 8 && v[..v.len() - 2].iter().all(|v| *v >= 0.62))
     });
+    let held = promising_dense
+        || selection.candidates.iter().any(|c| {
+            !c.last_resort
+                && matches!(
+                    c.plan.tactic_id,
+                    TacticId::M01 | TacticId::M02 | TacticId::S04 | TacticId::S05 | TacticId::S06
+                )
+        });
     let blend = selection.candidates.iter().any(|c| {
         !c.last_resort
             && matches!(
@@ -117,7 +132,8 @@ fn window_diagnostic(
 ) -> serde_json::Value {
     serde_json::json!({"cue":candidate.header.extensions.get("tactic_cue_candidate"),
         "bars":facts.bar_frames.len()-1,"accepted":selection.candidates.iter().map(|c|c.plan.tactic_id).collect::<Vec<_>>(),
-        "profiles":facts.pair.profiles,"a_roles":facts.a.roles,"b_roles":facts.b.roles,
+        "ranked":selection.candidates.iter().map(|c|serde_json::json!({"tactic":c.plan.tactic_id,"score":c.score,"dense_quality_seconds":c.dense_quality_seconds,"handoff_quality_seconds":c.handoff_quality_seconds,"phrase_exit":c.plan.phrase_exit})).collect::<Vec<_>>(),
+        "profiles":facts.pair.profiles,"swift_profiles":facts.pair.swift_profiles,"rhythmic_profiles":facts.pair.rhythmic_profiles,"rhythmic_exit":facts.pair.rhythmic_exit,"a_roles":facts.a.roles,"b_roles":facts.b.roles,
         "a_endpoint":facts.a.endpoint_reasons,"b_endpoint":facts.b.endpoint_reasons,"rejected":selection.rejected})
 }
 
@@ -179,7 +195,7 @@ pub(super) fn measure_edges(
         let selection = mixlib_planner::select_tactics(&facts, &admission)?;
         details.push(window_diagnostic(&candidate, &facts, &selection));
         extend_cues(
-            store, request, mixing, &candidate, &selection, &mut queue, cancel,
+            store, request, mixing, &candidate, &selection, &facts, &mut queue, cancel,
         )?;
         for profile in facts
             .pair
@@ -213,6 +229,14 @@ pub(super) fn measure_edges(
             if write_tactics(&mut plan, vec![ranked.plan]).is_err() {
                 continue;
             }
+            plan.header.extensions.insert(
+                "dense_quality_seconds".into(),
+                serde_json::json!(ranked.dense_quality_seconds),
+            );
+            plan.header.extensions.insert(
+                "handoff_quality_seconds".into(),
+                serde_json::json!(ranked.handoff_quality_seconds),
+            );
             plan.renderer_version = mixlib_audio::TACTIC_RENDERER.into();
             plan.validate()?;
             *admitted.entry(id).or_default() += 1;
@@ -222,6 +246,8 @@ pub(super) fn measure_edges(
                 entry_end,
                 score: ranked.score,
                 last_resort: ranked.last_resort,
+                dense_quality_seconds: ranked.dense_quality_seconds,
+                handoff_quality_seconds: ranked.handoff_quality_seconds,
             });
         }
     }
@@ -361,7 +387,7 @@ fn choose_pair_inner(
         };
         let mut accepted = None;
         extend_cues(
-            store, request, mixing, &candidate, &selection, &mut queue, cancel,
+            store, request, mixing, &candidate, &selection, &facts, &mut queue, cancel,
         )?;
         for ranked in &selection.candidates {
             let mut trial = candidate.clone();
@@ -376,12 +402,12 @@ fn choose_pair_inner(
             } = search
             {
                 let incoming = &trial.placements[1];
-                let after = incoming
+                let entry_end = incoming
                     .time_map
                     .source_at(trial.transitions[0].end_output_frame as f64)
-                    .round() as u64
-                    + mixlib_planner::CHAIN_SOLO_SECONDS
-                        * u64::from(incoming.time_map.source_sample_rate_hz);
+                    .round() as u64;
+                let after = mixlib_planner::read_track_pacing(store, &incoming.track_id, cancel)?
+                    .earliest_exit(entry_end);
                 let future = mixlib_planner::StitchRequest {
                     from: request.to,
                     to: next,

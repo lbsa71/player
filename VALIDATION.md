@@ -247,3 +247,44 @@ this repository; the public client ID is configured locally in preferences.
 - Playlist-link start uses the existing playback scopes, disables shuffle/repeat
   and checks their observed state before requesting the first playlist item.
   This flow has mocked request tests; an actual playlist start is still pending.
+
+## 2026-11-11 — catalog recovery and independent Spotify route
+
+- Added a Player-owned sidecar catalog; no driver/service catalog RPC. Existing
+  `trackID` is reused. Schema 2 adds observed duration/continuity evidence; legacy
+  sidecars remain unverified. Large Analyzer objects are omitted from the bounded
+  cached response without changing their files. Header/length validation reads no
+  PCM payload in normal library scans.
+- The dedicated Spotify tap now feeds Audio Bridge at unity gain while the Mac's
+  default output remains Built-in Speakers. Monitoring stayed off. Live source
+  and endpoint sample counters advanced with zero invalid buffers; the user
+  confirmed no music was audible through either device. Default output changes
+  previously traced to Control Center were user selections, not driver fallback.
+- HAL ignores `channels-in: 0` and reassigns stream object IDs when aggregate
+  composition changes. Regression tests cover selecting the tap by validated
+  terminal type and StartingChannel, separately mapping the IOProc stream mask.
+  Physical loopback input is disabled; ambiguous layouts are rejected before I/O.
+- With Spotify paused and the corrected tap active, an `afplay` Tink sound on the
+  ordinary output produced zero nonzero samples in 905,280 recorded bridge frames.
+  The test WAV is under ignored `build/isolation-check/`.
+- Live full-track completion: “Spitting Off the Edge of the World (2).wav” contains
+  11,354,880 frames at 44,100 Hz (257.480272 s), expected duration 257.746 s,
+  observed start 0.835026 s/end 257.696057 s. Continuity/finalization are true,
+  natural transition reason is retained, size is exactly 58 + frames × 8.
+  Player reports `audioVerified=true`, `status=complete`, and one complete track;
+  it advanced naturally into “Elephant Machine”. A bounded PCM check at 30 seconds
+  contained nonzero audio (peak 0.181406).
+- All 70 Swift tests passed (31 Spotify/recovery, 39 audio/catalog/renderer),
+  release build/signature verification passed, and the installed MCP protocol
+  smoke test passed. The HAL driver was not changed or reinstalled.
+- Completeness uses a two-second observation tolerance, not sample-accurate source
+  verification. A final track that pauses without a natural transition remains
+  conservatively incomplete. Fresh physical-output loss/sleep/restart tests of
+  this dedicated route remain separate from the earlier legacy-route validation.
+- After the final app restart and renewed macOS permission approvals, live recovery
+  restarted the same playlist, skipped the complete “Spitting Off the Edge of the
+  World” without creating a third copy, and began “Elephant Machine (3).partial.wav”
+  from the next incomplete track. Status reports one skipped track, active recovery,
+  healthy source callbacks and no errors. Mac default remains Built-in Speakers;
+  monitoring remains off. A bounded sample check confirms nonzero PCM in the new
+  WAV. The installed MCP smoke test passed again after this restart.

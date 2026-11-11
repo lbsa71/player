@@ -140,6 +140,8 @@ pub struct PassageFacts {
     pub stem_leakage: Option<Vec<StemLeakageWindow>>,
     #[serde(default)]
     pub endpoint_reasons: Vec<String>,
+    #[serde(default)]
+    pub phrase_exit: Option<PhraseExit>,
     pub stem_assets: Vec<StemAsset>,
     pub loop_candidates: Vec<LoopEvidence>,
     pub motif: Option<MotifEvidence>,
@@ -191,6 +193,12 @@ pub enum ShortFadeMatch {
 pub struct PairEvidence {
     #[serde(default)]
     pub profiles: BTreeMap<TacticId, PairProfile>,
+    #[serde(default)]
+    pub swift_profiles: BTreeMap<TacticId, PairProfile>,
+    #[serde(default)]
+    pub rhythmic_exit: Option<PhraseExit>,
+    #[serde(default)]
+    pub rhythmic_profiles: BTreeMap<TacticId, PairProfile>,
     pub beat_skew_ms: Option<f64>,
     pub harmonic_distance: Option<f64>,
     pub lead_conflict: Option<f64>,
@@ -216,6 +224,9 @@ pub struct PairEvidence {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateFacts {
+    /// Active exit variant; absent keeps the conventional resolution.
+    #[serde(default)]
+    pub phrase_exit: Option<PhraseExit>,
     pub output_sample_rate_hz: u32,
     pub bar_frames: Vec<u64>,
     #[serde(default)]
@@ -323,6 +334,10 @@ pub struct RankedTactic {
     pub score: f64,
     #[serde(default)]
     pub last_resort: bool,
+    #[serde(default)]
+    pub dense_quality_seconds: f64,
+    #[serde(default)]
+    pub handoff_quality_seconds: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TacticSelection {
@@ -341,6 +356,30 @@ fn role(p: &PassageFacts, roles: &[TacticRole]) -> bool {
 fn stable(p: &PassageFacts) -> bool {
     !p.bars.is_empty() && p.bars.iter().all(|b| known(b.stability, |v| v >= 0.65))
 }
+pub(crate) fn sustained_tactic(id: TacticId) -> bool {
+    matches!(
+        id,
+        TacticId::M01 | TacticId::M02 | TacticId::S05 | TacticId::S06
+    )
+}
+fn hold_end(id: TacticId, f: &CandidateFacts) -> u64 {
+    if let Some(exit) = f.phrase_exit.as_ref().filter(|_| sustained_tactic(id)) {
+        return exit.start_frame;
+    }
+    let bars = f.bar_frames.len() - 1;
+    match id {
+        TacticId::M01 | TacticId::S05 | TacticId::S06 => f.bar_frames[bars.saturating_sub(2)],
+        TacticId::M02 => f.bar_frames[bars.saturating_sub(1)],
+        _ => f.bar_frames[0],
+    }
+}
+fn held_bars(id: TacticId, f: &CandidateFacts) -> usize {
+    f.bar_frames
+        .iter()
+        .take_while(|&&at| at < hold_end(id, f))
+        .count()
+}
+
 fn stable_hold(p: &PassageFacts, bars: usize) -> bool {
     bars > 0
         && p.bars.len() >= bars
@@ -606,6 +645,23 @@ impl CandidateFacts {
             "TACTIC_FACTS",
             "candidate requires distinct placements",
         )?;
+        if let Some(exit) = &self.phrase_exit {
+            let end = *self.bar_frames.last().unwrap();
+            let last_bar = self.bar_frames[self.bar_frames.len() - 2];
+            require(
+                self.timing_basis == TacticTimingBasis::Bars
+                    && (self.a.phrase_exit.as_ref() == Some(exit)
+                        || self.pair.rhythmic_exit.as_ref() == Some(exit))
+                    && exit.start_frame >= last_bar + (end - last_bar) / 2
+                    && exit.start_frame < exit.end_frame
+                    && exit.end_frame <= end
+                    && exit.end_frame - exit.start_frame
+                        <= u64::from(self.output_sample_rate_hz) * 120 / 1000
+                    && !exit.evidence.is_empty(),
+                "TACTIC_PHRASE_EXIT",
+                "invalid measured swift exit",
+            )?;
+        }
         for p in [&self.a, &self.b] {
             require(
                 p.source.sample_rate_hz > 0
@@ -764,6 +820,10 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         need(
             f.a.build_release_frame.is_none_or(|release| {
                 release <= start
+                    || sustained_tactic(id)
+                        && f.phrase_exit
+                            .as_ref()
+                            .is_some_and(|exit| release <= exit.start_frame)
                     || matches!(id, C01 | C02 | C03 | C04 | C07)
                         && landing >= release
                         && release < end
@@ -811,8 +871,24 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             "selected pitched layers have unknown or incompatible harmony/lead occupancy",
         );
     }
+    if f.phrase_exit
+        .as_ref()
+        .is_some_and(|e| e.kind == PhraseExitKind::RhythmicHandoff)
+    {
+        need(
+            id == M01
+                && known(f.pair.complementarity, |v| v >= 0.65)
+                && known(f.pair.harmonic_distance, |v| v <= 0.30)
+                && known(f.pair.lead_conflict, |v| v <= 0.20),
+            "rhythmic exit needs a high-quality dense combination through its extended hold",
+        );
+    }
     match id {
         M01 => {
+            need(
+                !f.a.endpoint_reasons.is_empty() || !f.b.endpoint_reasons.is_empty(),
+                "dense mashup needs a measured musical endpoint; a seed duration is not an ending",
+            );
             need(
                 bars >= 8,
                 "dense mashup needs at least six hold bars and a two-bar resolution",
@@ -823,8 +899,8 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 "dense mashup needs a retained bed and incoming groove",
             );
             need(
-                stable_hold(&f.a, bars.saturating_sub(2))
-                    && stable_hold(&f.b, bars.saturating_sub(2))
+                stable_hold(&f.a, held_bars(id, f))
+                    && stable_hold(&f.b, held_bars(id, f))
                     && complementary(f),
                 "mashup layers do not remain complementary through the full window",
             );
@@ -833,7 +909,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                     v.len() == bars
                         && v.len() >= 6
                         && v.iter().all(|x| x.is_finite() && (0.0..=1.).contains(x))
-                        && v[..bars.saturating_sub(2)].iter().all(|x| *x >= 0.62)
+                        && v[..held_bars(id, f)].iter().all(|x| *x >= 0.62)
                 }),
                 "selected-layer density is unknown or not high through the hold",
             );
@@ -849,8 +925,8 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 "spacious mashup requires a texture and stable incoming drums",
             );
             need(
-                stable_hold(&f.a, bars.saturating_sub(1))
-                    && stable_hold(&f.b, bars.saturating_sub(1))
+                stable_hold(&f.a, held_bars(id, f))
+                    && stable_hold(&f.b, held_bars(id, f))
                     && complementary(f),
                 "mashup does not remain stable/complementary",
             );
@@ -942,7 +1018,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 bars >= 4
                     && role(&f.a, &[R::LowPercussionBed, R::Breakdown])
                     && role(&f.b, &[R::SteadyGroove])
-                    && stable_hold(&f.b, bars.saturating_sub(2)),
+                    && stable_hold(&f.b, held_bars(id, f)),
                 "drum linger requires a quiet outgoing bed and stable incoming groove",
             );
         }
@@ -954,9 +1030,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 "drum replacement must coincide with A's supported return",
             );
             need(
-                bars >= 4
-                    && role(&f.b, &[R::SteadyGroove])
-                    && stable_hold(&f.b, bars.saturating_sub(2)),
+                bars >= 4 && role(&f.b, &[R::SteadyGroove]) && stable_hold(&f.b, held_bars(id, f)),
                 "drum replacement needs a stable B groove",
             );
         }
@@ -1251,7 +1325,9 @@ fn apply_vocal_contract(plan: &mut TacticPlan, f: &CandidateFacts, p: &TacticPol
                 | TacticId::C14
         )
     {
-        let minimum = if matches!(plan.tactic_id, TacticId::M01 | TacticId::M02) {
+        let minimum = if plan.phrase_exit.is_some()
+            || matches!(plan.tactic_id, TacticId::M01 | TacticId::M02)
+        {
             plan.hold_end_frame
         } else {
             plan.bar_frames[(plan.bar_frames.len() - 1).min(4)]
@@ -1277,7 +1353,12 @@ fn apply_vocal_contract(plan: &mut TacticPlan, f: &CandidateFacts, p: &TacticPol
             .max()
             .unwrap_or(start);
         require(
-            off <= end && tail <= end,
+            off <= end
+                && tail <= end
+                && plan.phrase_exit.as_ref().is_none_or(|e| {
+                    off + u64::from(f.output_sample_rate_hz) / 200 <= e.end_frame
+                        && tail <= e.end_frame
+                }),
             "TACTIC_VOCALS",
             "outgoing phrase/tail exceeds transition",
         )?;
@@ -1682,6 +1763,27 @@ pub(crate) fn candidate_tactic_schedule(
         "TACTIC_MODIFIER",
         "tempo modifiers need an arrangement",
     )?;
+    if let Some(exit) = &f.phrase_exit {
+        let end = *f.bar_frames.last().unwrap();
+        let last_bar = f.bar_frames[f.bar_frames.len() - 2];
+        require(
+            sustained_tactic(id)
+                && f.timing_basis == TacticTimingBasis::Bars
+                && (f.a.phrase_exit.as_ref() == Some(exit)
+                    || id == TacticId::M01 && f.pair.rhythmic_exit.as_ref() == Some(exit))
+                && exit.start_frame >= last_bar + (end - last_bar) / 2
+                && exit.start_frame < exit.end_frame
+                && exit.end_frame <= end
+                && exit.end_frame - exit.start_frame
+                    <= u64::from(f.output_sample_rate_hz) * 120 / 1000
+                && f.a
+                    .build_release_frame
+                    .is_none_or(|at| at <= exit.start_frame)
+                && !exit.evidence.is_empty(),
+            "TACTIC_PHRASE_EXIT",
+            "swift exit lacks measured pause/release geometry or would truncate a build",
+        )?;
+    }
     let count = f.bar_frames.len() - 1;
     let motif_known = |passage: &PassageFacts| {
         passage.motif.as_ref().is_some_and(|m| {
@@ -1755,12 +1857,9 @@ pub(crate) fn candidate_tactic_schedule(
         f.b.arrival_frame
     };
     let landing = arrival.unwrap_or(end).clamp(start, end);
-    let exit = match id {
-        M01 => f.bar_frames[bars - 2],
-        M02 => f.bar_frames[bars - 1],
-        S05 | S06 => f.bar_frames[bars.saturating_sub(2)],
-        _ => start,
-    };
+    let exit = hold_end(id, f);
+    let phrase_exit = f.phrase_exit.clone().filter(|_| sustained_tactic(id));
+    let resolve_end = phrase_exit.as_ref().map_or(end, |e| e.end_frame);
     let arrangement = match id {
         M01 | M02 | M03 | M04 | M05 | M06 => TacticArrangement::Mashup,
         S03 | S04 | S05 | S06 => TacticArrangement::Handoff,
@@ -1775,7 +1874,7 @@ pub(crate) fn candidate_tactic_schedule(
         | C14 => TacticCharacter::Sudden,
         _ => TacticCharacter::Subtle,
     };
-    let mut plan=TacticPlan{policy_version:TACTICS_POLICY_VERSION.into(),tactic_id:id,modifiers:vec![],arrangement,character,permission:id.permission(),outgoing_placement:a,incoming_placement:b,start_frame:start,hold_end_frame:exit,exit_start_frame:exit,end_frame:end,bar_frames:f.bar_frames.clone(),timing_basis:f.timing_basis,bar_bpm:None,pulse_ratio:None,lanes:vec![],stem_assets:vec![],effects:vec![],source_edits:vec![],edit_speed_ratio_limits:if id.permission()==TacticPermission::Normal{[1.-p.normal_speed_deviation,1.+p.normal_speed_deviation]}else{p.expressive_edit_speed_limits},vocal_occupancy:vec![],vocal_guard_frames:(f.output_sample_rate_hz as f64*0.300).ceil() as u64,evidence:f.a.evidence.iter().chain(&f.b.evidence).cloned().collect(),selection_reason:format!("{id:?}: measured full-window eligibility, phrase, vocal and renderer constraints passed"),emergency:if id.permission()==TacticPermission::EmergencyOnly{p.emergency.clone()}else{None}};
+    let mut plan=TacticPlan{policy_version:TACTICS_POLICY_VERSION.into(),tactic_id:id,modifiers:vec![],arrangement,character,permission:id.permission(),outgoing_placement:a,incoming_placement:b,start_frame:start,hold_end_frame:exit,exit_start_frame:exit,phrase_exit:phrase_exit.clone(),end_frame:end,bar_frames:f.bar_frames.clone(),timing_basis:f.timing_basis,bar_bpm:None,pulse_ratio:None,lanes:vec![],stem_assets:vec![],effects:vec![],source_edits:vec![],edit_speed_ratio_limits:if id.permission()==TacticPermission::Normal{[1.-p.normal_speed_deviation,1.+p.normal_speed_deviation]}else{p.expressive_edit_speed_limits},vocal_occupancy:vec![],vocal_guard_frames:(f.output_sample_rate_hz as f64*0.300).ceil() as u64,evidence:f.a.evidence.iter().chain(&f.b.evidence).cloned().collect(),selection_reason:format!("{id:?}: measured full-window eligibility, phrase, vocal and renderer constraints passed"),emergency:if id.permission()==TacticPermission::EmergencyOnly{p.emergency.clone()}else{None}};
     if needs_stems(id) {
         plan.stem_assets =
             f.a.stem_assets
@@ -1790,21 +1889,21 @@ pub(crate) fn candidate_tactic_schedule(
                     transfer(
                         start,
                         end,
-                        exit + (end - exit) / 4,
-                        exit + 3 * (end - exit) / 4,
+                        exit + (resolve_end - exit) / 4,
+                        exit + 3 * (resolve_end - exit) / 4,
                         false,
                     ),
                     transfer(
                         start,
                         end,
-                        exit + (end - exit) / 4,
-                        exit + 3 * (end - exit) / 4,
+                        exit + (resolve_end - exit) / 4,
+                        exit + 3 * (resolve_end - exit) / 4,
                         true,
                     ),
                 ),
                 _ => (
-                    transfer(start, end, exit, end, false),
-                    transfer(start, end, exit, end, true),
+                    transfer(start, end, exit, resolve_end, false),
+                    transfer(start, end, exit, resolve_end, true),
                 ),
             };
             plan.lanes.push(lane(a, stem, ga));
@@ -2491,6 +2590,8 @@ pub(crate) fn candidate_tactic_schedule(
     }
     crate::stem_audibility::validate(&mut plan, f)?;
     let method = match id {
+        M01 if phrase_exit.as_ref().is_some_and(|e| e.kind == PhraseExitKind::RhythmicHandoff) => "high-quality dense mashup held until an on-grid incoming drum accent near its measured ending; swift accompaniment exchange without requiring silence",
+        M01 | M02 | S05 | S06 if phrase_exit.is_some() => "sustained stem combination resolves swiftly in a measured final-half-bar pause or completed crescendo release; incoming drums remain continuous",
         M01 => "dense selected layers remain compatible through the hold; resolve over the final two bars at the selected endpoint",
         M02 => "spacious retained bed and measured incoming arrival support a one-bar resolution",
         M03 => "complete A vocal phrase over isolated B accompaniment",
@@ -2504,9 +2605,9 @@ pub(crate) fn candidate_tactic_schedule(
             Some(ShortFadeMatch::OneBandDifference) => "aligned drums and two matching bands leave one harmonically compatible band to exchange",
             None => "last resort: short window passes vocal, boundary and headroom checks",
         },
-        S03 if last_resort(id, f, p) => "last resort: a one-bar bass swap still replaces the whole arrangement quickly without a measured short-fade match",
+        S03 if last_resort(id, f, p) => "last resort: a sub-four-bar upper-band fade with a bass exchange replaces the arrangement quickly without measured band compatibility",
         S03 => "active bass on both tracks requires one bounded bass ownership exchange",
-        S04 => "measured frequency occupancy selects the staged three-band exchange order",
+        S04 => "last resort after negative listening feedback: broad stereo-EQ band exchange; measured occupancy orders the bands but does not certify clean musical separation",
         S05 => "quiet A bed leaves room for stable B drums before the accompaniment transfer",
         S06 => "B drums replace A exactly at its supported drum-return boundary",
         S07 => "verified beatless structure permits a tonal bridge without invented pulse alignment",
@@ -2549,15 +2650,19 @@ fn last_resort(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> bool {
         TacticId::C01 | TacticId::C02 | TacticId::C03 | TacticId::C04 | TacticId::C07 => {
             !f.pair.cut_band_matches.contains(&id)
         }
+        // Listening feedback consistently rejects the broad stereo-EQ exchange.
+        // Measured occupancy alone does not establish clean musical separation.
+        // Keep it executable for explicit auditions, but outside clean-route search.
+        TacticId::S04 => true,
         TacticId::S02 => preferred_short_fade(f, p).is_none(),
-        TacticId::S03 if f.bar_frames.len() == 2 => preferred_short_fade(f, p).is_none(),
+        TacticId::S03 if f.bar_frames.len() <= 4 => preferred_short_fade(f, p).is_none(),
         _ => false,
     }
 }
 
 fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
     use TacticId::*;
-    if last_resort(id, f, p) {
+    if last_resort(id, f, p) && !matches!(id, S03 | S04) {
         // A mutually exclusive schedule has no overlapping clashes. That is
         // safety evidence, not evidence of musical continuity across its cut.
         return -1000.;
@@ -2591,15 +2696,15 @@ fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
     };
     // Tactic preferences break close calls. A strong measured fit can
     // outrank a more elaborate but less compatible schedule.
-    let held_bars = match id {
-        M01 | S05 | S06 => (f.bar_frames.len() - 1).saturating_sub(2),
-        M02 => (f.bar_frames.len() - 1).saturating_sub(1),
-        _ => 0,
-    };
+    let held_bars = f
+        .bar_frames
+        .windows(2)
+        .map(|w| (hold_end(id, f).min(w[1]).saturating_sub(w[0])) as f64 / (w[1] - w[0]) as f64)
+        .sum::<f64>();
     // Reward an established musical combination, not just the absence of
     // collisions after most of the outgoing layers have been removed.
-    let sustain = 18. * (1. - (-(held_bars as f64) / 8.).exp());
-    let endpoint = if held_bars > 0
+    let sustain = 18. * (1. - (-held_bars / 8.).exp());
+    let endpoint = if held_bars > 0.
         && (!f.a.endpoint_reasons.is_empty() || !f.b.endpoint_reasons.is_empty())
     {
         4.
@@ -2617,9 +2722,89 @@ fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
     } else {
         0.
     };
-    0.20 * base + sustain + endpoint - band_risk + 40. * f.pair.complementarity.unwrap_or(0.)
+    // S04 is an audition-disfavored fallback, ahead of unmatched cuts/fades
+    // but below every normal admitted tactic. Preserve fit differences when
+    // choosing among fallback exchanges rather than giving them a flat score.
+    let listening_penalty = if id == S04 {
+        200.
+    } else if id == S03 && last_resort(id, f, p) {
+        150.
+    } else {
+        0.
+    };
+    0.20 * base + sustain + endpoint - band_risk - listening_penalty
+        + 40. * f.pair.complementarity.unwrap_or(0.)
         - 40. * f.pair.harmonic_distance.unwrap_or(0.5)
         - 30. * f.pair.lead_conflict.unwrap_or(0.5)
+}
+
+fn dense_quality_seconds(id: TacticId, f: &CandidateFacts) -> f64 {
+    if id != TacticId::M01
+        || f.bar_frames.len() < 9
+        || f.a.endpoint_reasons.is_empty() && f.b.endpoint_reasons.is_empty()
+    {
+        return 0.;
+    }
+    let (Some(comp), Some(harmony), Some(lead)) = (
+        f.pair.complementarity,
+        f.pair.harmonic_distance,
+        f.pair.lead_conflict,
+    ) else {
+        return 0.;
+    };
+    if comp < 0.65 || harmony > 0.30 || lead > 0.20 {
+        return 0.;
+    }
+    sustained_value(id, f, comp, harmony, lead)
+}
+fn handoff_quality_seconds(id: TacticId, f: &CandidateFacts) -> f64 {
+    if !matches!(id, TacticId::S05 | TacticId::S06) || held_bars(id, f) < 4 {
+        return 0.;
+    }
+    let (Some(comp), Some(harmony), Some(lead)) = (
+        f.pair.complementarity,
+        f.pair.harmonic_distance,
+        f.pair.lead_conflict,
+    ) else {
+        return 0.;
+    };
+    let n = held_bars(id, f);
+    // Reward a substantial retained musical bed with steady drums, not an
+    // empty passage or merely a low clash score after removing everything.
+    if comp < 0.60
+        || harmony > 0.30
+        || lead > 0.25
+        || !f.a.bars[..n]
+            .iter()
+            .all(|b| known(b.stability, |v| v >= 0.80))
+        || !f.b.bars[..n]
+            .iter()
+            .all(|b| known(b.stability, |v| v >= 0.85))
+        || !f.pair.retained_bed_density.as_ref().is_some_and(|d| {
+            d.len() + 1 == f.bar_frames.len() && d[..n].iter().all(|v| v.is_finite() && *v >= 0.15)
+        })
+    {
+        return 0.;
+    }
+    sustained_value(id, f, comp, harmony, lead)
+}
+fn sustained_value(id: TacticId, f: &CandidateFacts, comp: f64, harmony: f64, lead: f64) -> f64 {
+    let until = hold_end(id, f);
+    f.bar_frames
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            let stability = f.a.bars[i]
+                .stability
+                .unwrap_or(0.)
+                .min(f.b.bars[i].stability.unwrap_or(0.));
+            until.min(w[1]).saturating_sub(w[0]) as f64 / f64::from(f.output_sample_rate_hz)
+                * comp
+                * (1. - harmony)
+                * (1. - lead)
+                * stability
+        })
+        .sum()
 }
 
 fn specialized_facts(id: TacticId, f: &CandidateFacts) -> CandidateFacts {
@@ -2669,25 +2854,64 @@ pub fn select_tactics(f: &CandidateFacts, p: &TacticPolicy) -> Result<TacticSele
         if id.is_modifier() {
             continue;
         }
-        let specialized = specialized_facts(id, f);
-        let reasons = eligibility(id, &specialized, p);
-        if !reasons.is_empty() {
-            rejected.push(TacticRejection {
-                tactic_id: id,
-                reasons,
-            });
-            continue;
+        let mut variants = vec![f.clone()];
+        if sustained_tactic(id)
+            && f.a.phrase_exit.is_some()
+            && f.pair.swift_profiles.contains_key(&id)
+        {
+            let mut swift = f.clone();
+            swift.phrase_exit = f.a.phrase_exit.clone();
+            swift.pair.profiles = f.pair.swift_profiles.clone();
+            variants.push(swift);
         }
-        match schedule_tactic(id, f, p) {
-            Ok(plan) => candidates.push(RankedTactic {
-                plan,
-                score: preference(id, &specialized, p),
-                last_resort: last_resort(id, &specialized, p),
-            }),
-            Err(e) => rejected.push(TacticRejection {
-                tactic_id: id,
-                reasons: vec![format!("{}: {}", e.code, e.message)],
-            }),
+        if id == TacticId::M01
+            && f.pair.rhythmic_exit.is_some()
+            && f.pair.rhythmic_profiles.contains_key(&id)
+        {
+            let mut rhythmic = f.clone();
+            rhythmic.phrase_exit = f.pair.rhythmic_exit.clone();
+            rhythmic.pair.profiles = f.pair.rhythmic_profiles.clone();
+            variants.push(rhythmic);
+        }
+        for variant in &variants {
+            let f = variant;
+            let specialized = specialized_facts(id, f);
+            let mut reasons = eligibility(id, &specialized, p);
+            if f.phrase_exit.is_some() && !reasons.is_empty() {
+                reasons = reasons
+                    .into_iter()
+                    .map(|r| format!("swift exit: {r}"))
+                    .collect();
+                if let Some(profile) = f.pair.profiles.get(&id) {
+                    reasons.extend(
+                        profile
+                            .evidence
+                            .iter()
+                            .filter(|r| r.starts_with("swift exit:"))
+                            .cloned(),
+                    );
+                }
+            }
+            if !reasons.is_empty() {
+                rejected.push(TacticRejection {
+                    tactic_id: id,
+                    reasons,
+                });
+                continue;
+            }
+            match schedule_tactic(id, f, p) {
+                Ok(plan) => candidates.push(RankedTactic {
+                    plan,
+                    score: preference(id, &specialized, p),
+                    last_resort: last_resort(id, &specialized, p),
+                    dense_quality_seconds: dense_quality_seconds(id, &specialized),
+                    handoff_quality_seconds: handoff_quality_seconds(id, &specialized),
+                }),
+                Err(e) => rejected.push(TacticRejection {
+                    tactic_id: id,
+                    reasons: vec![format!("{}: {}", e.code, e.message)],
+                }),
+            }
         }
     }
     candidates.sort_by(|a, b| {
@@ -2758,7 +2982,8 @@ pub(crate) mod tests {
                 artifact_score: 0.02,
             }),
             stem_leakage: None,
-            endpoint_reasons: vec![],
+            phrase_exit: None,
+            endpoint_reasons: vec!["fixture measured drum change".into()],
             stem_assets: all_lanes()
                 .iter()
                 .map(|&lane| StemAsset {
@@ -2810,6 +3035,7 @@ pub(crate) mod tests {
             evidence: vec![format!("measured-fixture/{placement}")],
         };
         CandidateFacts {
+            phrase_exit: None,
             output_sample_rate_hz: RATE,
             bar_frames: bar_frames.clone(),
             timing_basis: TacticTimingBasis::Bars,
@@ -2817,6 +3043,9 @@ pub(crate) mod tests {
             b: passage(1),
             pair: PairEvidence {
                 profiles: BTreeMap::new(),
+                swift_profiles: BTreeMap::new(),
+                rhythmic_exit: None,
+                rhythmic_profiles: BTreeMap::new(),
                 beat_skew_ms: Some(1.),
                 harmonic_distance: Some(0.05),
                 lead_conflict: Some(0.05),
@@ -2981,6 +3210,138 @@ pub(crate) mod tests {
         f
     }
 
+    fn with_swift_exit(mut f: CandidateFacts) -> CandidateFacts {
+        let end = *f.bar_frames.last().unwrap();
+        let exit = PhraseExit {
+            start_frame: end - BAR / 4,
+            end_frame: end - BAR / 4 + 3840,
+            kind: PhraseExitKind::AccompanimentPause,
+            evidence: "measured test PCM pause".into(),
+        };
+        f.a.phrase_exit = Some(exit.clone());
+        f.phrase_exit = Some(exit);
+        f
+    }
+    #[test]
+    fn rhythmic_handoff_keeps_a_dense_mix_without_quiet_accompaniment() {
+        let mut f = with_swift_exit(dense());
+        let mut exit = f.phrase_exit.take().unwrap();
+        exit.start_frame = 7 * BAR + BAR / 2;
+        exit.end_frame = exit.start_frame + 3840;
+        exit.kind = PhraseExitKind::RhythmicHandoff;
+        exit.evidence = "measured incoming drum accent near phrase end".into();
+        f.a.phrase_exit = None;
+        f.pair.rhythmic_exit = Some(exit.clone());
+        f.phrase_exit = Some(exit);
+        let t = schedule_tactic(TacticId::M01, &f, &policy()).unwrap();
+        validate_compiled(&t, &f);
+        assert_eq!(t.hold_end_frame, 7 * BAR + BAR / 2);
+        assert!(schedule_tactic(TacticId::S06, &f, &policy()).is_err());
+        f.pair.complementarity = Some(0.64);
+        assert!(schedule_tactic(TacticId::M01, &f, &policy()).is_err());
+    }
+    #[test]
+    fn long_stable_handoff_gets_credit_but_empty_or_unstable_beds_do_not() {
+        let mut f = facts(12);
+        role_set(
+            &mut f.a,
+            &[TacticRole::DrumReturn, TacticRole::SustainedTexture],
+        );
+        role_set(&mut f.b, &[TacticRole::SteadyGroove]);
+        f.a.arrival_frame = Some(0);
+        f.pair.complementarity = Some(0.69);
+        f.pair.harmonic_distance = Some(0.235);
+        f.pair.lead_conflict = Some(0.148);
+        let candidates = select_tactics(&f, &policy()).unwrap().candidates;
+        let handoff = candidates
+            .iter()
+            .find(|c| c.plan.tactic_id == TacticId::S06)
+            .unwrap();
+        assert!(handoff.handoff_quality_seconds > 0.);
+        assert_eq!(handoff.dense_quality_seconds, 0.);
+        f.a.bars[3].stability = Some(0.5);
+        assert_eq!(handoff_quality_seconds(TacticId::S06, &f), 0.);
+        f.a.bars[3].stability = Some(0.9);
+        f.pair.retained_bed_density = Some(vec![0.05; 12]);
+        assert_eq!(handoff_quality_seconds(TacticId::S06, &f), 0.);
+        assert_eq!(handoff_quality_seconds(TacticId::S03, &facts(12)), 0.);
+    }
+    #[test]
+    fn swift_exit_keeps_drums_and_full_hold_then_exchanges_accompaniment() {
+        let slow = dense();
+        let f = with_swift_exit(slow.clone());
+        let t = schedule_tactic(TacticId::M01, &f, &policy()).unwrap();
+        validate_compiled(&t, &f);
+        let e = t.phrase_exit.as_ref().unwrap();
+        assert!(
+            dense_quality_seconds(TacticId::M01, &f) > dense_quality_seconds(TacticId::M01, &slow)
+        );
+        assert!(!last_resort(TacticId::M01, &f, &policy()));
+        for lane in &t.lanes {
+            if lane.lane == StemLane::Drums {
+                assert!(lane
+                    .gain
+                    .iter()
+                    .all(|p| p.value == if lane.placement == 0 { 0. } else { 1. }));
+            } else if matches!(lane.lane, StemLane::Bass | StemLane::Other) {
+                assert_eq!(
+                    curve_value(&lane.gain, e.start_frame),
+                    if lane.placement == 0 { 1. } else { 0. }
+                );
+                assert_eq!(
+                    curve_value(&lane.gain, e.end_frame),
+                    if lane.placement == 0 { 0. } else { 1. }
+                );
+            }
+        }
+        let shifted = t.translated(1000, 3).unwrap();
+        assert_eq!(
+            shifted.phrase_exit.unwrap().start_frame,
+            e.start_frame + 1000
+        );
+    }
+    #[test]
+    fn swift_exit_cannot_truncate_a_build_vocal_or_unstable_extended_hold() {
+        let f = with_swift_exit(dense());
+        let mut build = f.clone();
+        build.a.build_release_frame = Some(*f.bar_frames.last().unwrap());
+        assert!(schedule_tactic(TacticId::M01, &build, &policy()).is_err());
+        build.a.build_release_frame = Some(f.phrase_exit.as_ref().unwrap().start_frame - 960);
+        assert!(schedule_tactic(TacticId::M01, &build, &policy()).is_ok());
+        let mut invalid = f.clone();
+        invalid.phrase_exit.as_mut().unwrap().start_frame = 20 * BAR;
+        assert!(schedule_tactic(TacticId::M01, &invalid, &policy()).is_err());
+        let mut unstable = f.clone();
+        unstable.a.bars[6].stability = Some(0.1);
+        assert!(schedule_tactic(TacticId::M01, &unstable, &policy()).is_err());
+        let mut vocal = f.clone();
+        vocal.a.vocal_phrases = Some(vec![VocalPhrase {
+            start_frame: 6 * BAR,
+            end_frame: 8 * BAR,
+            tail_end_frame: 8 * BAR,
+            entry_supported: true,
+            exit_supported: true,
+            confidence_margin: 0.9,
+        }]);
+        assert!(schedule_tactic(TacticId::M01, &vocal, &policy()).is_err());
+    }
+    #[test]
+    fn failed_swift_variant_keeps_the_normal_mashup_candidate() {
+        let mut f = with_swift_exit(dense());
+        f.phrase_exit = None;
+        f.pair
+            .swift_profiles
+            .insert(TacticId::M01, PairProfile::default());
+        let result = select_tactics(&f, &policy()).unwrap();
+        assert!(result
+            .candidates
+            .iter()
+            .any(|c| c.plan.tactic_id == TacticId::M01 && c.plan.phrase_exit.is_none()));
+        assert!(!result
+            .candidates
+            .iter()
+            .any(|c| c.plan.tactic_id == TacticId::M01 && c.plan.phrase_exit.is_some()));
+    }
     #[test]
     fn six_plus_two_keeps_accompaniment_fixed_while_vocals_finish() {
         let mut f = dense();
@@ -3069,6 +3430,27 @@ pub(crate) mod tests {
                 .contains("not an emergency"));
         }
     }
+    #[test]
+    fn dense_seed_needs_an_endpoint_and_longer_quality_is_accumulated() {
+        let mut seed = facts(8);
+        seed.a.endpoint_reasons.clear();
+        seed.b.endpoint_reasons.clear();
+        assert!(select_tactics(&seed, &policy())
+            .unwrap()
+            .rejected
+            .iter()
+            .any(|r| r.tactic_id == TacticId::M01
+                && r.reasons.iter().any(|s| s.contains("musical endpoint"))));
+        assert_eq!(dense_quality_seconds(TacticId::M01, &seed), 0.);
+        assert!(
+            dense_quality_seconds(TacticId::M01, &facts(16))
+                > dense_quality_seconds(TacticId::M01, &facts(8))
+        );
+        let mut poor = facts(16);
+        poor.pair.lead_conflict = Some(0.24);
+        assert_eq!(dense_quality_seconds(TacticId::M01, &poor), 0.);
+    }
+
     #[test]
     fn supported_sustained_mix_outranks_isolating_one_collision_free_motif() {
         let mut held = facts(8);
@@ -3430,6 +3812,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stereo_band_exchange_is_a_fallback_without_demoting_successful_stem_tactics() {
+        let mut f = facts(8);
+        role_set(&mut f.a, &[TacticRole::Mixed, TacticRole::DrumReturn]);
+        role_set(&mut f.b, &[TacticRole::SteadyGroove]);
+        f.a.arrival_frame = Some(f.bar_frames[0]);
+        let selected = select_tactics(&f, &policy()).unwrap();
+        let band = selected
+            .candidates
+            .iter()
+            .find(|c| c.plan.tactic_id == TacticId::S04)
+            .unwrap();
+        assert!(band.last_resort);
+        assert!(band
+            .plan
+            .selection_reason
+            .contains("negative listening feedback"));
+        for id in [TacticId::M01, TacticId::S06, TacticId::S03] {
+            let normal = selected
+                .candidates
+                .iter()
+                .find(|c| c.plan.tactic_id == id)
+                .unwrap_or_else(|| panic!("{id:?} missing: {:?}", selected.rejected));
+            assert!(!normal.last_resort, "{id:?} remains a normal tactic");
+            assert!(normal.score > band.score);
+        }
+        assert!(
+            band.score > preference(TacticId::C01, &f, &policy()),
+            "an unmatched cut remains below an admitted band exchange"
+        );
+        f.pair.short_fade_match = Some(ShortFadeMatch::AllBandsMatch);
+        assert!(
+            last_resort(TacticId::S04, &f, &policy()),
+            "a matching statistic cannot erase the listening policy"
+        );
+    }
+
+    #[test]
     fn low_band_energy_penalizes_but_does_not_veto_a_compatible_exchange() {
         let mut f = facts(4);
         let baseline = preference(TacticId::S04, &f, &policy());
@@ -3455,7 +3874,9 @@ pub(crate) mod tests {
         assert!(preference(TacticId::S03, &f, &p) < preference(TacticId::S03, &facts(4), &p));
         f.pair.short_fade_match = Some(ShortFadeMatch::OneBandDifference);
         assert!(!last_resort(TacticId::S03, &f, &p));
-        assert!(!last_resort(TacticId::S03, &facts(2), &p));
+        assert!(last_resort(TacticId::S03, &facts(2), &p));
+        assert!(last_resort(TacticId::S03, &facts(3), &p));
+        assert!(!last_resort(TacticId::S03, &facts(6), &p));
     }
 
     #[test]

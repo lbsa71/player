@@ -5,7 +5,10 @@ use mixlib_catalog::{validate_analysis, Store};
 use mixlib_types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod pacing;
 mod phrase;
+pub use pacing::{read_track_pacing, PacingDecision, TrackPacing};
+mod phrase_exit;
 mod short_fade;
 mod stem_audibility;
 mod stitch;
@@ -24,7 +27,6 @@ pub use stitch::{
     drum_stitch, pick_four_tracks, pick_prepared_tracks, pick_tracks, preferred_band_stitch,
     quiet_linger_candidates, quiet_linger_stitch, stitch, tactic_continuations,
     tactic_stitch_candidates, BeatReturnCue, ChainPick, DrumHandoff, StitchRequest,
-    CHAIN_SOLO_SECONDS,
 };
 
 pub const PLANNER: &str = "region-beam/1";

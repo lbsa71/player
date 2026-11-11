@@ -12,8 +12,17 @@ final class RecordingTests: XCTestCase {
         addTeardownBlock { try FileManager.default.removeItem(at: url) }
         return url
     }
-    private func track(_ name: String, position: Double = 0) -> RecordingTrack {
-        RecordingTrack(id: name, album: "Album", artist: "Artist", name: name, positionSeconds: position)
+    private func track(_ name: String, position: Double = 0, duration: Double? = nil) -> RecordingTrack {
+        RecordingTrack(id: name, album: "Album", artist: "Artist", name: name, positionSeconds: position,
+                       expectedDurationSeconds: duration)
+    }
+    private func manifest(_ wav: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: wav.path + ".json"))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+    private func appendSecond(to file: FloatWAVFile) throws {
+        let samples = [Float](repeating: 0.25, count: 8000 * 2)
+        try samples.withUnsafeBufferPointer { try file.append($0.baseAddress!, count: 8000) }
     }
     private func render(_ renderer: OpaquePointer, count: Int = 512, value: Float = 0.75) -> [Float] {
         var input = (0..<count * 2).map { $0 % 2 == 0 ? value : -value }
@@ -170,5 +179,117 @@ final class RecordingTests: XCTestCase {
         recorder.stop(reason:"Test"); recorder.waitUntilStopped()
         let wav = try Data(contentsOf:directory.appendingPathComponent("Album - Artist - Started.wav"))
         XCTAssertEqual(wav.dropFirst(58),expected.withUnsafeBytes { Data($0) })
+    }
+    func testRecorderPersistsObservedCoverageOnNaturalTrackChange() throws {
+        let directory = try folder()
+        let renderer = try XCTUnwrap(player_renderer_create(8000, true))
+        defer { player_renderer_destroy(renderer) }
+        let recorder = DebugWAVRecorder(renderer: renderer, directory: directory, sampleRate: 8000) { _ in }
+        _ = try recorder.start(track: track("First", duration: 3))
+        for second in 1...3 {
+            _ = render(renderer, count: 8000)
+            recorder.observe(track("First", position: Double(second), duration: 3))
+            recorder.waitUntilStopped()
+        }
+        recorder.observe(track("Second", duration: 5)); recorder.waitUntilStopped()
+        recorder.stop(reason: "Test"); recorder.waitUntilStopped()
+        let metadata = try manifest(directory.appendingPathComponent("Album - Artist - First.wav"))
+        XCTAssertEqual(metadata["trackID"] as? String, "First")
+        XCTAssertNil(metadata["assetID"])
+        XCTAssertEqual(metadata["recordingSchemaVersion"] as? Int, 2)
+        XCTAssertEqual(metadata["completionPolicy"] as? String, "observed-v1")
+        XCTAssertEqual(metadata["expectedDurationSeconds"] as? Double, 3)
+        XCTAssertEqual(metadata["observedStartPositionSeconds"] as? Double, 0)
+        XCTAssertEqual(metadata["observedEndPositionSeconds"] as? Double, 3)
+        XCTAssertEqual(metadata["durationSeconds"] as? Double, 3)
+        XCTAssertEqual(metadata["coverageContinuous"] as? Bool, true)
+    }
+    func testSkippedTrackFinalizesPriorCaptureAndResumesWithoutSkippedAudio() throws {
+        let directory = try folder()
+        let renderer = try XCTUnwrap(player_renderer_create(8000, true))
+        defer { player_renderer_destroy(renderer) }
+        let recorder = DebugWAVRecorder(renderer: renderer, directory: directory, sampleRate: 8000) { _ in }
+        _ = try recorder.start(track: track("First", duration: 1))
+        _ = render(renderer, count: 8000)
+        recorder.observe(track("First", position: 1, duration: 1)); recorder.waitUntilStopped()
+        recorder.observe(track("Skipped", duration: 10), capture: false); recorder.waitUntilStopped()
+        let first = try manifest(directory.appendingPathComponent("Album - Artist - First.wav"))
+        XCTAssertEqual(first["reason"] as? String, "Observed track change")
+        XCTAssertEqual(first["coverageContinuous"] as? Bool, true)
+        let writtenBeforeSkip = player_record_written(renderer)
+        _ = render(renderer, count: 8000, value: 0.1)
+        recorder.observe(track("Skipped", position: 1, duration: 10), capture: false); recorder.waitUntilStopped()
+        XCTAssertEqual(player_record_written(renderer), writtenBeforeSkip)
+        recorder.observe(track("Resumed", duration: 1)); recorder.waitUntilStopped()
+        let resumed = render(renderer, count: 8000, value: 0.5)
+        recorder.stop(reason: "Test"); recorder.waitUntilStopped()
+        let wavs = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "wav" }.map(\.lastPathComponent).sorted()
+        XCTAssertEqual(wavs, ["Album - Artist - First.wav", "Album - Artist - Resumed.wav"])
+        let resumedFile = try Data(contentsOf: directory.appendingPathComponent("Album - Artist - Resumed.wav"))
+        XCTAssertEqual(resumedFile.dropFirst(58), resumed.withUnsafeBytes { Data($0) })
+    }
+    func testSuspendingCurrentTrackCannotClaimCompletionAndCanResumeSameTrack() throws {
+        let directory = try folder()
+        let renderer = try XCTUnwrap(player_renderer_create(8000, true))
+        defer { player_renderer_destroy(renderer) }
+        let recorder = DebugWAVRecorder(renderer: renderer, directory: directory, sampleRate: 8000) { _ in }
+        _ = try recorder.start(track: track("Track", duration: 1))
+        _ = render(renderer, count: 8000)
+        recorder.observe(track("Track", position: 1, duration: 1), capture: false); recorder.waitUntilStopped()
+        let suspended = try manifest(directory.appendingPathComponent("Album - Artist - Track.wav"))
+        XCTAssertEqual(suspended["reason"] as? String, "Capture suspended")
+        XCTAssertEqual(suspended["coverageContinuous"] as? Bool, false)
+        _ = render(renderer, count: 8000, value: 0.1)
+        recorder.observe(track("Track", duration: 1)); recorder.waitUntilStopped()
+        let resumed = render(renderer, count: 8000, value: 0.5)
+        recorder.stop(reason: "Test"); recorder.waitUntilStopped()
+        let resumedFile = try Data(contentsOf: directory.appendingPathComponent("Album - Artist - Track (2).wav"))
+        XCTAssertEqual(resumedFile.dropFirst(58), resumed.withUnsafeBytes { Data($0) })
+    }
+    func testCoverageRejectsSeekJumpsAndDurationChanges() throws {
+        let cases: [(String, Double, Double)] = [
+            ("Forward seek", 8, 10),
+            ("Backward seek", 0.5, 10),
+            ("Duration changed", 2, 30)
+        ]
+        for (name, position, duration) in cases {
+            let file = try FloatWAVFile(directory: folder(), track: track(name, duration: 10), sampleRate: 8000)
+            try appendSecond(to: file)
+            file.observe(positionSeconds: 1, expectedDurationSeconds: 10)
+            try appendSecond(to: file)
+            file.observe(positionSeconds: position, expectedDurationSeconds: duration)
+            let metadata = try manifest(file.finish(reason: "Observed track change", complete: true))
+            XCTAssertEqual(metadata["coverageContinuous"] as? Bool, false, name)
+            XCTAssertEqual(metadata["observedEndPositionSeconds"] as? Double, position, name)
+        }
+    }
+    func testCoverageKeepsActualLastObservationAndOmitsUnknownDuration() throws {
+        let file = try FloatWAVFile(directory: folder(), track: track("Unobserved"), sampleRate: 8000)
+        try appendSecond(to: file)
+        let metadata = try manifest(file.finish(reason: "Observed track change", complete: true))
+        XCTAssertEqual(metadata["observedEndPositionSeconds"] as? Double, 0)
+        XCTAssertEqual(metadata["durationSeconds"] as? Double, 1)
+        XCTAssertNil(metadata["expectedDurationSeconds"])
+    }
+    func testStoppedPausedAndFailedSegmentsCannotClaimContinuousCompletion() throws {
+        for (reason, complete) in [("Stopped by user", true), ("Paused or metadata unavailable", true),
+                                   ("Observed track change", false)] {
+            let file = try FloatWAVFile(directory: folder(), track: track("Track", duration: 1), sampleRate: 8000)
+            try appendSecond(to: file)
+            file.observe(positionSeconds: 1, expectedDurationSeconds: 1)
+            let metadata = try manifest(file.finish(reason: reason, complete: complete))
+            XCTAssertEqual(metadata["coverageContinuous"] as? Bool, false, reason)
+        }
+    }
+    func testInvalidInitialAndLaterPlaybackMetadataCannotClaimCoverage() throws {
+        for position in [-1.0, .infinity, .nan] {
+            XCTAssertThrowsError(try FloatWAVFile(directory: folder(), track: track("Invalid", position: position), sampleRate: 8000))
+        }
+        let file = try FloatWAVFile(directory: folder(), track: track("Invalid observation", duration: 1), sampleRate: 8000)
+        try appendSecond(to: file)
+        file.observe(positionSeconds: .nan, expectedDurationSeconds: 1)
+        let metadata = try manifest(file.finish(reason: "Observed track change", complete: true))
+        XCTAssertEqual(metadata["coverageContinuous"] as? Bool, false)
     }
 }

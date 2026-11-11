@@ -66,22 +66,36 @@ install scripts never reinstall the driver. Future OS compatibility fixes or
 changes to the endpoint itself may still require a driver update; a literal
 “never reinstall” guarantee is not possible.
 
-Player uses Audio Bridge for capture. The main window shows the capture source,
-recording file/folder, and listening status separately. Use **Record playlist**
-or **Stop recording** for WAVs, and **Enable audio** if setup is inactive. The
-legacy process-tap path is no longer offered in the UI. macOS asks AudioBridge for Microphone
-permission because this is an input device; the code opens only the virtual
-endpoint, never the physical microphone. Recording is always opt-in and off
-after service restart. Capture and monitoring preferences survive restarts.
+Player connects a private **Spotify-only process tap** to the fixed Audio Bridge
+endpoint at unity gain. The tap suppresses Spotify's ordinary output while it is
+active. Changing the Mac's output in Control Center affects other applications;
+Spotify keeps feeding Audio Bridge. WAV recording stays in the independent
+AudioBridge service, before monitoring gain. Neither starting this route nor
+resuming recording changes the system output. Keep speakers/headphones selected
+for Mac audio; selecting Audio Bridge as the system default would mix other apps
+into its recordings, so Player stops its per-track recording in that case.
 
-**Use for Mac audio** explicitly makes Audio Bridge the regular default output.
-All apps following that default are included, not only Spotify. Default input
-and system-alert output are unchanged. Spotify's Web API does not select a
-local Core Audio device. Use **Restore Mac output** or **Stop capture** to
-restore the previous available physical output. If the saved output is absent,
-choose one in macOS Sound settings. With monitoring off, endpoint audio is
-recordable but inaudible. The LaunchAgent restarts a crashed service; sound may
-be interrupted during recovery. It does not resume recording automatically.
+The main window shows Spotify → Audio Bridge, recording progress/folder, and
+optional listening separately. **Enable audio** prepares the dedicated route,
+even while Spotify is paused. **Resume playlist recording** prepares it as needed.
+**Listen** forwards endpoint audio to the selected physical output; **Stop
+listening** disables that forwarder without affecting WAVs. Player needs macOS
+Screen & System Audio Recording permission for the private tap. AudioBridge needs
+Microphone permission to read its virtual input; it never opens the physical
+microphone. Neither operation reinstalls the driver.
+
+The tap aggregate validates stream terminal types and channel positions, then
+explicitly excludes the endpoint's loopback input, avoiding feedback. Negotiation
+must prove stereo Float32 on the endpoint clock before I/O starts. Muting applies
+from startup, including paused startup; there is no audible probe for this route.
+When Player quits or its tap is released, Spotify returns to normal system output.
+A failed route stops track recording; restarting Spotify processes may require
+re-enabling the route. Recording remains opt-in and off after service restart.
+
+The service's `bridge_use_default`/`bridge_restore_default` RPCs remain available
+for generic system-wide capture, but Player's Spotify flow does not call them.
+The HAL endpoint and service remain independent of Spotify; only Player knows
+which processes to capture and how to label/recover playlist tracks.
 
 For driver removal, restore a physical default output first, stop capture,
 then unload the agent with
@@ -120,25 +134,21 @@ default ad-hoc signature is intended only for local testing.
    here** if another Spotify device is active. Playback controls operate on
    your explicitly selected device; the device name alone is not proof of its
    physical location.
-5. For the optional **Spotify process tap** path, select wired headphones and click **Route through Player**. Allow system
+5. Click **Enable audio** to connect Spotify to Audio Bridge. Allow system
    audio recording when macOS asks. If previously denied, enable Player under
    System Settings → Privacy & Security → Screen & System Audio Recording,
-   then relaunch if requested. No microphone permission is needed.
-6. Player probes for a signal without rendering or muting, then starts the
-   private route with conditional source muting. **Routing active** requires
-   healthy callbacks. Local volume controls only this route. **Use Spotify
-   output** stops routing and restores ordinary playback.
+   then relaunch if requested. The dedicated route can start while Spotify is paused.
+6. Keep your preferred speakers/headphones selected in macOS for other apps.
+   Spotify's private route stays on Audio Bridge. **Resume playlist recording**
+   records missing tracks; physical listening is optional and controlled separately.
 
-The legacy process-tap engine accepts output-only stereo devices and native Float32
-streams. Duplex USB interfaces and multichannel devices are rejected before
-capture. Device loss triggers a best-effort Spotify pause before bounded route
-teardown; network failure can allow ordinary Spotify playback to resume on
-another output. Source/configuration changes and sleep stop routing; after wake
-or reconnection, refresh/select the output and explicitly restart. The legacy tap never
-changes the global default output. The endpoint path changes it only through
-the explicit **Use for Mac audio** action described above.
+The legacy physical-output process-tap engine remains for compatibility, but is
+not offered by the current UI. Source/configuration changes and sleep stop the
+route; after wake or restarting Spotify, explicitly re-enable it. When the tap
+is released, Spotify resumes ordinary output. Starting the dedicated route never
+changes the global default output device.
 
-Use **Diagnostics…** to export bounded metadata and counters, never audio or
+Use `player_status` and `player_logs` for bounded metadata and counters, never audio or
 credentials. `~/Applications/Player.app/Contents/MacOS/Player --inspect` prints
 available output devices and Spotify Core Audio process objects without starting
 capture. See [VALIDATION.md](VALIDATION.md) for the acceptance checklist and
@@ -158,9 +168,9 @@ is pressed or `player_record_start` is called. It never uploads audio.
    playlist**. Player requests shuffle/repeat off and checks those modes before
    starting at the first item. Spotify owns queue advancement. Turn off Spotify
    crossfade/Automix manually if distinct track transitions are needed.
-2. Start Audio Bridge capture and send playback to its endpoint. Monitoring
-   is optional. For the legacy process tap, start **Route through Player**.
-3. Click **Record WAVs**. Output goes to the configured debug folder (here,
+2. Use **Enable audio** to connect Spotify to Audio Bridge independently of the
+   Mac's output. Monitoring is optional; other apps keep their normal output.
+3. Click **Resume playlist recording**. Output goes to the configured debug folder (here,
    `/Users/stefan/Documents/Audio`; default `~/Documents/Audio`).
 4. Click **Stop recording** to finalize files while playback continues. Stopping
    capture also finalizes the current recording. Player quitting ends its track
@@ -173,6 +183,45 @@ existing files are never overwritten. Active files end in `.partial.wav` and
 are renamed after finalization. Forced termination or a write/overflow error
 leaves an explicitly partial file. A JSON sidecar maps each file to its Spotify
 track ID, observed start position, sample rate, frame count and stop reason.
+
+**Resume playlist recording** restarts the current playlist with shuffle/repeat
+off and skips tracks whose local sidecars prove complete observed coverage.
+Player reads the recording folder directly, matching the existing `trackID`;
+the HAL driver only moves samples, and AudioBridge only writes recordings and
+capture evidence. There is no catalog API in the driver or service.
+
+New sidecars use `recordingSchemaVersion: 2` and `completionPolicy: observed-v1`,
+adding expected duration, last observed position, and continuity evidence.
+Completion requires a finalized WAV, a start within two seconds of zero,
+continuous capture, and observed/recorded duration within the two-second
+boundary tolerance. Player checks WAV headers and file length without reading
+sample payloads. This is approximate playback coverage, not sample-accurate
+source verification. A pause, stop, seek, metadata gap, or error remains
+incomplete; the final track stopping without an observed next-track boundary is
+also conservatively incomplete. Legacy sidecars without this evidence remain
+unverified and will be recorded again. Existing files are never overwritten.
+
+Recovery advances through Spotify's observed playlist; it does not download a
+playlist or need extra account scopes. Missing tracks begin at zero; completed
+tracks are skipped without creating another WAV. Playback/device/context changes,
+manual controls, stale metadata, or an unconfirmed command stop automatic recovery.
+Ambiguous next commands are never retried. A same-ID duplicate immediately after
+a skip can be indistinguishable from an unconfirmed command; recovery stops after
+ten seconds rather than guessing. Resume explicitly after an interruption.
+
+`player_record_resume` accepts an optional `playlist` link/URI and exposes progress
+under `player_status.playlistRecovery`. `player_recordings` lists paginated cached
+metadata (`offset`, `limit` up to 20); `refresh: true` starts a background rescan.
+Each row contains WAV/sidecar basenames, `trackID`, raw retained metadata, and a
+complete/incomplete/unverified/invalid assessment. Large analyzer payloads are
+omitted with `metadataOmittedKeys`; the files themselves are unchanged. Catalog
+schema version 1 is an app contract, independent of driver version 1.
+
+The generic service accepts optional `expectedDurationSeconds` with track labels
+and `capture: false` on `bridge_record_track`. This reports a boundary while
+suppressing capture of the next item, without creating a skipped file. All older
+callers retain the default `capture: true` behavior. These are user-space updates;
+no driver reinstall is required.
 
 The Rust analyzer uses this same `~/Documents/Audio` folder. Run
 `./scripts/mixlib scan` to register finalized recordings. It preserves the
@@ -242,7 +291,7 @@ JSON-RPC to that running app, and also provides a one-shot CLI for diagnostics:
 ~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_status
 ~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_devices
 ~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_logs
-~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_start '{"outputUID":"BuiltInHeadphoneOutputDevice"}'
+~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_start
 ~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_volume '{"gain":0.5}'
 ~/Applications/Player.app/Contents/MacOS/PlayerMCP --call player_stop
 ```

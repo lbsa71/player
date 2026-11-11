@@ -172,10 +172,10 @@ private final class EndpointInput {
         metadataLeaseUntil = leaseSeconds.map { Date().addingTimeInterval(max(2,min(60,$0))) }
         event("WAV recording started at the virtual endpoint, before monitoring")
     }
-    public func observeTrack(_ track: RecordingTrack?, leaseSeconds: Double = 10) {
+    public func observeTrack(_ track: RecordingTrack?, leaseSeconds: Double = 10, capture: Bool = true) {
         guard recording.enabled else { return }
         metadataLeaseUntil = Date().addingTimeInterval(max(2,min(60,leaseSeconds)))
-        recorder?.observe(track)
+        recorder?.observe(track,capture:capture)
     }
     public func stopRecording(reason: String = "Stopped by user.") {
         guard let recorder, !recording.finishing else { return }

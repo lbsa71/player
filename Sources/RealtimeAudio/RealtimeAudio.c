@@ -14,6 +14,7 @@ struct PlayerRenderer {
     _Atomic(unsigned long long) callbacks, frames, nonzeroFrames, invalidBuffers;
     float currentGain, rampStep;
     bool renderOutput;
+    uint32_t selectedInputBuffer, expectedInputBuffers;
     _Atomic(unsigned int) references;
     _Atomic(bool) recording, recordBusy;
     _Atomic(unsigned long long) recordWrite, recordRead, recordDropped;
@@ -77,6 +78,11 @@ uint32_t player_record_read(PlayerRenderer *r, float *stereo, uint32_t maxFrames
     atomic_store_explicit(&r->recordRead, read + count, memory_order_release);
     return count;
 }
+bool player_renderer_select_input_buffer(PlayerRenderer *r, uint32_t index, uint32_t totalBuffers) {
+    if (!totalBuffers || index >= totalBuffers || atomic_load(&r->callbacks) != 0) return false;
+    r->selectedInputBuffer = index; r->expectedInputBuffers = totalBuffers;
+    return true;
+}
 void player_renderer_set_gain(PlayerRenderer *r, float gain) {
     if (!isfinite(gain)) gain = 0;
     atomic_store_explicit(&r->gainBits, bits(fmaxf(0, fminf(1, gain))), memory_order_relaxed);
@@ -137,6 +143,14 @@ void player_renderer_process(PlayerRenderer *r, const AudioBufferList *input, Au
     }
     atomic_fetch_add_explicit(&r->callbacks, 1, memory_order_relaxed);
     Channel source[2], destination[2];
+    AudioBufferList selected;
+    if (r->expectedInputBuffers) {
+        if (input && input->mNumberBuffers == r->expectedInputBuffers) {
+            selected.mNumberBuffers = 1;
+            selected.mBuffers[0] = input->mBuffers[r->selectedInputBuffer];
+            input = &selected;
+        } else { input = NULL; }
+    }
     if (!stereo(input, source) || !stereo(output, destination) ||
         source[0].frames != destination[0].frames) {
         atomic_fetch_add_explicit(&r->invalidBuffers, 1, memory_order_relaxed);

@@ -349,6 +349,15 @@ fn profile(
     placements: [&Placement; 2],
     facts: &CandidateFacts,
 ) -> Option<PairProfile> {
+    profile_with_hold(t, records, placements, facts, None)
+}
+fn profile_with_hold(
+    t: &TacticPlan,
+    records: [&TacticTrackAnalysis; 2],
+    placements: [&Placement; 2],
+    facts: &CandidateFacts,
+    precise_hold: Option<&[Window; 2]>,
+) -> Option<PairProfile> {
     let level = placements.map(|p| {
         p.automation
             .iter()
@@ -380,6 +389,9 @@ fn profile(
             )
         });
         let base = [base[0].as_ref()?, base[1].as_ref()?];
+        let held = precise_hold
+            .filter(|_| bounds[0] < t.hold_end_frame && t.hold_end_frame < bounds[1])
+            .map_or(base, |w| [&w[0], &w[1]]);
         if measure_stability {
             for side in 0..2 {
                 let placement = if side == 0 {
@@ -393,7 +405,7 @@ fn profile(
                     .filter(|l| l.placement == placement)
                     .map(|l| {
                         let held_gain = value(&l.gain, t.start_frame);
-                        let rms = base[side].lanes.get(&l.lane).map(|s| s.rms)?;
+                        let rms = held[side].lanes.get(&l.lane).map(|s| s.rms)?;
                         Some((rms * held_gain * level[side]).powi(2))
                     })
                     .collect::<Option<Vec<_>>>()?
@@ -413,6 +425,10 @@ fn profile(
                     .filter(|p| p.output_frame >= bounds[0] && p.output_frame < bounds[1])
                     .map(|p| p.output_frame),
             );
+        }
+        if t.phrase_exit.is_some() {
+            let points: Vec<_> = phases.iter().copied().collect();
+            phases.extend(points.windows(2).map(|w| w[0] + (w[1] - w[0]) / 2));
         }
         for at in phases {
             let mut audible = vec![];
@@ -533,6 +549,8 @@ fn profile(
                         entry.insert(window(records[side], start, end)?);
                     }
                     &cache[&key]
+                } else if at < t.hold_end_frame {
+                    held[side]
                 } else {
                     base[side]
                 };
@@ -636,8 +654,12 @@ fn profile(
                 .max(bass[0].min(bass[1]).powi(2))
                 .max(drums[0].min(drums[1]).powi(2))
                 .max(conflict);
-            let reference = (base[0].source.rms * level[0]).max(base[1].source.rms * level[1]);
-            per_density.push(density(&audible, reference));
+            let reference_window = if at < t.hold_end_frame { held } else { base };
+            let reference = (reference_window[0].source.rms * level[0])
+                .max(reference_window[1].source.rms * level[1]);
+            if bounds[0] >= t.hold_end_frame || at < t.hold_end_frame {
+                per_density.push(density(&audible, reference));
+            }
             let bed: Vec<_> = audible
                 .into_iter()
                 .filter(|l| l.side == 0 && l.lane != StemLane::Drums)
@@ -1095,6 +1117,144 @@ fn pulse_relation(
     facts.a.evidence.push(format!("measured pulse mapping {interpreted}: slow-grid skew {:.3}ms, low/high attack-pattern cosine {:.3}/{:.3}; no categorical drum-name inference",skew/facts.output_sample_rate_hz as f64*1000.,low,high));
 }
 
+/// Replace only time-local energy/activity descriptors for a partial held bar.
+/// Full-bar spectral/lead evidence and peak bounds remain conservative. The
+/// unheld portion keeps its original descriptors and is assessed separately.
+fn precise_hold_window(
+    store: &mixlib_catalog::Store,
+    record: &TacticTrackAnalysis,
+    p: &Placement,
+    first: u64,
+    last: u64,
+    cancel: &Cancellation,
+) -> Result<Option<Window>> {
+    use mixlib_audio::WavReader;
+    let start = p.time_map.source_at(first as f64).ceil() as u64;
+    let end = p.time_map.source_at(last as f64).floor() as u64;
+    let Some(mut w) = window(record, start, end) else {
+        return Ok(None);
+    };
+    let source = store.source(&store.track(&p.track_id)?)?;
+    let measure = |path: &std::path::Path| -> Result<(f64, f64, Vec<f64>)> {
+        let mut wav = WavReader::open(path)?;
+        require(
+            wav.format.sample_rate_hz == record.source_sample_rate_hz
+                && wav.format.frames == record.source_frames
+                && wav.format.channels == 2,
+            "TACTIC_STEM_FORMAT",
+            "partial-hold PCM timebase changed",
+        )?;
+        wav.seek_frame(start)?;
+        let block = u64::from((record.source_sample_rate_hz / 50).max(1));
+        let mut at = start;
+        let (mut energy, mut peak) = (0., 0f64);
+        let mut envelope = vec![];
+        while at < end {
+            cancel.check()?;
+            let count = block.min(end - at) as usize;
+            let pcm = wav.read_frames(count)?;
+            require(
+                pcm.len() == count,
+                "TACTIC_STEM_FORMAT",
+                "partial-hold PCM ended early",
+            )?;
+            let power = pcm
+                .iter()
+                .flatten()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>();
+            energy += power;
+            peak = pcm
+                .iter()
+                .flatten()
+                .map(|v| f64::from(*v).abs())
+                .fold(peak, f64::max);
+            envelope.push((power / (2 * count) as f64).sqrt());
+            at += count as u64;
+        }
+        let rms = (energy / (2 * (end - start)) as f64).sqrt();
+        require(
+            rms.is_finite() && peak.is_finite(),
+            "TACTIC_STEM_FORMAT",
+            "nonfinite partial-hold PCM",
+        )?;
+        Ok((rms, peak, envelope))
+    };
+    let source_levels = measure(&source)?;
+    let threshold = (source_levels.0 * 0.04).max(0.0008);
+    let update = |s: &mut Stats, (rms, peak, envelope): (f64, f64, Vec<f64>)| {
+        s.rms = rms;
+        s.peak = s.peak.max(peak);
+        s.crest = if rms > 0. { db(peak / rms) } else { 0. };
+        s.activity = envelope.iter().filter(|v| **v >= threshold).count() as f64
+            / envelope.len().max(1) as f64;
+    };
+    update(&mut w.source, source_levels);
+    for lane in LANES {
+        let Some(asset) = record.stems.get(&lane) else {
+            return Ok(None);
+        };
+        let levels = measure(&store.path(&asset.path)?)?;
+        update(w.lanes.get_mut(&lane).unwrap(), levels);
+    }
+    Ok(Some(w))
+}
+
+pub(crate) fn refine_rhythmic_hold(
+    store: &mixlib_catalog::Store,
+    records: [&TacticTrackAnalysis; 2],
+    placements: [&Placement; 2],
+    facts: &mut CandidateFacts,
+    cancel: &Cancellation,
+) -> Result<()> {
+    let Some(exit) = facts.pair.rhythmic_exit.clone() else {
+        return Ok(());
+    };
+    let mut active = facts.clone();
+    active.phrase_exit = Some(exit.clone());
+    let policy = TacticPolicy {
+        normal_speed_deviation: placements
+            .iter()
+            .map(|p| {
+                (1. - p.time_map.speed_ratio_limits[0]).max(p.time_map.speed_ratio_limits[1] - 1.)
+            })
+            .fold(0.06, f64::max)
+            .min(0.2),
+        ..TacticPolicy::default()
+    };
+    let Ok(t) = candidate_tactic_schedule(TacticId::M01, &active, &policy) else {
+        return Ok(());
+    };
+    let first = facts.bar_frames[facts.bar_frames.len() - 2];
+    let Some(a) = precise_hold_window(
+        store,
+        records[0],
+        placements[0],
+        first,
+        exit.start_frame,
+        cancel,
+    )?
+    else {
+        return Ok(());
+    };
+    let Some(b) = precise_hold_window(
+        store,
+        records[1],
+        placements[1],
+        first,
+        exit.start_frame,
+        cancel,
+    )?
+    else {
+        return Ok(());
+    };
+    if let Some(mut measured) = profile_with_hold(&t, records, placements, &active, Some(&[a, b])) {
+        measured.evidence.push("partial held bar RMS, crest and 20ms activity remeasured from source/stem PCM on the actual time maps; later energy change is excluded from the hold; full-bar pitch/lead and peak bounds retained".into());
+        facts.pair.rhythmic_profiles.insert(TacticId::M01, measured);
+    }
+    Ok(())
+}
+
 /// Enrich only from identity-checked persisted source evidence. This function
 /// performs no model inference, file access, user communication or metadata writes.
 pub(crate) fn enrich_pair_evidence(
@@ -1152,6 +1312,45 @@ pub(crate) fn enrich_pair_evidence(
             measured.unwrap_or_else(|| PairProfile {
                 method: METHOD.into(),
                 evidence: vec![format!("{id:?}: {reason}; no compatibility inferred")],
+                ..PairProfile::default()
+            }),
+        );
+    }
+    if facts.a.phrase_exit.is_some() {
+        let mut swift = facts.clone();
+        swift.phrase_exit = facts.a.phrase_exit.clone();
+        for id in TacticId::ALL.into_iter().filter(|id| sustained_tactic(*id)) {
+            let measured = candidate_tactic_schedule(id, &swift, &policy).and_then(|t| {
+                profile(&t, records, placements, &swift).ok_or_else(|| {
+                    Error::new("TACTIC_PAIR", "source coverage unknown for swift exit")
+                })
+            });
+            facts.pair.swift_profiles.insert(
+                id,
+                measured.unwrap_or_else(|e| PairProfile {
+                    method: METHOD.into(),
+                    evidence: vec![format!("swift exit: {}: {}", e.code, e.message)],
+                    ..PairProfile::default()
+                }),
+            );
+        }
+    }
+    if facts.pair.rhythmic_exit.is_some() {
+        let mut rhythmic = facts.clone();
+        rhythmic.phrase_exit = facts.pair.rhythmic_exit.clone();
+        let measured = candidate_tactic_schedule(TacticId::M01, &rhythmic, &policy).and_then(|t| {
+            profile(&t, records, placements, &rhythmic).ok_or_else(|| {
+                Error::new(
+                    "TACTIC_PAIR",
+                    "source coverage unknown for rhythmic handoff",
+                )
+            })
+        });
+        facts.pair.rhythmic_profiles.insert(
+            TacticId::M01,
+            measured.unwrap_or_else(|e| PairProfile {
+                method: METHOD.into(),
+                evidence: vec![format!("swift exit: {}: {}", e.code, e.message)],
                 ..PairProfile::default()
             }),
         );
@@ -1236,6 +1435,41 @@ mod tests {
             created_at: "fixture".into(),
         };
         (record, placement)
+    }
+
+    #[test]
+    fn partial_hold_uses_retained_energy_without_erasing_later_peak_bounds() {
+        let mut f = crate::tactics::tests::facts(8);
+        let exit = PhraseExit {
+            start_frame: 7 * BAR + BAR / 2,
+            end_frame: 7 * BAR + BAR / 2 + 3840,
+            kind: PhraseExitKind::AccompanimentPause,
+            evidence: "partial-window fixture".into(),
+        };
+        f.a.phrase_exit = Some(exit.clone());
+        f.phrase_exit = Some(exit);
+        let (mut a, pa) = fixture(0, &f);
+        let (mut b, pb) = fixture(1, &f);
+        let held = [
+            window(&a, 6 * BAR, 7 * BAR).unwrap(),
+            window(&b, 6 * BAR, 7 * BAR).unwrap(),
+        ];
+        for lane in ["drums", "bass", "other", "vocals"] {
+            a.signal_evidence["bars"][7]["stems"][lane]["rms"] = json!(0.001);
+        }
+        b.signal_evidence["bars"][7]["stems"]["other"]["peak"] = json!(0.9);
+        let t = candidate_tactic_schedule(TacticId::M01, &f, &TacticPolicy::default()).unwrap();
+        let coarse = profile(&t, [&a, &b], [&pa, &pb], &f).unwrap();
+        let exact = profile_with_hold(&t, [&a, &b], [&pa, &pb], &f, Some(&held)).unwrap();
+        assert!(
+            exact.selected_composite_density.as_ref().unwrap()[7]
+                > coarse.selected_composite_density.as_ref().unwrap()[7]
+        );
+        assert!(
+            exact.outgoing_layer_stability.as_ref().unwrap()[7]
+                > coarse.outgoing_layer_stability.as_ref().unwrap()[7]
+        );
+        assert!(exact.predicted_peak_dbfs.unwrap() >= coarse.predicted_peak_dbfs.unwrap());
     }
 
     #[test]

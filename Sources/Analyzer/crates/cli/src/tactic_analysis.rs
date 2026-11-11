@@ -76,6 +76,49 @@ pub(super) fn ensure_tactic_analysis(
     Ok(report)
 }
 
+/// Shortlist using basic measurements, then publish through the normal fused
+/// sidecar analysis path. Failed candidates do not count toward pool expansion.
+pub(super) fn expand_pool(
+    store: &Store,
+    count: usize,
+    python: &Path,
+    cancel: &Cancellation,
+) -> Result<serde_json::Value> {
+    let before = measured_beam::prepared_pool(store)?.len();
+    let policy: MixingConfig = store.read("config/mixing.json")?;
+    eprintln!(
+        "tactic analysis: ranking new tracks by two-sided connections to {before} prepared tracks"
+    );
+    let shortlist = mixlib_planner::pick_tracks(store, &policy, 12, 8, cancel)?;
+    let mut attempts = Vec::new();
+    let mut added = 0;
+    for candidate in &shortlist.preparation_candidates {
+        if added >= count {
+            break;
+        }
+        cancel.check()?;
+        let id = candidate["track_id"].as_str().unwrap();
+        let track = store.track(id)?;
+        let source = store.source(&track)?;
+        eprintln!("tactic analysis: pool candidate {}", source.display());
+        let report = ensure_tactic_analysis(store, &[id.to_owned()], python, cancel)?;
+        let succeeded = report.counts.get("failed").copied().unwrap_or(0) == 0;
+        if succeeded {
+            added += 1;
+        }
+        attempts.push(serde_json::json!({"candidate":candidate,"source":source,"succeeded":succeeded,"report":report}));
+    }
+    let after = measured_beam::prepared_pool(store)?.len();
+    let mut report = Report::new("tactic_pool_expansion");
+    report.header.extensions.insert("selection".into(), serde_json::json!({
+        "requested":count,"added":after.saturating_sub(before),"prepared_before":before,"prepared_after":after,
+        "basic_analyzed_tracks":shortlist.analyzed_tracks,"shortlist":shortlist.preparation_candidates,
+        "attempts":attempts,"complete":after >= before + count
+    }));
+    store.report(&report)?;
+    Ok(serde_json::to_value(report)?)
+}
+
 fn script_sources() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         (

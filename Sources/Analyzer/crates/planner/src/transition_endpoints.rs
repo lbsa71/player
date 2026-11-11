@@ -70,10 +70,12 @@ fn drum_changes(rows: &[Value]) -> Vec<Endpoint> {
             && v[2..]
                 .iter()
                 .all(|&(e, a)| e <= energy * 0.70 && a <= activity * 0.70);
-        let up = steady_before
-            && v[2..]
-                .iter()
-                .all(|&(e, a)| e >= energy.max(0.003) * 1.6 && a >= activity.max(0.25) * 1.4);
+        // A return often follows silence plus a pickup, not a steady quiet bed.
+        let prior_energy = v[0].0.max(v[1].0).max(0.003);
+        let prior_activity = v[0].1.max(v[1].1).max(0.25);
+        let up = v[2..]
+            .iter()
+            .all(|&(e, a)| e >= prior_energy * 1.6 && a >= prior_activity * 1.4);
         let changed_pattern = window
             .iter()
             .map(pattern)
@@ -102,6 +104,67 @@ fn drum_changes(rows: &[Value]) -> Vec<Endpoint> {
         }
     }
     result
+}
+
+pub(crate) fn arrivals(record: &TacticTrackAnalysis) -> Vec<Endpoint> {
+    measured(record)
+        .into_iter()
+        .filter(|e| {
+            e.reason == "sustained drum arrival"
+                || record
+                    .signal_evidence
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|v| {
+                        v.get("frame").and_then(Value::as_u64) == Some(e.frame)
+                            && matches!(
+                                v.get("kind").and_then(Value::as_str),
+                                Some("drum_return" | "drop")
+                            )
+                            && number(v, "score").is_some_and(|s| (0.6..=1.).contains(&s))
+                    })
+        })
+        .collect()
+}
+
+/// Legacy build spans sometimes include the first full-volume release bar.
+/// Refine only when a sustained drum arrival and a stable full-mix plateau
+/// identify that final bar as the release, rather than a continuing crescendo.
+pub(crate) fn build_release(record: &TacticTrackAnalysis, start: u64, end: u64) -> u64 {
+    let Some(rows) = record.signal_evidence.get("bars").and_then(Value::as_array) else {
+        return end;
+    };
+    build_release_rows(rows, start, end)
+}
+
+fn build_release_rows(rows: &[Value], start: u64, end: u64) -> u64 {
+    let changes = drum_changes(rows);
+    for w in rows.windows(2) {
+        let Some(at) = w[0].get("start_frame").and_then(Value::as_u64) else {
+            continue;
+        };
+        if at <= start
+            || w[0].get("end_frame").and_then(Value::as_u64) != Some(end)
+            || w[1].get("start_frame").and_then(Value::as_u64) != Some(end)
+            || !changes
+                .iter()
+                .any(|e| e.frame == at && e.reason == "sustained drum arrival")
+        {
+            continue;
+        }
+        if let Some((a, b)) = w[0]
+            .get("source")
+            .and_then(|s| number(s, "rms"))
+            .zip(w[1].get("source").and_then(|s| number(s, "rms")))
+        {
+            if a > 0.003 && (b - a).abs() <= a * 0.15 {
+                return at;
+            }
+        }
+    }
+    end
 }
 
 pub(crate) fn measured(record: &TacticTrackAnalysis) -> Vec<Endpoint> {
@@ -134,7 +197,15 @@ pub(crate) fn measured(record: &TacticTrackAnalysis) -> Vec<Endpoint> {
             .and_then(Value::as_u64)
         {
             result.push(Endpoint {
-                frame,
+                frame: if kind == "build" {
+                    build_release(
+                        record,
+                        event.get("frame").and_then(Value::as_u64).unwrap_or(frame),
+                        frame,
+                    )
+                } else {
+                    frame
+                },
                 reason: format!("measured {kind} boundary"),
             });
         }
@@ -171,6 +242,39 @@ mod tests {
                 [at * 100]
             );
         }
+    }
+
+    #[test]
+    fn build_release_is_refined_only_after_the_crescendo_has_plateaued() {
+        let mut rows = (0..5).map(|i| row(i, i < 2, false)).collect::<Vec<_>>();
+        for r in &mut rows {
+            r["source"] = json!({"rms":0.07});
+        }
+        assert_eq!(build_release_rows(&rows, 0, 300), 200);
+        rows[3]["source"]["rms"] = json!(0.12);
+        assert_eq!(
+            build_release_rows(&rows, 0, 300),
+            300,
+            "continuing crescendo cannot be shortened"
+        );
+        rows[3]["source"]["rms"] = json!(0.07);
+        rows[3]["stems"]["drums"]["rms"] = json!(0.01);
+        assert_eq!(
+            build_release_rows(&rows, 0, 300),
+            300,
+            "one loud fill is not a release"
+        );
+    }
+
+    #[test]
+    fn return_can_follow_uneven_quiet_pickup_but_not_an_isolated_loud_bar() {
+        let mut rows = (0..6).map(|i| row(i, i < 2, false)).collect::<Vec<_>>();
+        rows[0]["stems"]["drums"]["rms"] = json!(0.0001);
+        assert!(drum_changes(&rows)
+            .iter()
+            .any(|e| e.frame == 200 && e.reason == "sustained drum arrival"));
+        rows[3] = row(3, true, false);
+        assert!(!drum_changes(&rows).iter().any(|e| e.frame == 200));
     }
 
     #[test]

@@ -18,6 +18,7 @@ import SpotifyKit
     @Published var events: [String] = []
     var onRemotePlayback: (() -> Void)?
     var onPlaybackChanged: (() -> Void)?
+    var onManualCommand: (() -> Void)?
     var recordingEnabled = false {
         didSet { if oldValue != recordingEnabled && connected { beginPolling() } }
     }
@@ -117,7 +118,14 @@ import SpotifyKit
         } catch { handle(error) }
     }
     func refreshPlayback(force: Bool = false) async {
-        guard connected, !reading, force || !commandPending else { return }
+        // A command must not reuse a read that began before it was accepted.
+        // Let an in-flight poll finish, then issue a distinct forced observation.
+        if force {
+            while reading && connected && !Task.isCancelled {
+                do { try await Task.sleep(for:.milliseconds(10)) } catch { return }
+            }
+        }
+        guard connected, !reading, !Task.isCancelled, force || !commandPending else { return }
         reading = true
         let current = generation
         defer { reading = false }
@@ -135,22 +143,29 @@ import SpotifyKit
     }
     func send(_ command: TransportCommand, name: String) {
         guard canControl else { error = "Connect Spotify and identify its device on this Mac first."; return }
+        onManualCommand?()
+        Task { try? await perform(command, name: name) }
+    }
+    /// Awaitable command used by playlist recovery. Success still requires a fresh
+    /// observation; ambiguous transport errors are never automatically retried.
+    func perform(_ command: TransportCommand, name: String) async throws {
+        guard canControl else { throw SpotifyFailure.setup("Spotify is not ready for a playback command.") }
         commandPending = true
+        defer { commandPending = false }
         lastCommand = "\(name) requested"
-        let id = selectedDeviceID
-        Task {
-            defer { commandPending = false }
-            do {
-                try await client.command(command, deviceID: id)
-                lastCommand = "\(name) accepted; checking Spotify"
-                event(lastCommand)
-                try await Task.sleep(for: .milliseconds(350))
-                await refreshPlayback(force: true)
-            } catch {
-                lastCommand = "\(name) not confirmed"
-                stale = true; handle(error)
-                if case SpotifyFailure.noDevice = error { await refreshDevices() }
-            }
+        do {
+            try await client.command(command, deviceID: selectedDeviceID)
+            lastCommand = "\(name) accepted; checking Spotify"
+            event(lastCommand)
+            try await Task.sleep(for: .milliseconds(350))
+            await refreshPlayback(force: true)
+            try Task.checkCancellation()
+            guard connected, !stale else { throw SpotifyFailure.setup("Spotify playback could not be confirmed.") }
+        } catch {
+            lastCommand = "\(name) not confirmed"
+            stale = true; handle(error)
+            if case SpotifyFailure.noDevice = error { await refreshDevices() }
+            throw error
         }
     }
     func pauseForOutputLoss() async -> Bool {
@@ -196,7 +211,9 @@ import SpotifyKit
          "durationSeconds": Double(playback?.item?.duration_ms ?? 0) / 1000,
          "commandPending": commandPending, "lastCommand": lastCommand,
          "refreshingDevices": refreshingDevices,
-         "contextURI": playback?.context?.uri ?? "",
+         "contextURI": playback?.context?.uri ?? "", "trackID":playback?.item?.id ?? "",
+         "shuffle":playback?.shuffle_state as Any? ?? NSNull(), "repeatMode":playback?.repeat_state ?? "",
+         "observedAt":observedAt.map { ISO8601DateFormatter().string(from:$0) } ?? "",
          "devices": devices.map { ["id": $0.id ?? "", "name": $0.name, "type": $0.type, "active": $0.is_active] as [String: Any] }]
     }
 }

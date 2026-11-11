@@ -29,7 +29,8 @@ final class ProcessTapSession {
 
     func start(probe: Bool, gain: Float, progress: (String) -> Void = { _ in }) throws {
         guard !sources.isEmpty else { throw AudioFailure("Open Spotify and play a track on this Mac first.") }
-        guard output.supportsPrototype else {
+        let endpoint = output.uid == AudioBridgeEndpoint.uid
+        guard output.supportsPrototype || (endpoint && output.inputChannels == 2 && output.outputChannels == 2) else {
             throw AudioFailure("This prototype requires a stereo output-only device. Use the Mac headphone jack or an output-only DAC; duplex interfaces and multichannel devices await validation.")
         }
         do {
@@ -37,7 +38,7 @@ final class ProcessTapSession {
             let description = CATapDescription(stereoMixdownOfProcesses: sources.map(\.objectID))
             description.name = "Player · Spotify only"
             description.isPrivate = true
-            description.muteBehavior = probe ? .unmuted : .mutedWhenTapped
+            description.muteBehavior = endpoint ? .mutedWhenTapped : (probe ? .unmuted : .mutedWhenTapped)
             try checked(AudioHardwareCreateProcessTap(description, &tap), "Create Spotify process tap")
             let tapFormat = try HAL.value(tap, kAudioTapPropertyFormat, initial: AudioStreamBasicDescription())
             let tapUID = try HAL.string(tap, kAudioTapPropertyUID)
@@ -64,16 +65,36 @@ final class ProcessTapSession {
                 UInt32(MemoryLayout<Double>.size), &rate), "Negotiate aggregate sample rate")
             let inputs = try HAL.formats(aggregate, scope: kAudioObjectPropertyScopeInput)
             let outputs = try HAL.formats(aggregate, scope: kAudioObjectPropertyScopeOutput)
-            try Self.validateFormats(inputs, outputs, expectedRate: output.sampleRate)
+            var selection: TapInputSelection?
+            if endpoint {
+                let nativeInputs = try HAL.ids(output.objectID,kAudioDevicePropertyStreams,scope:kAudioObjectPropertyScopeInput)
+                let inputStreams = try HAL.ids(aggregate,kAudioDevicePropertyStreams,scope:kAudioObjectPropertyScopeInput)
+                let selected = try Self.tapInputSelection(
+                    endpointInputTerminals:nativeInputs.map { try HAL.value($0,kAudioStreamPropertyTerminalType,initial:UInt32(0)) },
+                    aggregateTerminals:inputStreams.map { try HAL.value($0,kAudioStreamPropertyTerminalType,initial:UInt32(0)) },
+                    startingChannels:inputStreams.map { try HAL.value($0,kAudioStreamPropertyStartingChannel,initial:UInt32(0)) },
+                    formats:inputs,bufferChannels:inputBufferChannels())
+                selection = selected
+                try Self.validateFormats([inputs[selected.streamIndex]], outputs, expectedRate: output.sampleRate)
+            } else { try Self.validateFormats(inputs, outputs, expectedRate: output.sampleRate) }
             formatDescription = "Tap \(Int(tapFormat.mSampleRate)) Hz → output \(Int(output.sampleRate)) Hz · Float32 stereo · hardware clock / tap drift compensation"
             progress(formatDescription)
-            guard let storage = player_renderer_create(output.sampleRate, !probe) else {
+            guard let storage = player_renderer_create(output.sampleRate, endpoint || !probe) else {
                 throw AudioFailure("Could not allocate the renderer.")
             }
             renderer = storage
-            player_renderer_set_gain(storage, gain)
+            player_renderer_set_gain(storage, endpoint ? 1 : gain)
+            if let selection {
+                guard player_renderer_select_input_buffer(storage,selection.bufferIndex,UInt32(inputs.count)) else {
+                    throw AudioFailure("Cannot select the proven tap input buffer.")
+                }
+            }
             progress("Creating the audio callback. macOS may wait here for you to allow Player system audio recording.")
             try checked(AudioDeviceCreateIOProcID(aggregate, player_audio_callback, UnsafeMutableRawPointer(storage), &ioProc), "Create audio callback")
+            if let selection {
+                try selectInputStream(UInt32(selection.streamIndex),count:UInt32(inputs.count))
+                formatDescription = "Spotify tap → Audio Bridge · \(Int(output.sampleRate)) Hz Float32 stereo · independent of the Mac’s default output"
+            }
             progress("Starting the audio device. Waiting for captured samples.")
             try checked(AudioDeviceStart(aggregate, ioProc), "Start audio capture (check system audio recording permission)")
             started = true
@@ -81,6 +102,63 @@ final class ProcessTapSession {
             let cleanup = stop()
             if !cleanup.isEmpty { throw AudioFailure("\(error.localizedDescription) Cleanup: \(cleanup.joined(separator: "; "))") }
             throw error
+        }
+    }
+
+    struct TapInputSelection: Equatable {
+        let streamIndex: Int
+        let bufferIndex: UInt32
+    }
+    /// The endpoint's public driver contract exposes one Line input. The other
+    /// aggregate input is the single Unknown-terminal process tap. Stream IDs
+    /// are not semantic identities: HAL reuses them when composition changes.
+    /// StartingChannel maps that stream to its actual IOProc buffer independently
+    /// of the enumeration index used by IOProcStreamUsage.
+    static func tapInputSelection(endpointInputTerminals: [UInt32], aggregateTerminals: [UInt32],
+                                  startingChannels: [UInt32], formats: [AudioStreamBasicDescription],
+                                  bufferChannels: [UInt32]) throws -> TapInputSelection {
+        guard endpointInputTerminals == [kAudioStreamTerminalTypeLine],
+              aggregateTerminals.count == 2,
+              aggregateTerminals.filter({ $0 == kAudioStreamTerminalTypeLine }).count == 1,
+              aggregateTerminals.filter({ $0 == kAudioStreamTerminalTypeUnknown }).count == 1,
+              let tapIndex = aggregateTerminals.firstIndex(of:kAudioStreamTerminalTypeUnknown),
+              startingChannels.count == 2, Set(startingChannels) == [1,3],
+              formats.count == 2, bufferChannels == [2,2],
+              formats.allSatisfy({ $0.mChannelsPerFrame == 2 && $0.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0 }) else {
+            throw AudioFailure("Cannot distinguish the Spotify tap from Audio Bridge loopback; refusing an ambiguous input topology.")
+        }
+        return TapInputSelection(streamIndex:tapIndex,bufferIndex:(startingChannels[tapIndex]-1)/2)
+    }
+    private func inputBufferChannels() throws -> [UInt32] {
+        var address = HAL.address(kAudioDevicePropertyStreamConfiguration,kAudioObjectPropertyScopeInput)
+        var size: UInt32 = 0
+        try checked(AudioObjectGetPropertyDataSize(aggregate,&address,0,nil,&size),"Read aggregate input layout size")
+        guard size >= MemoryLayout<AudioBufferList>.size else { throw AudioFailure("Aggregate input layout is empty.") }
+        let storage = UnsafeMutableRawPointer.allocate(byteCount:Int(size),alignment:MemoryLayout<AudioBufferList>.alignment)
+        defer { storage.deallocate() }
+        try checked(AudioObjectGetPropertyData(aggregate,&address,0,nil,&size,storage),"Read aggregate input layout")
+        let list = UnsafeMutableAudioBufferListPointer(storage.assumingMemoryBound(to:AudioBufferList.self))
+        return list.map(\.mNumberChannels)
+    }
+    private func selectInputStream(_ selected: UInt32, count: UInt32) throws {
+        guard let ioProc, selected < count else { throw AudioFailure("Invalid input stream selection.") }
+        let size = MemoryLayout<AudioHardwareIOProcStreamUsage>.size + max(0,Int(count)-1)*MemoryLayout<UInt32>.size
+        let storage = UnsafeMutableRawPointer.allocate(byteCount:size,alignment:MemoryLayout<AudioHardwareIOProcStreamUsage>.alignment)
+        defer { storage.deallocate() }
+        storage.initializeMemory(as:UInt8.self,repeating:0,count:size)
+        let usage = storage.assumingMemoryBound(to:AudioHardwareIOProcStreamUsage.self)
+        usage.pointee.mIOProc = unsafeBitCast(ioProc,to:UnsafeMutableRawPointer.self)
+        usage.pointee.mNumberStreams = count
+        let offset = MemoryLayout<AudioHardwareIOProcStreamUsage>.offset(of:\.mStreamIsOn)!
+        let enabled = storage.advanced(by:offset).assumingMemoryBound(to:UInt32.self)
+        enabled[Int(selected)] = 1
+        var address = HAL.address(kAudioDevicePropertyIOProcStreamUsage,kAudioObjectPropertyScopeInput)
+        try checked(AudioObjectSetPropertyData(aggregate,&address,0,nil,UInt32(size),storage),"Disable endpoint loopback in Spotify route")
+        var returnedSize = UInt32(size)
+        try checked(AudioObjectGetPropertyData(aggregate,&address,0,nil,&returnedSize,storage),"Verify tap-only input stream usage")
+        guard usage.pointee.mNumberStreams == count,
+              (0..<Int(count)).allSatisfy({ (enabled[$0] != 0) == ($0 == Int(selected)) }) else {
+            throw AudioFailure("HAL did not confirm that only the Spotify tap input is enabled.")
         }
     }
 

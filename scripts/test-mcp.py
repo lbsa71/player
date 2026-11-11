@@ -29,7 +29,7 @@ try:
     process.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
     process.stdin.flush()
     tools = request(2, "tools/list")["result"]["tools"]
-    assert {tool["name"] for tool in tools} == {"player_status", "player_devices", "player_logs", "player_start", "player_stop", "player_volume", "player_login", "player_spotify_devices", "player_select_spotify_device", "player_transport", "player_quit", "player_record_start", "player_record_stop", "bridge_status", "bridge_devices", "bridge_start", "bridge_stop", "bridge_monitor", "bridge_monitor_stop", "bridge_gain", "bridge_record_start", "bridge_record_stop", "bridge_record_track", "bridge_use_default", "bridge_restore_default"}
+    assert {tool["name"] for tool in tools} == {"player_status", "player_devices", "player_logs", "player_start", "player_stop", "player_volume", "player_login", "player_spotify_devices", "player_select_spotify_device", "player_transport", "player_quit", "player_record_start", "player_record_stop", "player_record_resume", "player_recordings", "bridge_status", "bridge_devices", "bridge_start", "bridge_stop", "bridge_monitor", "bridge_monitor_stop", "bridge_gain", "bridge_record_start", "bridge_record_stop", "bridge_record_track", "bridge_use_default", "bridge_restore_default"}
     assert request(3, "ping")["result"] == {}
     assert request(4, "not-a-method")["error"]["code"] == -32601
     process.stdin.write("not json\n")

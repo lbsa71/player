@@ -14,7 +14,7 @@ struct PlayerWindow: View {
     @State private var showSettings = false
     @State private var seeking = false
     @State private var seekValue = 0.0
-    @State private var playlistInput = ""
+    @AppStorage("lastRecordingPlaylist") private var playlistInput = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -106,7 +106,7 @@ struct PlayerWindow: View {
                 }
             }.padding(28)
             Divider()
-            AudioBridgePanel(model:model,bridge:model.bridge)
+            AudioBridgePanel(model:model,bridge:model.bridge,recovery:model.playlistRecording)
         }
         .frame(width: 720).background(PlayerPalette.canvas).foregroundStyle(PlayerPalette.ink)
         .tint(PlayerPalette.accent).preferredColorScheme(.light)
@@ -125,12 +125,13 @@ struct PlayerWindow: View {
 private struct AudioBridgePanel: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var bridge: AudioBridgeModel
+    @ObservedObject var recovery: PlaylistRecordingModel
     private var ready: Bool {
-        bridge.capturing && bridge.status["defaultOutput"] as? String == "se.lbsa71.AudioBridge.endpoint.v1"
+        bridge.capturing && model.endpointReady
     }
     private var outputName: String {
         let uid = bridge.status["monitorActualOutputUID"] as? String ?? ""
-        return model.outputs.first(where: { $0.uid == uid })?.name ?? (model.outputs.contains(where: { $0.uid == model.selectedUID }) ? "Listening paused" : "Headphones disconnected")
+        return model.outputs.first(where: { $0.uid == uid })?.name ?? "Listening off"
     }
     var body: some View {
         VStack(alignment:.leading,spacing:16) {
@@ -139,23 +140,28 @@ private struct AudioBridgePanel: View {
                     Label(bridge.recordingEnabled ? "Recording playlist" : "Playlist recording",
                           systemImage:bridge.recordingEnabled ? "record.circle.fill" : "waveform")
                         .font(.headline).foregroundStyle(bridge.recordingEnabled ? Color.red : PlayerPalette.ink)
-                    Text("Capture source: Audio Bridge").font(.callout)
+                    Text("Spotify → Audio Bridge").font(.callout)
                     Text("One WAV per track · Float32 WAV")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button(bridge.recordingEnabled ? "Stop recording" : "Record playlist") {
-                    if bridge.recordingEnabled { bridge.command("bridge_record_stop") }
-                    else { bridge.record(directory:model.debugOutputDirectory,track:model.recordingTrack) }
+                Button(bridge.recordingEnabled || recovery.running ? "Stop recording" : "Resume playlist recording") {
+                    if bridge.recordingEnabled || recovery.running { recovery.stop() }
+                    else { recovery.start(playlist:model.spotify.playback?.context?.uri ?? UserDefaults.standard.string(forKey:"lastRecordingPlaylist") ?? "") }
                 }.buttonStyle(.borderedProminent)
-                    .disabled(bridge.busy || !ready || bridge.recording["finishing"] as? Bool == true)
+                    .disabled(!recovery.running && !bridge.recordingEnabled && (bridge.busy || !bridge.installed || bridge.recording["finishing"] as? Bool == true))
+            }
+            Text(recovery.detail).font(.caption).foregroundStyle(.secondary)
+            if recovery.completeCount > 0 || recovery.unverifiedCount > 0 {
+                Text("\(recovery.completeCount) tracks complete · \(recovery.unverifiedCount) older files unverified")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             if !ready {
                 HStack {
-                    Text(bridge.installed ? "Enable audio to record this Mac’s playback." : "Audio Bridge needs to be installed.")
+                    Text(bridge.installed ? "Connect Spotify to Audio Bridge to record. Other apps keep your chosen system output." : "Audio Bridge needs to be installed.")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Enable audio") { bridge.connect(outputUID:model.selectedUID) }
+                    Button("Enable audio") { model.enableEndpointRoute() }
                         .disabled(bridge.busy || !bridge.installed)
                 }
             }
@@ -179,14 +185,17 @@ private struct AudioBridgePanel: View {
                         if !editing { bridge.command("bridge_gain",["gain":bridge.monitorGain]) }
                     }.frame(width:160).accessibilityLabel("Listening volume")
                     Text("\(Int(bridge.monitorGain*100))%").font(.caption).monospacedDigit()
+                    Button("Stop listening") { bridge.command("bridge_monitor_stop") }
                 } else {
-                    Button("Resume listening") { bridge.command("bridge_monitor",["outputUID":model.selectedUID]) }
-                        .disabled(bridge.busy || !model.outputs.contains(where: { $0.uid == model.selectedUID }))
+                    Button("Listen") {
+                        if let uid = model.listeningOutputUID { bridge.command("bridge_monitor",["outputUID":uid]) }
+                    }
+                        .disabled(bridge.busy || model.listeningOutputUID == nil)
                 }
             }
-            Text("Listening volume and headphones do not affect the WAV recording.")
+            Text("Other apps use your Mac’s output. Listening here is optional and does not affect WAVs.")
                 .font(.caption).foregroundStyle(.secondary)
-            ForEach([bridge.error,bridge.recording["error"] as? String ?? ""].filter { !$0.isEmpty },id:\.self) {
+            ForEach([model.discoveryError,recovery.error,bridge.error,bridge.recording["error"] as? String ?? ""].filter { !$0.isEmpty },id:\.self) {
                 Text($0).font(.caption).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)
             }
         }.padding(24).background(.white.opacity(0.55))

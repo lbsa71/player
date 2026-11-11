@@ -76,7 +76,8 @@ if CommandLine.arguments.count > 1 {
         return RecordingTrack(id:arguments["trackID"] as? String ?? UUID().uuidString,
                               album:arguments["album"] as? String ?? "Audio Bridge",
                               artist:arguments["artist"] as? String ?? "Input",
-                              name:name,positionSeconds:arguments["positionSeconds"] as? Double ?? 0)
+                              name:name,positionSeconds:arguments["positionSeconds"] as? Double ?? 0,
+                              expectedDurationSeconds:arguments["expectedDurationSeconds"] as? Double)
     }
     private func handle(_ request: [String:Any]) -> [String:Any] {
         guard let method = request["method"] as? String, let arguments = request["arguments"] as? [String:Any] else {
@@ -125,7 +126,8 @@ if CommandLine.arguments.count > 1 {
                     UserDefaults.standard.set(true,forKey:"captureEnabled")
                 }
             case "bridge_record_track":
-                controller.observeTrack(arguments["playing"] as? Bool == false ? nil : track(arguments),leaseSeconds:10)
+                controller.observeTrack(arguments["playing"] as? Bool == false ? nil : track(arguments),leaseSeconds:10,
+                                        capture:arguments["capture"] as? Bool ?? true)
             case "bridge_record_stop":
                 operationGeneration += 1; busy = false
                 controller.stopRecording(); usesTrackMetadata = false

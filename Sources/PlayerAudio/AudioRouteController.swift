@@ -16,6 +16,7 @@ public struct RouteSnapshot {
     public var detail = "Start Spotify manually, select wired headphones, then test routing."
     public var stats = RouteStats()
     public var format = ""
+    public var outputUID = ""
     public var events: [String] = []
     public var recording = RecordingSnapshot()
     public var isBusy: Bool { [.preparing, .starting, .running, .stopping].contains(phase) }
@@ -46,21 +47,25 @@ public final class AudioRouteController {
             guard session == nil else { return }
             routeID = UUID()
             do {
-                guard let output = try OutputDevice.discover().first(where: { $0.uid == outputUID }) else {
+                guard let output = try OutputDevice.find(uid:outputUID) else {
                     throw AudioFailure("The selected output is no longer available. Reconnect it and select it again.")
                 }
                 let sources = try SourceResolver.spotify()
-                guard sources.contains(where: \.isPlaying) else {
+                let endpoint = outputUID == AudioBridgeEndpoint.uid
+                guard endpoint ? !sources.isEmpty : sources.contains(where: \.isPlaying) else {
                     throw AudioFailure("No local Spotify audio is playing. Play a track in the Spotify desktop app on this Mac, then try again.")
                 }
                 event("Preparing \(output.name), \(Int(output.sampleRate)) Hz; \(sources.count) Spotify process objects")
                 snapshot.stats = RouteStats()
+                snapshot.outputUID = outputUID
                 let probe = ProcessTapSession(output: output, sources: sources)
                 session = probe
-                snapshot.phase = .preparing
-                snapshot.detail = "Allow system audio recording if macOS asks. Checking for Spotify samples; ordinary playback remains on."
+                snapshot.phase = endpoint ? .starting : .preparing
+                snapshot.detail = endpoint
+                    ? "Connecting Spotify privately to Audio Bridge. Allow system audio recording if macOS asks."
+                    : "Allow system audio recording if macOS asks. Checking for Spotify samples; ordinary playback remains on."
                 publish()
-                try probe.start(probe: true, gain: gain, progress: preparationProgress)
+                try probe.start(probe: !endpoint, gain: endpoint ? 1 : gain, progress: preparationProgress)
                 snapshot.format = probe.formatDescription
                 began = Date(); lastAdvance = began; lastSignal = began
                 previousCallbacks = 0; previousNonzero = 0; tickCount = 0
@@ -126,7 +131,10 @@ public final class AudioRouteController {
         recorder.stop(reason: reason)
     }
     public func setGain(_ value: Float) {
-        queue.async { [self] in gain = value; session?.setGain(value) }
+        queue.async { [self] in
+            gain = value
+            if session?.output.uid != AudioBridgeEndpoint.uid { session?.setGain(value) }
+        }
     }
 
     private func tick() {
@@ -160,10 +168,12 @@ public final class AudioRouteController {
                 return
             }
         } else if snapshot.phase == .starting {
-            if stats.callbacks > 8 && stats.nonzeroFrames > 512 {
+            if stats.callbacks > 8 && (session.output.uid == AudioBridgeEndpoint.uid || stats.nonzeroFrames > 512) {
                 snapshot.phase = .running
-                snapshot.detail = "Captured samples are advancing. Verify one audible Spotify path and that other apps are excluded."
-                event("Routing active; callbacks and nonzero samples confirmed")
+                snapshot.detail = session.output.uid == AudioBridgeEndpoint.uid
+                    ? "Spotify is routed to Audio Bridge. System output and listening are independent."
+                    : "Captured samples are advancing. Verify one audible Spotify path and that other apps are excluded."
+                event(session.output.uid == AudioBridgeEndpoint.uid ? "Private endpoint route active; callbacks confirmed" : "Routing active; callbacks and nonzero samples confirmed")
             } else if Date().timeIntervalSince(began) > 8 {
                 fail("The muted route did not produce healthy audio. Normal Spotify output may resume.")
                 return
@@ -175,7 +185,7 @@ public final class AudioRouteController {
             }
             snapshot.detail = Date().timeIntervalSince(lastSignal) > 5
                 ? "No recent signal. Spotify may be paused or playing elsewhere; capture is not evidence of local playback."
-                : "Spotify signal detected. Local volume affects only the routed output."
+                : (session.output.uid == AudioBridgeEndpoint.uid ? "Spotify is feeding Audio Bridge at unity gain." : "Spotify signal detected. Local volume affects only the routed output.")
         }
         tickCount += 1
         if tickCount % 8 == 0 { revalidate() }
@@ -202,7 +212,7 @@ public final class AudioRouteController {
     private func revalidate() {
         guard let session, snapshot.phase != .stopping else { return }
         do {
-            guard let current = try OutputDevice.discover().first(where: { $0.uid == session.output.uid }),
+            guard let current = try OutputDevice.find(uid:session.output.uid),
                   current == session.output else {
                 outputLost()
                 return

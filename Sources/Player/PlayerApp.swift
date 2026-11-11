@@ -15,6 +15,7 @@ import SpotifyKit
     }
     let spotify = SpotifyPlaybackModel()
     let bridge = AudioBridgeModel()
+    let playlistRecording: PlaylistRecordingModel
     @Published var bridgeRecordingActive = false
     let audioPath = "bridge"
     let controller = AudioRouteController()
@@ -22,23 +23,35 @@ import SpotifyKit
     private var observers: [NSObjectProtocol] = []
 
     init() {
+        let folder = UserDefaults.standard.string(forKey:"debugOutputDirectory") ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/Audio").path
+        playlistRecording = PlaylistRecordingModel(spotify:spotify,bridge:bridge,directory:URL(fileURLWithPath:folder,isDirectory:true))
+        playlistRecording.prepareSource = { [weak self] in
+            guard let self else { throw ControlError.message("Player is shutting down.") }
+            try await self.prepareEndpointRoute()
+        }
         controller.onChange = { [weak self] state in
             self?.route = state
             guard let self else { return }
             self.spotify.recordingEnabled = state.recording.enabled || self.bridge.recordingEnabled
+            self.playlistRecording.sourceChanged(ready:state.phase == .running && state.outputUID == AudioBridgeEndpoint.uid)
         }
         bridge.onRecordingChange = { [weak self] in
             guard let self else { return }
             self.spotify.recordingEnabled = self.route.recording.enabled || self.bridge.recordingEnabled
             self.bridgeRecordingActive = self.bridge.recordingEnabled
+            self.playlistRecording.bridgeChanged()
         }
         spotify.onPlaybackChanged = { [weak self] in
             guard let self else { return }
             self.controller.observeRecordingTrack(self.recordingTrack)
-            self.bridge.observe(self.recordingTrack)
+            self.playlistRecording.playbackChanged(self.recordingTrack)
+        }
+        spotify.onManualCommand = { [weak self] in
+            guard let self, self.playlistRecording.running else { return }
+            self.playlistRecording.stop(reason:"Automatic recovery stopped after a manual playback command.")
         }
         spotify.onRemotePlayback = { [weak self] in
-            guard let self, self.route.isBusy else { return }
+            guard let self, self.route.isBusy, self.route.outputUID != AudioBridgeEndpoint.uid else { return }
             self.controller.stop(reason: "Playback is on another Spotify device. Local routing stopped.")
         }
         controller.onOutputLoss = { [weak self] completion in
@@ -73,12 +86,13 @@ import SpotifyKit
         case "player_status":
             return ["ok": true, "phase": route.phase.rawValue, "busy": route.isBusy,
                     "detail": route.detail, "format": route.format,
-                    "selectedOutputUID": selectedUID, "gain": gain,
+                    "selectedOutputUID": selectedUID, "gain": gain, "sourceOutputUID":route.outputUID, "sourceReady":endpointReady,
                     "sourceSummary": sourceSummary, "discoveryError": discoveryError,
                     "stats": ["callbacks": route.stats.callbacks, "frames": route.stats.frames,
                               "nonzeroFrames": route.stats.nonzeroFrames, "invalidBuffers": route.stats.invalidBuffers,
                               "peak": route.stats.peak],
                     "spotify": spotify.status, "audioPath":audioPath, "bridge":bridge.status,
+                    "playlistRecovery":playlistRecording.status,
                     "recording": ["enabled": route.recording.enabled, "finishing": route.recording.finishing,
                                   "file": route.recording.file, "savedFiles": route.recording.savedFiles,
                                   "frames": route.recording.frames, "detail": route.recording.detail,
@@ -94,7 +108,10 @@ import SpotifyKit
         case "player_logs": return ["ok": true, "events": route.events, "spotifyEvents": spotify.events, "latestError": discoveryError,
                                      "routeDetail": route.detail]
         case "player_start":
-            if audioPath == "bridge" { return ["ok":false,"error":"Audio Bridge mode is selected. Use bridge_start and bridge_monitor; use bridge_use_default only when explicitly routing Mac audio to the endpoint."] }
+            if audioPath == "bridge" {
+                enableEndpointRoute()
+                return ["ok":true,"accepted":true,"message":"Spotify-only routing to Audio Bridge requested. Inspect sourceReady and phase; the Mac's default output is unchanged."]
+            }
             guard !route.isBusy else { return ["ok": false, "error": "A route is already active or preparing. Stop it first."] }
             refresh()
             guard let uid = arguments["outputUID"] as? String,
@@ -105,7 +122,8 @@ import SpotifyKit
             start()
             return ["ok": true, "accepted": true, "message": "Start requested. Poll player_status; acceptance does not imply audio is routing."]
         case "player_stop":
-            if audioPath == "bridge" { bridge.command("bridge_stop") } else { controller.stop() }
+            if playlistRecording.running || bridge.recordingEnabled { playlistRecording.stop() }
+            if audioPath == "bridge" { controller.stop(); bridge.command("bridge_stop") } else { controller.stop() }
             return ["ok": true, "accepted": true, "message": "Stop requested. Poll player_status for teardown completion."]
         case "player_volume":
             guard let value = arguments["gain"] as? Double, value.isFinite, (0...1).contains(value) else {
@@ -114,10 +132,26 @@ import SpotifyKit
             gain = value
             if audioPath == "bridge" { bridge.command("bridge_gain",["gain":value]) }
             return ["ok": true, "gain": gain]
+        case "player_recordings":
+            let offset = max(0,arguments["offset"] as? Int ?? 0)
+            let limit = max(1,min(20,arguments["limit"] as? Int ?? 20))
+            if arguments["refresh"] as? Bool == true { Task { try? await playlistRecording.refreshCatalog() } }
+            return playlistRecording.catalogPage(offset:offset,limit:limit)
+        case "player_record_resume":
+            guard !playlistRecording.running, !bridge.recordingEnabled, !bridge.busy, spotify.canControl,
+                  bridge.installed else {
+                return ["ok":false,"error":"Enable Audio Bridge, connect Spotify on this Mac, and stop any current recording first."]
+            }
+            let input = arguments["playlist"] as? String ?? spotify.playback?.context?.uri ?? UserDefaults.standard.string(forKey:"lastRecordingPlaylist") ?? ""
+            guard let uri = try? SpotifyPlaylist.uri(input) else { return ["ok":false,"error":"Provide a Spotify playlist link or play a playlist first."] }
+            playlistRecording.start(playlist:uri)
+            return ["ok":true,"accepted":true,"message":"Recovery requested. Inspect player_status.playlistRecovery."]
         case "player_record_start":
+            guard !playlistRecording.running else { return ["ok":false,"error":"Playlist recovery is already active."] }
             if audioPath == "bridge" {
-                bridge.record(directory:debugOutputDirectory,track:recordingTrack)
-                return ["ok":true,"accepted":true,"message":"Endpoint WAV recording requested. Inspect player_status.bridge.recording."]
+                playlistRecording.playbackChanged(recordingTrack)
+                playlistRecording.startManualRecording()
+                return ["ok":true,"accepted":true,"message":"Spotify-only endpoint WAV recording requested. Inspect sourceReady and bridge.recording."]
             }
             guard route.phase == .running, recordingTrack != nil,
                   !route.recording.enabled, !route.recording.finishing else {
@@ -127,6 +161,7 @@ import SpotifyKit
             return ["ok": true, "accepted": true, "directory": debugOutputDirectory.path,
                     "message": "Recording requested. Poll player_status.recording for file creation or errors."]
         case "player_record_stop":
+            if playlistRecording.running { playlistRecording.stop(); return ["ok":true,"accepted":true] }
             if audioPath == "bridge" { bridge.command("bridge_record_stop") } else { controller.stopRecording() }
             return ["ok": true, "accepted": true, "message": "Finalization requested. Poll until recording.enabled and recording.finishing are false."]
         case "player_login":
@@ -182,6 +217,38 @@ import SpotifyKit
             discoveryError = ""
         } catch { discoveryError = error.localizedDescription }
     }
+    var listeningOutputUID: String? {
+        let current = bridge.status["defaultOutput"] as? String
+        if let current, outputs.contains(where:{ $0.uid == current }) { return current }
+        return outputs.contains(where:{ $0.uid == selectedUID }) ? selectedUID : nil
+    }
+    var endpointReady: Bool { route.phase == .running && route.outputUID == AudioBridgeEndpoint.uid }
+    func prepareEndpointRoute() async throws {
+        try await bridge.perform("bridge_start")
+        guard bridge.status["defaultOutput"] as? String != AudioBridgeEndpoint.uid else {
+            throw ControlError.message("Choose speakers or headphones as the Mac's output. Player routes Spotify to Audio Bridge separately, keeping other apps out of its WAVs.")
+        }
+        if endpointReady { return }
+        guard !route.isBusy else { throw ControlError.message("Wait for the current audio route to finish.") }
+        controller.start(outputUID:AudioBridgeEndpoint.uid)
+        // Core Audio setup and TCC stay on the existing lifecycle queue; the UI
+        // observes progress and remains responsive while this request waits.
+        do {
+            for attempt in 0..<200 {
+                try Task.checkCancellation()
+                if endpointReady { return }
+                if attempt > 0 && route.phase == .failed { throw ControlError.message(route.detail) }
+                try await Task.sleep(for:.milliseconds(100))
+            }
+            throw ControlError.message("Spotify routing is not ready. Check Player's system audio recording permission.")
+        } catch { controller.stop(reason:"Spotify endpoint setup cancelled or failed."); throw error }
+    }
+    func enableEndpointRoute() {
+        Task {
+            do { try await prepareEndpointRoute() }
+            catch { discoveryError = error.localizedDescription }
+        }
+    }
     func start() {
         if spotify.connected && !spotify.isLocalPlayback {
             discoveryError = "Identify Spotify on this Mac and transfer playback here before routing."
@@ -202,7 +269,8 @@ import SpotifyKit
               let item = playback.item, let id = item.id,
               playback.currently_playing_type == "track" else { return nil }
         return RecordingTrack(id: id, album: item.album?.name ?? "Unknown album", artist: item.subtitle,
-                              name: item.name, positionSeconds: spotify.progress(at: Date()))
+                              name: item.name, positionSeconds: spotify.progress(at: Date()),
+                              expectedDurationSeconds:Double(item.duration_ms)/1000)
     }
     func startRecording() {
         guard let track = recordingTrack else { return }
@@ -291,7 +359,7 @@ private var architecture: String {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("Recording") {
-                Button("Stop recording") { model.bridge.command("bridge_record_stop") }.keyboardShortcut(".", modifiers: .command)
+                Button("Stop recording") { model.playlistRecording.stop() }.keyboardShortcut(".", modifiers: .command)
                 Button("Open recording folder") { NSWorkspace.shared.open(model.debugOutputDirectory) }
             }
         }

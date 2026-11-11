@@ -88,15 +88,23 @@ pub(crate) fn apply(plan: &mut TacticPlan, f: &CandidateFacts) -> Result<bool> {
         if f.a.vocal_phrases.is_some() && f.b.vocal_phrases.is_some() {
             return Ok(false);
         }
-        let minimum = match plan.tactic_id {
-            TacticId::M01 | TacticId::M02 => plan.hold_end_frame,
-            _ => plan.bar_frames[(plan.bar_frames.len() - 1).min(4)],
+        let minimum = if plan.phrase_exit.is_some() {
+            plan.hold_end_frame
+        } else {
+            match plan.tactic_id {
+                TacticId::M01 | TacticId::M02 => plan.hold_end_frame,
+                _ => plan.bar_frames[(plan.bar_frames.len() - 1).min(4)],
+            }
         };
         let ramp = (u64::from(f.output_sample_rate_hz) / 200).max(1);
         let mut alternatives = vec![];
         for &[a, b] in a {
             let first = (minimum + ramp).min(end).max(a + half);
-            let last = end.min(b.saturating_sub(half));
+            let last = plan
+                .phrase_exit
+                .as_ref()
+                .map_or(end, |e| e.end_frame)
+                .min(b.saturating_sub(half));
             if first <= last {
                 alternatives.push(first);
                 if first != last {

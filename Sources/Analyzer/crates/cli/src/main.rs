@@ -2,6 +2,7 @@ mod chain;
 mod measured_beam;
 mod tactic_analysis;
 mod tactics;
+mod timetable;
 
 use clap::{Parser, Subcommand};
 use mixlib_catalog::*;
@@ -50,6 +51,9 @@ enum Command {
     },
     /// Cache full-track stems, vocal phrases and signal evidence for tactic selection.
     AnalyzeTactics {
+        /// Automatically prepare N new tracks with connections into the prepared pool.
+        #[arg(long, conflicts_with="track", value_parser=clap::value_parser!(u16).range(1..=128))]
+        expand_pool: Option<u16>,
         #[arg(long)]
         track: Vec<String>,
         #[arg(long, env = "MIXLIB_SEPARATOR_PYTHON")]
@@ -91,6 +95,15 @@ enum Command {
         overwrite: bool,
     },
     Render {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Export the saved timetable, measured matching evidence and full-set comparisons.
+    Timetable {
         #[arg(long)]
         plan: String,
         #[arg(long)]
@@ -280,6 +293,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             | Command::FuseSidecars
             | Command::Correct { .. }
             | Command::Render { .. }
+            | Command::Timetable { .. }
             | Command::Preview { .. }
             | Command::Play { .. }
     );
@@ -313,14 +327,21 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             &store, *resume, *dsp_only, track, cancel,
         )?)?,
         Command::AnalyzeTactics {
+            expand_pool,
             track,
             separator_python,
-        } => serde_json::to_value(tactic_analysis::ensure_tactic_analysis(
-            &store,
-            track,
-            separator_python,
-            cancel,
-        )?)?,
+        } => {
+            if let Some(count) = expand_pool {
+                tactic_analysis::expand_pool(&store, usize::from(*count), separator_python, cancel)?
+            } else {
+                serde_json::to_value(tactic_analysis::ensure_tactic_analysis(
+                    &store,
+                    track,
+                    separator_python,
+                    cancel,
+                )?)?
+            }
+        }
         Command::Inspect { track, bars } => {
             if let Some(id) = track {
                 let t = store.track(id)?;
@@ -394,9 +415,25 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             let p = load_plan(&store, plan)?;
             let sources = verify_plan(&store, &p, cancel)?;
             protect_output(&store, output)?;
-            let r = mixlib_audio::render(&p, &sources, output, *overwrite, None, cancel)?;
+            let table_path = timetable::sidecar(output);
+            timetable::preflight(&store, &table_path, *overwrite)?;
+            let (evidence, markdown) = timetable::build(&store, &p, cancel)?;
+            let mut r = mixlib_audio::render(&p, &sources, output, *overwrite, None, cancel)?;
+            timetable::write(&table_path, &markdown, *overwrite)?;
+            r.header.extensions.insert("timetable".into(), evidence);
             store.report(&r)?;
             serde_json::to_value(r)?
+        }
+        Command::Timetable {
+            plan,
+            output,
+            overwrite,
+        } => {
+            timetable::preflight(&store, output, *overwrite)?;
+            let p = load_plan(&store, plan)?;
+            let (data, markdown) = timetable::build(&store, &p, cancel)?;
+            timetable::write(output, &markdown, *overwrite)?;
+            serde_json::json!({"output":output,"timetable":data})
         }
         Command::Tactics {
             plan,
@@ -737,10 +774,17 @@ fn render_stitch(
 ) -> Result<serde_json::Value> {
     tactics::automatic(store, &mut plan, cancel)?;
     let sources = verify_plan(store, &plan, cancel)?;
+    let table_path = timetable::sidecar(output);
+    timetable::preflight(store, &table_path, overwrite)?;
+    let (evidence, markdown) = timetable::build(store, &plan, cancel)?;
+    plan.header.extensions.insert("timetable".into(), evidence);
     let report = mixlib_audio::render(&plan, &sources, output, overwrite, None, cancel)?;
+    timetable::write(&table_path, &markdown, overwrite)?;
     store.write(&format!("plans/{}.json", plan.plan_id), &plan)?;
     store.report(&report)?;
-    Ok(serde_json::json!({"output": output, "plan": plan, "report": report}))
+    Ok(
+        serde_json::json!({"output": output, "timetable":table_path, "plan": plan, "report": report}),
+    )
 }
 
 fn prepare_drum_clip(

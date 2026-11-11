@@ -306,7 +306,8 @@ pub fn quiet_linger_candidates(
             let extra = if legacy_break {
                 0.
             } else {
-                if b.end + (CHAIN_SOLO_SECONDS + 16) * u64::from(to.track.format.sample_rate_hz)
+                if TrackPacing::from_features(&to.beats, &incoming.frames).earliest_exit(b.end)
+                    + 16 * u64::from(to.track.format.sample_rate_hz)
                     > to.track.format.frames
                 {
                     continue;
@@ -480,6 +481,16 @@ pub fn tactic_stitch_candidates(
     };
     let av = cached(&a)?;
     let bv = cached(&b)?;
+    let return_frames = |r: Option<&TacticTrackAnalysis>| -> BTreeSet<u64> {
+        r.map(crate::transition_endpoints::arrivals)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.frame)
+            .collect()
+    };
+    let a_returns = return_frames(av.as_ref());
+    let b_returns = return_frames(bv.as_ref());
+
     let quiet = |record: Option<&TacticTrackAnalysis>| {
         record
             .and_then(|r| {
@@ -544,6 +555,7 @@ pub fn tactic_stitch_candidates(
         .collect();
     let per_length = (limit / lengths.len().max(1)).max(1);
     let mut choices = Vec::new();
+    let mut return_choices = Vec::new();
     // Include short exits and long holds in each evidenced common meter.
     for overlap in lengths {
         let outgoing = passages_for_clock(
@@ -615,6 +627,12 @@ pub fn tactic_stitch_candidates(
             ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
             // Give distinct parts of both recordings a turn before keeping
             // several nearly interchangeable variants of the same cues.
+            // Keep the best measured return alongside ordinary cue ranking.
+            // Otherwise a slightly cheaper interior beat can consume the quota.
+            let return_choice = ranked
+                .iter()
+                .find(|(_, a, b, _)| a_returns.contains(a) || b_returns.contains(b))
+                .copied();
             let mut regions = BTreeSet::new();
             let (distinct, nearby): (Vec<_>, Vec<_>) =
                 ranked.into_iter().partition(|&(_, a_frame, b_frame, _)| {
@@ -624,6 +642,9 @@ pub fn tactic_stitch_candidates(
                     ))
                 });
             let mut selected: Vec<(u64, u64)> = Vec::new();
+            if let Some((cost, outgoing, incoming, meter)) = return_choice {
+                return_choices.push((overlap, cost, outgoing, incoming, meter, incoming_overlap));
+            }
             for (cost, outgoing, incoming, meter) in distinct.into_iter().chain(nearby) {
                 let separation = u64::from(a.track.format.sample_rate_hz) * 2;
                 if selected.iter().any(|&(x, y)| {
@@ -658,6 +679,9 @@ pub fn tactic_stitch_candidates(
             break;
         }
     }
+    // Return probes have their own small quota. They must not evict the
+    // ordinary entries from which long dense continuations were discovered.
+    let return_keys = append_return_probes(&mut choices, return_choices, (limit / 3).max(1));
     let mut result = Vec::new();
     for (overlap, _, outgoing, incoming, _, incoming_overlap) in choices {
         let pinned = StitchRequest {
@@ -692,7 +716,7 @@ pub fn tactic_stitch_candidates(
         plan.header.extensions.insert("tactic_cue_candidate".into(),serde_json::json!({
             "outgoing_source_frame":outgoing,"incoming_source_frame":incoming,"overlap_beats":overlap,
             "incoming_overlap_beats":incoming_overlap,"pulse_ratio":incoming_overlap as f64/overlap as f64,
-            "timing_basis":"bars"
+            "timing_basis":"bars", "entry_return_probe":return_keys.contains(&(overlap,outgoing,incoming,incoming_overlap))
         }));
         result.push(plan);
     }
@@ -720,8 +744,17 @@ pub fn tactic_stitch_candidates(
         )?);
     }
     alternative.truncate(limit);
+    let (returns, mut result): (Vec<_>, Vec<_>) = result.into_iter().partition(|p| {
+        p.header
+            .extensions
+            .get("tactic_cue_candidate")
+            .and_then(|v| v.get("entry_return_probe"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
     result.truncate(limit.saturating_sub(alternative.len()));
     result.extend(alternative);
+    result.extend(returns);
     Ok(result)
 }
 
@@ -813,6 +846,16 @@ pub fn tactic_continuations(
     }
     endpoints.sort_by_key(|(counts, _, _)| counts[0]);
     endpoints.dedup_by_key(|(counts, _, _)| *counts);
+    // Probe both the nearest musical change and the longest feasible horizon.
+    let mut pending: std::collections::VecDeque<_> = endpoints.into();
+    let mut endpoints = vec![];
+    while let Some(first) = pending.pop_front() {
+        endpoints.push(first);
+        if let Some(last) = pending.pop_back() {
+            endpoints.push(last);
+        }
+    }
+
     let mut result = vec![];
     for (counts, side, endpoint) in endpoints {
         cancel.check()?;
@@ -862,6 +905,24 @@ pub fn tactic_continuations(
         }
     }
     Ok(result)
+}
+
+fn append_return_probes(
+    choices: &mut Vec<TacticCueChoice>,
+    mut return_choices: Vec<TacticCueChoice>,
+    limit: usize,
+) -> BTreeSet<(usize, u64, u64, usize)> {
+    return_choices.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let key = |c: &TacticCueChoice| (c.0, c.2, c.3, c.5);
+    let existing: BTreeSet<_> = choices.iter().map(key).collect();
+    let returns: Vec<_> = distribute_tactic_durations(return_choices)
+        .into_iter()
+        .filter(|c| !existing.contains(&key(c)))
+        .take(limit)
+        .collect();
+    let return_keys: BTreeSet<_> = returns.iter().map(key).collect();
+    choices.extend(returns);
+    return_keys
 }
 
 fn distribute_tactic_durations(choices: Vec<TacticCueChoice>) -> Vec<TacticCueChoice> {
@@ -1704,13 +1765,12 @@ pub fn automatic_cues(
     Ok(candidates)
 }
 
-/// Minimum solo source time between two joins on a middle track.
-pub const CHAIN_SOLO_SECONDS: u64 = 45;
-
 #[derive(Debug)]
 pub struct ChainPick {
     pub analyzed_tracks: usize,
     pub orders: Vec<Vec<String>>,
+    /// Basic-analysis shortlist only; stem/vocal admission still required.
+    pub preparation_candidates: Vec<serde_json::Value>,
 }
 
 struct PoolWindow {
@@ -1803,6 +1863,20 @@ struct PoolEdge {
 
 /// Search the analyzed pool for ordered chains with compatible joins.
 /// The actual stitch selector can use a richer transition at any of those joins.
+fn preparation_bridge_cost(
+    incoming: &PoolEdge,
+    outgoing: &PoolEdge,
+    pacing: &TrackPacing,
+) -> Option<f64> {
+    let decision = pacing.assess(incoming.entry_end, outgoing.exit)?;
+    Some(
+        incoming.score
+            + outgoing.score
+            + 0.75 * incoming.score.max(outgoing.score)
+            + 0.005 * decision.penalty_quality_seconds,
+    )
+}
+
 pub fn pick_four_tracks(
     store: &Store,
     policy: &MixingConfig,
@@ -1880,6 +1954,11 @@ fn pick_tracks_in_pool(
         .iter()
         .map(|track| ReturnFeatures::read(store, track, cancel))
         .collect::<Result<Vec<_>>>()?;
+    let pacing: Vec<_> = pool
+        .iter()
+        .zip(&features)
+        .map(|(t, f)| TrackPacing::from_features(&t.beats, &f.frames))
+        .collect();
     let count = pool.len();
     let evidence = pool
         .iter()
@@ -1967,6 +2046,49 @@ fn pick_tracks_in_pool(
         }
     }
 
+    // Rank new material by a feasible entrance AND later exit to different
+    // prepared tracks. The same solo runway as the measured search applies.
+    // These inexpensive connections nominate analysis, never admit a tactic.
+    let mut preparation = Vec::new();
+    for target in 0..count {
+        if evidence[target].is_some() {
+            continue;
+        }
+        let mut best: Option<(f64, usize, usize)> = None;
+        for from in 0..count {
+            if evidence[from].is_none() {
+                continue;
+            }
+            for (to, prepared) in evidence.iter().enumerate() {
+                if from == to || prepared.is_none() {
+                    continue;
+                }
+                for incoming in &edges[from][target] {
+                    for outgoing in &edges[target][to] {
+                        let Some(cost) =
+                            preparation_bridge_cost(incoming, outgoing, &pacing[target])
+                        else {
+                            continue;
+                        };
+                        if best.is_none_or(|old| cost < old.0) {
+                            best = Some((cost, from, to));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((cost, from, to)) = best {
+            preparation.push((cost, target, from, to));
+        }
+    }
+    preparation.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let preparation_candidates = preparation.into_iter().map(|(cost, target, from, to)| {
+        serde_json::json!({"track_id":pool[target].track.track_id,
+            "basic_connection_cost":cost,"incoming_from":pool[from].track.track_id,
+            "outgoing_to":pool[to].track.track_id,"pacing":"phrase-pacing/1",
+            "basis":"basic timing, harmony, texture and source runway; pending stem/vocal admission"})
+    }).collect();
+
     struct Route {
         tracks: Vec<usize>,
         entry_end: u64,
@@ -1988,8 +2110,7 @@ fn pick_tracks_in_pool(
             let earliest = if route.tracks.len() == 1 {
                 0
             } else {
-                route.entry_end
-                    + CHAIN_SOLO_SECONDS * u64::from(pool[from].track.format.sample_rate_hz)
+                pacing[from].earliest_exit(route.entry_end)
             };
             for to in 0..count {
                 cancel.check()?;
@@ -2039,6 +2160,7 @@ fn pick_tracks_in_pool(
     Ok(ChainPick {
         analyzed_tracks: count,
         orders,
+        preparation_candidates,
     })
 }
 
@@ -2730,6 +2852,46 @@ fn build_stitch_from_tracks(
 #[cfg(test)]
 mod mashup_tests {
     use super::*;
+
+    #[test]
+    fn preparation_requires_a_later_exit_after_the_same_solo_runway() {
+        let incoming = PoolEdge {
+            exit: 0,
+            entry_end: 136,
+            score: 0.01,
+        };
+        let early = PoolEdge {
+            exit: 159,
+            entry_end: 0,
+            score: 0.001,
+        };
+        let later = PoolEdge {
+            exit: 182,
+            entry_end: 0,
+            score: 0.05,
+        };
+        assert!(preparation_bridge_cost(&incoming, &early, &TrackPacing::unknown(1)).is_none());
+        assert!(preparation_bridge_cost(&incoming, &later, &TrackPacing::unknown(1)).is_some());
+    }
+
+    #[test]
+    fn return_probe_quota_never_evicts_existing_dense_entries() {
+        let original = vec![(32, 0.1, 100, 200, 4, 32), (64, 0.2, 100, 200, 4, 64)];
+        let mut choices = original.clone();
+        let keys = append_return_probes(
+            &mut choices,
+            vec![
+                original[0],
+                (16, 0.3, 300, 400, 4, 16),
+                (32, 0.4, 300, 400, 4, 32),
+            ],
+            1,
+        );
+        assert_eq!(&choices[..2], original.as_slice());
+        assert_eq!(choices.len(), 3);
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&(16, 300, 400, 16)));
+    }
 
     #[test]
     fn beat_change_after_handoff_does_not_invalidate_synchronized_overlap() {

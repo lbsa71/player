@@ -123,6 +123,19 @@ pub(crate) fn apply_cached_tactic_facts(
         }
     }
     apply_events(record, p, anchors, facts);
+    let source_start = p.time_map.source_at(anchors[0] as f64).round() as u64;
+    if crate::transition_endpoints::arrivals(record)
+        .iter()
+        .any(|e| {
+            e.frame.abs_diff(source_start) <= u64::from(record.source_sample_rate_hz) * 8 / 100
+        })
+    {
+        facts.roles.insert(TacticRole::DrumReturn, 1.);
+        facts.arrival_frame = Some(anchors[0]);
+        facts
+            .evidence
+            .push("entry coincides with a measured sustained drum return".into());
+    }
     let end_source = p
         .time_map
         .source_at(*anchors.last().unwrap() as f64)
@@ -140,6 +153,7 @@ pub(crate) fn apply_cached_tactic_facts(
             .iter()
             .map(|r| format!("measured transition endpoint: {r}")),
     );
+    facts.phrase_exit = crate::phrase_exit::measure(store, record, p, anchors, facts, cancel)?;
     apply_motif(record, p, anchors, facts);
     apply_loops(record, p, anchors, facts);
     Ok(())
@@ -786,7 +800,8 @@ fn apply_events(
                             && release >= source_start
                     })
             {
-                let output = if release == source_start {
+                let release = crate::transition_endpoints::build_release(record, source, release);
+                let output = if release <= source_start {
                     start
                 } else if release > source_end {
                     end.saturating_add(1)

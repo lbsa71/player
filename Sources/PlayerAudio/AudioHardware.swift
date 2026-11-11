@@ -70,20 +70,32 @@ public struct OutputDevice: Identifiable, Equatable {
         return try HAL.string(id, kAudioDevicePropertyDeviceUID)
     }
 
+    /// Explicit lookup may return a virtual endpoint. `discover()` deliberately
+    /// remains limited to physical monitoring destinations.
+    public static func find(uid: String) throws -> OutputDevice? {
+        guard let id = try HAL.ids(HAL.system, kAudioHardwarePropertyDevices).first(where: {
+            try HAL.string($0, kAudioDevicePropertyDeviceUID) == uid
+        }) else { return nil }
+        return try describe(id)
+    }
+    private static func describe(_ id: AudioObjectID) throws -> OutputDevice? {
+        let outputs = try HAL.formats(id, scope: kAudioObjectPropertyScopeOutput)
+        let channels = outputs.reduce(0) { $0 + Int($1.mChannelsPerFrame) }
+        guard channels > 0 else { return nil }
+        return OutputDevice(objectID: id,
+            uid: try HAL.string(id, kAudioDevicePropertyDeviceUID),
+            name: try HAL.string(id, kAudioObjectPropertyName),
+            sampleRate: try HAL.value(id, kAudioDevicePropertyNominalSampleRate, initial: Double(0)),
+            inputChannels: try HAL.formats(id, scope: kAudioObjectPropertyScopeInput).reduce(0) { $0 + Int($1.mChannelsPerFrame) },
+            outputChannels: channels,
+            transport: try HAL.value(id, kAudioDevicePropertyTransportType, initial: UInt32(0)))
+    }
     public static func discover() throws -> [OutputDevice] {
         try HAL.ids(HAL.system, kAudioHardwarePropertyDevices).compactMap { id in
-            let outputs = try HAL.formats(id, scope: kAudioObjectPropertyScopeOutput)
-            let channels = outputs.reduce(0) { $0 + Int($1.mChannelsPerFrame) }
-            guard channels > 0 else { return nil }
-            let transport = try HAL.value(id, kAudioDevicePropertyTransportType, initial: UInt32(0))
-            guard transport != kAudioDeviceTransportTypeAggregate,
-                  transport != kAudioDeviceTransportTypeVirtual else { return nil }
-            return OutputDevice(objectID: id,
-                uid: try HAL.string(id, kAudioDevicePropertyDeviceUID),
-                name: try HAL.string(id, kAudioObjectPropertyName),
-                sampleRate: try HAL.value(id, kAudioDevicePropertyNominalSampleRate, initial: Double(0)),
-                inputChannels: try HAL.formats(id, scope: kAudioObjectPropertyScopeInput).reduce(0) { $0 + Int($1.mChannelsPerFrame) },
-                outputChannels: channels, transport: transport)
+            guard let output = try describe(id),
+                  output.transport != kAudioDeviceTransportTypeAggregate,
+                  output.transport != kAudioDeviceTransportTypeVirtual else { return nil }
+            return output
         }.sorted { $0.name < $1.name }
     }
 }

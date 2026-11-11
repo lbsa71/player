@@ -8,9 +8,12 @@ public struct RecordingTrack: Sendable {
     public let artist: String
     public let name: String
     public let positionSeconds: Double
-    public init(id: String, album: String, artist: String, name: String, positionSeconds: Double) {
+    public let expectedDurationSeconds: Double?
+    public init(id: String, album: String, artist: String, name: String, positionSeconds: Double,
+                expectedDurationSeconds: Double? = nil) {
         self.id = id; self.album = album; self.artist = artist; self.name = name
         self.positionSeconds = positionSeconds
+        self.expectedDurationSeconds = expectedDurationSeconds
     }
 }
 
@@ -39,6 +42,10 @@ final class FloatWAVFile {
     private(set) var frames: UInt64 = 0
     private var checkpointFrames: UInt64 = 0
     private(set) var lastURL: URL
+    private var expectedDurationSeconds: Double?
+    private var observedEndPositionSeconds: Double
+    private var observationFrames: UInt64 = 0
+    private var coverageContinuous = true
 
     static func filenameBase(_ track: RecordingTrack) -> String {
         func clean(_ value: String) -> String {
@@ -56,8 +63,14 @@ final class FloatWAVFile {
         guard sampleRate.isFinite, (8000...384000).contains(sampleRate), sampleRate.rounded() == sampleRate else {
             throw AudioFailure("WAV recording requires an integer sample rate between 8 and 384 kHz.")
         }
+        guard track.positionSeconds.isFinite, track.positionSeconds >= 0,
+              track.expectedDurationSeconds.map({ $0.isFinite && $0 > 0 }) ?? true else {
+            throw AudioFailure("Recording positions and expected durations must be valid finite values.")
+        }
         self.directory = directory; self.track = track; rate = UInt32(sampleRate)
         self.captureDescription = captureDescription
+        expectedDurationSeconds = track.expectedDurationSeconds
+        observedEndPositionSeconds = track.positionSeconds
         base = Self.filenameBase(track)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let available = try FileManager.default.attributesOfFileSystem(forPath: directory.path)[.systemFreeSize] as? NSNumber
@@ -109,6 +122,30 @@ final class FloatWAVFile {
         try handle.write(contentsOf: Self.header(rate: rate, frames: frames))
         try handle.seek(toOffset: 58 + frames * 8)
     }
+    // Observations are evidence, not a claim of sample-accurate boundaries.
+    // Compare progress against captured frames both incrementally and from the
+    // segment start so seeks and accumulating gaps cannot look like coverage.
+    func observe(positionSeconds: Double, expectedDurationSeconds duration: Double?) {
+        guard positionSeconds.isFinite, positionSeconds >= 0,
+              duration.map({ $0.isFinite && $0 > 0 }) ?? true else {
+            coverageContinuous = false
+            return
+        }
+        if let duration {
+            if let expectedDurationSeconds, abs(expectedDurationSeconds - duration) > 2 {
+                coverageContinuous = false
+            } else if expectedDurationSeconds == nil { expectedDurationSeconds = duration }
+        }
+        let elapsed = Double(frames - observationFrames) / Double(rate)
+        let progress = positionSeconds - observedEndPositionSeconds
+        let totalElapsed = Double(frames) / Double(rate)
+        if progress < -0.25 || abs(progress - elapsed) > 2 ||
+            abs(positionSeconds - track.positionSeconds - totalElapsed) > 2 {
+            coverageContinuous = false
+        }
+        observedEndPositionSeconds = positionSeconds
+        observationFrames = frames
+    }
     @discardableResult func finish(reason: String, complete: Bool) throws -> URL {
         guard let handle else { return lastURL }
         defer { try? handle.close(); self.handle = nil }
@@ -129,17 +166,21 @@ final class FloatWAVFile {
             }
             guard lastURL != temporaryURL else { throw AudioFailure("Cannot assign a unique WAV filename; the partial file is retained.") }
         }
-        let manifest: [String: Any] = [
+        var manifest: [String: Any] = [
+            "recordingSchemaVersion": 2, "completionPolicy": "observed-v1",
             "trackID": track.id, "album": track.album, "artist": track.artist, "track": track.name,
             "sampleRate": rate, "channels": 2, "encoding": captureDescription,
             "frames": frames, "durationSeconds": Double(frames) / Double(rate),
             "observedStartPositionSeconds": track.positionSeconds,
+            "observedEndPositionSeconds": observedEndPositionSeconds,
+            "coverageContinuous": coverageContinuous && complete && reason == "Observed track change",
             "startedAt": ISO8601DateFormatter().string(from: startedAt),
             "finishedAt": ISO8601DateFormatter().string(from: Date()), "reason": reason,
             "segmentFinalized": complete,
             "boundaryMethod": "Spotify playback observation; approximate, not sample-accurate track boundaries",
             "file": lastURL.lastPathComponent
         ]
+        if let expectedDurationSeconds { manifest["expectedDurationSeconds"] = expectedDurationSeconds }
         let metadataURL = URL(fileURLWithPath: lastURL.path + ".json")
         let metadata = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
         try metadata.write(to: metadataURL, options: .withoutOverwriting)
@@ -186,28 +227,39 @@ final class DebugWAVRecorder {
             return state
         }
     }
-    func observe(_ track: RecordingTrack?) {
+    func observe(_ track: RecordingTrack?, capture: Bool = true) {
         queue.async { [self] in
             guard state.enabled, !stopping else { return }
             do {
+                let keepCapturing = capture && track != nil && file != nil
+                if track == nil || !capture { player_record_stop(renderer) }
                 if let track, track.id == file?.track.id {
+                    try drain(through: player_record_written(renderer))
+                    file?.observe(positionSeconds:track.positionSeconds,expectedDurationSeconds:track.expectedDurationSeconds)
                     let restarted = track.positionSeconds + 2 < (lastPosition ?? track.positionSeconds)
                     lastPosition = track.positionSeconds
-                    if !restarted { return }
+                    if !restarted && capture { return }
                 }
-                if track == nil { player_record_stop(renderer) }
                 try drain(through: player_record_written(renderer))
                 guard player_record_dropped(renderer) == 0 else { throw AudioFailure("Recording buffer overflow or audio-format fault; partial WAV retained.") }
                 if let file {
-                    state.file = try file.finish(reason: track == nil ? "Paused or metadata unavailable" : "Observed track change", complete: true).path
+                    let reason: String
+                    if track == nil { reason = "Paused or metadata unavailable" }
+                    else if !capture && track?.id == file.track.id { reason = "Capture suspended" }
+                    else { reason = "Observed track change" }
+                    state.file = try file.finish(reason: reason, complete: true).path
                     state.savedFiles += 1; self.file = nil
                 }
-                if let track {
+                if let track, capture {
                     file = try FloatWAVFile(directory: directory, track: track, sampleRate: sampleRate, captureDescription: captureDescription)
                     state.file = file!.temporaryURL.path
                     // For a rotation the ring stays enabled, preserving all samples across file I/O.
-                    if !player_record_start(renderer) { /* already active across rotation */ }
+                    if !keepCapturing {
+                        guard player_record_start(renderer) else { throw AudioFailure("The renderer is already recording or is a probe.") }
+                    }
                     state.detail = "Recording rendered audio. Track boundaries are approximate."
+                } else if track != nil {
+                    state.detail = "WAV recording armed; capture suspended for the supplied track."
                 } else { state.detail = "WAV recording armed; waiting for a playing track on this Mac." }
                 lastPosition = track?.positionSeconds
                 state.frames = file?.frames ?? 0

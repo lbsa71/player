@@ -42,15 +42,17 @@ pub(super) fn stitch_chain(
     let mut chain_tactics = Vec::new();
     for (index, names) in tracks.windows(2).enumerate() {
         cancel.check()?;
-        let outgoing_after_frame = chain.as_ref().map_or(0, |p| {
+        let outgoing_after_frame = if let Some(p) = chain.as_ref() {
             let middle = p.placements.last().unwrap();
-            middle
+            let entry_end = middle
                 .time_map
                 .source_at(p.transitions.last().unwrap().end_output_frame as f64)
-                .round() as u64
-                + mixlib_planner::CHAIN_SOLO_SECONDS
-                    * u64::from(middle.time_map.source_sample_rate_hz)
-        });
+                .round() as u64;
+            mixlib_planner::read_track_pacing(store, &middle.track_id, cancel)?
+                .earliest_exit(entry_end)
+        } else {
+            0
+        };
         let request = mixlib_planner::StitchRequest {
             from: names[0],
             to: names[1],
@@ -230,6 +232,8 @@ pub(super) fn extend_measured(
         "choice": pair_tactics[0].tactic_id,
         "score": score,
         "last_resort": last_resort,
+        "dense_quality_seconds": pair.header.extensions.get("dense_quality_seconds").and_then(serde_json::Value::as_f64).unwrap_or(0.),
+        "handoff_quality_seconds": pair.header.extensions.get("handoff_quality_seconds").and_then(serde_json::Value::as_f64).unwrap_or(0.),
     });
     let mut plan = prefix.unwrap_or(pair).clone();
     let mut joins = plan
@@ -448,7 +452,7 @@ pub(super) fn try_quiet_linger(
     python: &Path,
     cancel: &Cancellation,
 ) -> Result<Option<MixPlan>> {
-    let min_tail = next_track.map_or(0, |_| mixlib_planner::CHAIN_SOLO_SECONDS + 16);
+    let min_tail = next_track.map_or(0, |_| 16);
     let candidates =
         mixlib_planner::quiet_linger_candidates(store, request, policy, 3, min_tail, cancel)?;
     if candidates.is_empty() {
@@ -463,10 +467,11 @@ pub(super) fn try_quiet_linger(
         let bars = handoff.vocal_bars.expect("quiet linger has a vocal window");
         if let Some(next_track) = next_track {
             let map = &plan.placements[1].time_map;
-            let after = map
+            let entry_end = map
                 .source_at(*bars.last().expect("vocal window has an end") as f64)
-                .round() as u64
-                + mixlib_planner::CHAIN_SOLO_SECONDS * u64::from(map.source_sample_rate_hz);
+                .round() as u64;
+            let after = mixlib_planner::read_track_pacing(store, request.to, cancel)?
+                .earliest_exit(entry_end);
             let next = mixlib_planner::StitchRequest {
                 from: request.to,
                 to: next_track,

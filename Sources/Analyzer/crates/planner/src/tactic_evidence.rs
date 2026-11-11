@@ -318,6 +318,7 @@ fn candidate_facts_cached(
         ..PairEvidence::default()
     };
     let mut result = CandidateFacts {
+        phrase_exit: None,
         output_sample_rate_hz: plan.output.sample_rate_hz,
         timing_basis,
         bar_frames,
@@ -326,7 +327,16 @@ fn candidate_facts_cached(
         pair,
     };
     if let (Some(a), Some(b)) = (&cached[0], &cached[1]) {
+        result.pair.rhythmic_exit =
+            crate::phrase_exit::rhythmic_exit(store, b, placements[1], &result, cancel)?;
         crate::tactic_pair_evidence::enrich_pair_evidence(a, b, placements, &mut result)?;
+        crate::tactic_pair_evidence::refine_rhythmic_hold(
+            store,
+            [a, b],
+            placements,
+            &mut result,
+            cancel,
+        )?;
         // Assess continuity independently of nonoverlapping gains and bind it
         // to each tactic's actual landing. C01 can land on an earlier attack
         // than a build/drop cut, so one proof cannot promote both locations.
@@ -755,6 +765,7 @@ fn passage_facts(
         stems: None,
         stem_leakage: None,
         endpoint_reasons: vec![],
+        phrase_exit: None,
         stem_assets: vec![],
         loop_candidates: vec![],
         motif: None,

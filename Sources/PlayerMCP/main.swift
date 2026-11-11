@@ -5,10 +5,13 @@ let toolDefinitions: [[String: Any]] = ([
     ["name": "player_status", "description": "Read route state, sample counters, format, source discovery and latest errors."],
     ["name": "player_devices", "description": "List local physical outputs, stable UIDs, formats and prototype support."],
     ["name": "player_logs", "description": "Read the bounded route event log. No audio or credentials appear in logs."],
-    ["name": "player_start", "description": "Start Spotify-only capture on an explicitly selected output UID. May trigger macOS audio permission; returns accepted, then poll status.",
-     "inputSchema": ["type": "object", "properties": ["outputUID": ["type": "string"]], "required": ["outputUID"], "additionalProperties": false]],
+    ["name": "player_start", "description": "Connect Spotify-only audio to Audio Bridge independently of the Mac default output. May trigger system audio permission. Poll sourceReady/phase in player_status; physical listening remains optional."],
     ["name": "player_stop", "description": "Stop capture and restore ordinary Spotify output. Returns accepted, then poll status."],
     ["name": "player_record_start", "description": "Start per-track Float32 WAV recording of Player's rendered output in its configured debug folder. Requires active routing and fresh local track metadata. Track boundaries are approximate. Poll player_status.recording."],
+    ["name":"player_record_resume","description":"Resume ordered playlist WAV recording from the beginning, automatically skipping tracks with complete local capture evidence. Poll player_status.playlistRecovery. Does not change the driver.",
+     "inputSchema":["type":"object","properties":["playlist":["type":"string"]],"additionalProperties":false]],
+    ["name":"player_recordings","description":"List a bounded page of Player's cached recording sidecars and completeness assessments. refresh=true requests an asynchronous rescan; inspect scanning/updatedAt. WAV sample payloads are never read.",
+     "inputSchema":["type":"object","properties":["offset":["type":"integer","minimum":0],"limit":["type":"integer","minimum":1,"maximum":20],"refresh":["type":"boolean"]],"additionalProperties":false]],
     ["name": "player_record_stop", "description": "Stop WAV recording and finalize files without stopping playback. Poll player_status.recording until finishing=false."],
     ["name": "player_volume", "description": "Set local renderer gain from 0 to 1 without changing Spotify volume.",
      "inputSchema": ["type": "object", "properties": ["gain": ["type": "number", "minimum": 0, "maximum": 1]], "required": ["gain"], "additionalProperties": false]],
@@ -31,9 +34,9 @@ let toolDefinitions: [[String: Any]] = ([
     ["name":"bridge_gain","description":"Change monitoring gain only. Does not affect endpoint WAV samples.",
      "inputSchema":["type":"object","properties":["gain":["type":"number","minimum":0,"maximum":1]],"required":["gain"],"additionalProperties":false]],
     ["name":"bridge_record_start","description":"Record raw endpoint input to Float32 WAVs. Optional labels are generic; no application dependency. Poll bridge_status for errors/finalization.",
-     "inputSchema":["type":"object","properties":["playing":["type":"boolean"],"directory":["type":"string"],"album":["type":"string"],"artist":["type":"string"],"track":["type":"string"],"trackID":["type":"string"],"positionSeconds":["type":"number"],"leaseSeconds":["type":"number","minimum":2,"maximum":60]],"additionalProperties":false]],
+     "inputSchema":["type":"object","properties":["playing":["type":"boolean"],"directory":["type":"string"],"album":["type":"string"],"artist":["type":"string"],"track":["type":"string"],"trackID":["type":"string"],"positionSeconds":["type":"number"],"expectedDurationSeconds":["type":"number","exclusiveMinimum":0],"leaseSeconds":["type":"number","minimum":2,"maximum":60]],"additionalProperties":false]],
     ["name":"bridge_record_track","description":"Supply observed track labels to the generic recorder, or playing=false to close the current segment. Refreshes a 10-second metadata lease.",
-     "inputSchema":["type":"object","properties":["playing":["type":"boolean"],"album":["type":"string"],"artist":["type":"string"],"track":["type":"string"],"trackID":["type":"string"],"positionSeconds":["type":"number"]],"additionalProperties":false]],
+     "inputSchema":["type":"object","properties":["playing":["type":"boolean"],"capture":["type":"boolean"],"album":["type":"string"],"artist":["type":"string"],"track":["type":"string"],"trackID":["type":"string"],"positionSeconds":["type":"number"],"expectedDurationSeconds":["type":"number","exclusiveMinimum":0]],"additionalProperties":false]],
     ["name":"bridge_record_stop","description":"Finalize endpoint WAV recording without stopping input capture or monitoring."],
     ["name":"bridge_use_default","description":"Explicitly route the Mac's regular default output to Audio Bridge. This affects all apps following that default, not only Spotify. Does not change the default microphone or alert output."],
     ["name":"bridge_restore_default","description":"Restore the physical default output remembered when Audio Bridge was explicitly selected."]
@@ -43,8 +46,8 @@ let toolDefinitions: [[String: Any]] = ([
     if result["inputSchema"] == nil {
         result["inputSchema"] = ["type": "object", "properties": [:], "additionalProperties": false] as [String: Any]
     }
-    result["annotations"] = ["readOnlyHint": ["player_status", "player_devices", "player_logs", "player_spotify_devices", "bridge_status", "bridge_devices"].contains(name),
-                              "destructiveHint": false, "openWorldHint": name.hasPrefix("player_spotify") || ["player_login", "player_transport"].contains(name)]
+    result["annotations"] = ["readOnlyHint": ["player_status", "player_devices", "player_logs", "player_spotify_devices", "player_recordings", "bridge_status", "bridge_devices"].contains(name),
+                              "destructiveHint": false, "openWorldHint": name.hasPrefix("player_spotify") || ["player_login", "player_transport", "player_record_resume"].contains(name)]
     return result
 }
 

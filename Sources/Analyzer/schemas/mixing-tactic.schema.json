@@ -395,6 +395,43 @@
       ],
       "type": "object"
     },
+    "PhraseExit": {
+      "additionalProperties": false,
+      "description": "A short, measured resolution of an already sustained stem combination.",
+      "properties": {
+        "end_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PhraseExitKind"
+        },
+        "start_frame": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_frame",
+        "end_frame",
+        "kind",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "PhraseExitKind": {
+      "enum": [
+        "accompaniment_pause",
+        "crescendo_release",
+        "rhythmic_handoff"
+      ],
+      "type": "string"
+    },
     "PitchNote": {
       "additionalProperties": false,
       "properties": {
@@ -971,6 +1008,16 @@
     },
     "permission": {
       "$ref": "#/$defs/TacticPermission"
+    },
+    "phrase_exit": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PhraseExit"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "policy_version": {
       "type": "string"

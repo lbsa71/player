@@ -147,6 +147,28 @@ replace the environment variable. Automatic `stitch` with that interpreter
 ensures full tactic analysis for its selected tracks before choosing cues.
 Without an interpreter, existing valid full-track evidence can still be used.
 
+`analyze-tactics --expand-pool 4` chooses four additional distinct recordings
+using the app's basic-analysis graph. It ranks feasible entrances from and later
+exits to different prepared tracks, enforcing the same 45-second solo runway.
+This is a preparation shortlist, not admission of those transitions: full stem,
+vocal and signal measurements still decide eligibility. Failed analyses are
+reported and replaced from the shortlist. The saved expansion report records
+selection evidence, attempts and before/after counts. Source metadata continues
+through the single fused `.wav.json` per recording.
+
+`stitch` and `render` now write `<output-stem>-timetable.md` next to the WAV.
+The evidence table includes track presence, source excerpts, transition cues,
+selected tactic and exit variant, fractional held bars, resolution length,
+segment roles, selected-layer compatibility and the saved selection rationale.
+Its structured counterpart is embedded in the stitch plan or render report.
+`mixlib timetable --plan PLAN_ID --output timetable.md --json` exports this for
+an existing plan without rendering or reselecting anything. It remeasures only
+the saved cue windows and uses the exact normal, pause or rhythmic exit profile;
+missing evidence remains unknown. Full-set alternatives include the first
+lexicographic deciding criterion and problematic joins, within the saved search
+budget. These scores are heuristic measurements, not confidence probabilities.
+
+
 The automatic search enumerates cues and durations together, then evaluates
 concrete schedules against selected-layer harmony, lead/bass/drum ownership,
 headroom, phrase completion, vocal guards, loop seams and effect tails. A poor
@@ -173,10 +195,19 @@ reserved for mashups and staged handoffs. A single fill cannot certify a rhythm
 change. Proposals go through the same PCM, vocal, timing and layer admission as
 seeds. Per-window reports retain the cue, duration, profiles and exact rejections.
 
-M01 can hold longer than six bars, preserving a final two-bar resolution. S05/S06
+M01 requires a measured musical endpoint and can hold longer than six bars,
+preserving a final two-bar resolution or admitting a measured swift phrase exit. An arbitrary seed endpoint cannot
+qualify it. High-quality M01 holds supply quality-weighted seconds to the set
+objective, using worst-case full-window compatibility and per-bar stability. S05/S06
 keep their selected layers until that resolution instead of exiting at bar two.
 Stability uses the hold as its reference and is checked separately from the exit.
 Longer admitted holds receive a bounded score benefit, as do measured end events.
+S04 is a last-resort candidate following repeated negative listening feedback.
+Its score stays below normal admitted tactics and above unmatched cuts/fades;
+fit measurements still rank S04 alternatives within that fallback tier. A
+fallback S04 cannot consume the reserved continuation budget for normal held
+arrangements. M01 dense mashups and S05/S06 separated-stem handoffs retain their
+existing admission, schedules and preference.
 Bass swaps have lower tactic preference; shared low-band energy penalizes S04
 but cannot by itself reject a measured-compatible band allocation.
 
@@ -186,8 +217,43 @@ vocal scheduler tests later verified gaps when closing at the first pocket
 would leave suspected vocal bleed in an audible accompaniment lane. It never
 moves accompaniment automation or waives leakage checks to make a gate fit.
 
+S05/S06 now contribute separate `handoff_quality_seconds` to the beam's
+sustained-mix objective. Credit requires at least four hold bars, a real retained
+bed, stable layers on both decks, and strong pair compatibility. The S06 entry
+still requires a measured drum return. Dense and handoff components stay
+separate in candidate, edge, join and route diagnostics. Twelve anchor slots
+per family prevent either family from crowding the other out before full-route
+comparison. The planner version is `sustained-anchor-beam/5`.
+
+Sub-four-bar S03 schedules count as fallback unless measured band matching
+supports a short replacement. Longer S03 schedules retain their existing
+eligibility. This prevents a short EQ fade from avoiding the short-transition
+policy merely by exchanging bass quickly.
+
+The new `rhythmic_handoff` exit proposes a final-half-bar incoming drum accent
+near a measured endpoint for M01. It requires energetic, compatible selected
+layers through the longer hold, not quiet accompaniment. PCM attack measurement
+uses the actual incoming drum source and output time map. The partial final
+held bar gets PCM RMS, crest and activity measurements over exactly the
+retained interval; energy changes after the handoff cannot lower its hold
+density. Full-bar pitch/lead evidence and peak bounds remain conservative. Its profile and
+rejections are separate from ordinary and pause/release profiles; the app
+compares all admitted variants and retains the ordinary resolve on failure.
+
+`phrase_exit.rs` measures the last two bars of source-aligned bass/other PCM
+for a final-half-bar pause or completed local crescendo release. It never uses
+muted drum fills as evidence. A 20 ms post-event guard precedes an 80 ms smooth
+exchange. The optional typed `phrase_exit` records the event, output interval
+and provenance and translates with the chain. M01/M02/S05/S06 retain ordinary
+and swift profiles/candidates independently; compatibility is remeasured on
+each actual schedule. Admission checks every bar touched by the extended hold,
+and dense-anchor value counts its actual duration, including a partial bar.
+Known buildups, incomplete vocal lines and accompaniment bleed still veto the
+swift variant. Failure leaves the ordinary resolve available. This refinement
+uses existing source stems and fused metadata; it adds no per-WAV sidecar.
+
 M01 holds the selected mashup for at least six complete bars and resolves over
-the final two bars of its measured window. B drums stay steady, A drums stay
+the final two bars of its measured window by default. B drums stay steady, A drums stay
 absent, bass has an explicit exchange, and vocal gates follow independent
 supported phrases with at least a 300 ms guard. M02 retains the spacious bed
 and brisk exit. Density and compatibility are measured after choosing audible
@@ -228,8 +294,18 @@ Each edge retains its cue, tactic, and evidence. Each partial route carries
 its entry point and assembled time maps, so separate entries into the same
 track can survive. Extensions require 45 seconds of solo source time and
 validate the translated schedules together, including vocal tails. Complete
-routes rank by fewest last-resort transitions, then weakest join, then total score.
-Unmatched ownership cuts and ordinary short fades share a default budget of one
+routes rank by fewest last-resort transitions, fewest joins below score 25,
+most quality-weighted dense-mashup plus stable-handoff seconds, then weakest join and total fit.
+The picker attempts routes around up to 12 measured dense-mashup and 12 stable-handoff anchors plus
+an unconstrained beam. Each anchor fixes a concrete entry and endpoint;
+`dense_anchor_search` records route outcomes and comparison metrics. This keeps
+strong late mashups from disappearing during early forward-beam pruning.
+Reachability is anchor-aware. Each anchor exhausts zero-fallback search at
+both beam widths before allowing a fallback; counterfactual results retain
+the actual join choices and effective search bounds. Return probes have a
+separate quota of one third of the base seed budget.
+Listening-disfavored S04 stereo band exchanges, unmatched ownership cuts and
+ordinary short fades share a default budget of one
 last-resort join per set. All-band mapped PCM agreement can promote a cut. Each
 measurement pass saves a `measured_graph` report with per-pair tactic admissions
 and rejection reasons, linking to separate detailed window reports so the graph

@@ -36,6 +36,13 @@ private final class MemoryStore: RefreshTokenStore, @unchecked Sendable {
 }
 
 final class SpotifyTests: XCTestCase {
+    private func playbackModes(deviceID:String = "local", shuffle:Bool = false, repeatMode:String = "off") -> String {
+        #"{"device":{"id":"\#(deviceID)","name":"Mac","type":"Computer","is_active":true,"is_restricted":false},"is_playing":false,"shuffle_state":\#(shuffle),"repeat_state":"\#(repeatMode)"}"#
+    }
+    private func pollingClient(_ http: ScriptedHTTP, attempts:Int = 3) -> SpotifyClient {
+        SpotifyClient(auth:TestTokens(),http:http,modeConfirmationAttempts:attempts,
+                      modeConfirmationDelay:{ try Task.checkCancellation() })
+    }
     func testPlaylistLinksAreNormalizedAndRejectOtherDestinations() throws {
         let id = "37i9dQZF1DXcBWIGoYBM5M"
         XCTAssertEqual(try SpotifyPlaylist.uri("https://open.spotify.com/playlist/\(id)?si=test"), "spotify:playlist:\(id)")
@@ -45,7 +52,7 @@ final class SpotifyTests: XCTestCase {
         XCTAssertThrowsError(try SpotifyPlaylist.uri("spotify:playlist:../../test"))
     }
     func testPlaylistStartsFromBeginningOnlyAfterModesAreObserved() async throws {
-        let state = #"{"device":{"id":"local","name":"Mac","type":"Computer","is_active":true,"is_restricted":false},"is_playing":false,"shuffle_state":false,"repeat_state":"off"}"#
+        let state = playbackModes()
         let http = ScriptedHTTP([.init(code: 204), .init(code: 204), .init(code: 200, body: state), .init(code: 204)])
         let client = SpotifyClient(auth: TestTokens(), http: http)
         try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"), deviceID: "local")
@@ -57,11 +64,68 @@ final class SpotifyTests: XCTestCase {
         XCTAssertEqual(body["position_ms"] as? Int, 0)
     }
     func testPlaylistDoesNotStartWhenPlaybackModesAreUnconfirmed() async {
-        let http = ScriptedHTTP([.init(code: 204), .init(code: 204), .init(code: 204)])
-        let client = SpotifyClient(auth: TestTokens(), http: http)
-        do { try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"), deviceID: "local"); XCTFail("Expected unconfirmed mode error") } catch {}
+        let http = ScriptedHTTP([.init(code: 204), .init(code: 204), .init(code: 204),
+                                 .init(code:200,body:playbackModes(shuffle:true)),
+                                 .init(code:200,body:playbackModes(deviceID:"another-device"))])
+        let client = pollingClient(http)
+        do { try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"), deviceID: "local"); XCTFail("Expected unconfirmed mode error") }
+        catch SpotifyFailure.setup {} catch { XCTFail("Unexpected error: \(error)") }
         let requests = await http.requests
         XCTAssertFalse(requests.contains { $0.url!.lastPathComponent == "play" })
+        XCTAssertEqual(requests.map { $0.url!.lastPathComponent },["shuffle","repeat","player","player","player"])
+    }
+    func testPlaylistWaitsForEventualModesWithoutRepeatingControlCommands() async throws {
+        let http = ScriptedHTTP([.init(code:204),.init(code:204),
+                                .init(code:200,body:playbackModes(shuffle:true,repeatMode:"context")),
+                                .init(code:200,body:playbackModes(repeatMode:"context")),
+                                .init(code:200,body:playbackModes()),.init(code:204)])
+        let client = pollingClient(http)
+        try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),deviceID:"local")
+        let requests = await http.requests
+        XCTAssertEqual(requests.map { $0.url!.lastPathComponent },["shuffle","repeat","player","player","player","play"])
+        XCTAssertEqual(requests.filter { $0.httpMethod != "GET" }.count,3)
+    }
+    func testPlaylistConfirmationCancellationStopsBeforeAnotherObservationOrPlay() async {
+        let http = ScriptedHTTP([.init(code:204),.init(code:204),.init(code:204)])
+        let delayStarted = expectation(description:"Waiting for Spotify propagation")
+        let client = SpotifyClient(auth:TestTokens(),http:http,modeConfirmationAttempts:3,modeConfirmationDelay:{
+            delayStarted.fulfill()
+            try await Task.sleep(for:.seconds(60))
+        })
+        let task = Task { try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),deviceID:"local") }
+        await fulfillment(of:[delayStarted],timeout:2)
+        task.cancel()
+        do { try await task.value; XCTFail("Expected cancellation") }
+        catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        let requests = await http.requests
+        XCTAssertEqual(requests.map { $0.url!.lastPathComponent },["shuffle","repeat","player"])
+    }
+    func testPlaylistConfirmation403StopsWithoutRetryOrPlay() async {
+        let http = ScriptedHTTP([.init(code:204),.init(code:204),.init(code:403)])
+        let client = pollingClient(http)
+        do { try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),deviceID:"local"); XCTFail("Expected denial") }
+        catch SpotifyFailure.denied {} catch { XCTFail("Unexpected error: \(error)") }
+        let requests = await http.requests
+        XCTAssertEqual(requests.map { $0.url!.lastPathComponent },["shuffle","repeat","player"])
+    }
+    func testPlaylistConfirmationRateLimitPreservesRequestGate() async {
+        let http = ScriptedHTTP([.init(code:204),.init(code:204),.init(code:429,headers:["Retry-After":"120"])])
+        let client = pollingClient(http)
+        do { try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),deviceID:"local"); XCTFail("Expected rate limit") }
+        catch SpotifyFailure.rateLimited {} catch { XCTFail("Unexpected error: \(error)") }
+        do { _ = try await client.playback(); XCTFail("Expected rate-limit gate") }
+        catch SpotifyFailure.rateLimited {} catch { XCTFail("Unexpected error: \(error)") }
+        let count = await http.requests.count
+        XCTAssertEqual(count,3)
+    }
+    func testPlaylistConfirmation401RefreshesObservationOnly() async throws {
+        let http = ScriptedHTTP([.init(code:204),.init(code:204),.init(code:401),
+                                .init(code:200,body:playbackModes()),.init(code:204)])
+        let client = pollingClient(http)
+        try await client.command(.playlist("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),deviceID:"local")
+        let requests = await http.requests
+        XCTAssertEqual(requests.map { $0.url!.lastPathComponent },["shuffle","repeat","player","player","play"])
+        XCTAssertEqual(requests[3].value(forHTTPHeaderField:"Authorization"),"Bearer new-token")
     }
     func testPKCEAgainstRFC7636Vector() throws {
         XCTAssertEqual(PKCE.challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),

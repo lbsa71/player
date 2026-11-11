@@ -38,6 +38,9 @@ BridgeMonitorStats bridge_monitor_stats(BridgeForwarder * _Nonnull forwarder);
 OSStatus bridge_capture_callback(AudioObjectID device, const AudioTimeStamp * _Nonnull now,
     const AudioBufferList * _Nonnull input, const AudioTimeStamp * _Nonnull inputTime,
     AudioBufferList * _Nonnull output, const AudioTimeStamp * _Nonnull outputTime, void * _Nullable context);
+// Configure once before starting I/O. Select one interleaved stereo buffer by
+// proven aggregate stream identity; all other inputs (including loopback) are ignored.
+bool player_renderer_select_input_buffer(PlayerRenderer * _Nonnull renderer, uint32_t index, uint32_t totalBuffers);
 void player_renderer_set_gain(PlayerRenderer * _Nonnull renderer, float gain);
 PlayerRenderStats player_renderer_stats(PlayerRenderer * _Nonnull renderer);
 void player_renderer_process(PlayerRenderer * _Nonnull renderer, const AudioBufferList * _Nullable input, AudioBufferList * _Nullable output);

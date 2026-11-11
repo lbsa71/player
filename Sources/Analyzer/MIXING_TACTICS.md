@@ -1,6 +1,6 @@
 # Mixing tactics
 
-Specification version 1.2 · 11 November 2026
+Specification version 1.6 · 11 November 2026
 
 This is the decision contract for choosing cues, layer ownership, transition
 duration and exit treatment. It extends [the analyzer specification](README.md).
@@ -41,12 +41,114 @@ independent and recheck audible vocal ownership.
 Bass swaps remain available but receive less preference than a useful mashup or
 staged handoff. Tactic variety alone is not evidence of a better mix.
 
+## Build the set around sustained dense mashups
+
+High-quality dense mashups are the defining set-building strategy. The picker
+MUST retain concrete anchor choices (both source entries, measured ending and
+selected lane schedule) and attempt complete sets around them. A forward beam
+that discards a valuable late anchor before reaching it is insufficient.
+
+M01 admission requires a measured musical ending, even when the seed already
+has a convenient eight- or sixteen-bar duration. Seed-only endpoints remain
+measurement probes, not accepted dense mashups. The search tests both near
+changes and longer horizons, rechecking density and stability in every held
+bar and worst-case harmony, lead conflicts, vocals and headroom over the full
+schedule. A longer duration never waives those checks.
+
+The current bounded search tries the strongest 24 dense anchors and an
+unconstrained route. Anchor quality requires complementarity ≥0.65, harmonic
+conflict ≤0.30 and lead conflict ≤0.20 after admission. Its value is held
+seconds multiplied by complementarity, harmonic/lead compatibility and each
+bar's weaker retained-layer stability. This rewards good sustained music,
+not merely a count of mashup labels. Complete sets rank by fewer fallbacks,
+fewer joins scoring below 25, more quality-weighted dense hold seconds, then
+weakest join and total fit. These numerical policies are measured heuristics,
+not calibrated listening-quality probabilities. Reports retain each anchor's
+cue, score, concrete joins and complete-route result so duration losses are
+inspectable. Search the zero-fallback budget first at both beam widths; only
+then consider routes that need a fallback. Anchor-aware reachability must
+include this remaining budget, preventing an attractive prefix with a future
+fallback from displacing clean anchor routes.
+
+Measured drum returns have a separate bounded cue-search quota alongside
+ordinary candidates; they must not evict existing dense entry probes.
+A return can follow an uneven quiet passage or pickup. A build's reported end
+may move to the start of its final bar only when a sustained drum arrival and
+stable full-mix plateau establish that the release has already happened; an
+ongoing crescendo remains protected.
+
+## Swift phrase exits for held mashups and handoffs
+
+**Given A's retained bass and accompaniment have a measured pause or completed
+crescendo release in the last half of the last bar, and B's drums can remain
+steady through the longer hold, keep the combination intact until that event,
+then exchange the accompaniment quickly.** This refines M01/M02/S05/S06; it is
+not permission to replace arbitrary transitions with cuts.
+
+**An energetic dense mashup does not need to go quiet.** A second M01 exit
+variant uses an incoming drum accent on a beat in the final half-bar before a
+measured musical ending. Incoming drum RMS over 80 ms must be at least 1.2× the
+preceding bar and 1.4× the preceding 100 ms, with a non-negligible groove. The
+first supported accent is proposed; it is not always a fixed 7.5-bar ending.
+Its 80 ms accompaniment exchange starts on that accent, while B drums continue.
+The extended hold must independently pass density and stability checks, with
+complementarity ≥0.65, harmonic distance ≤0.30 and lead conflict ≤0.20. Vocal,
+leakage, buildup and headroom checks remain mandatory. The gradual variant is
+retained. A strong mashup is the reason to sustain energy, not to seek silence.
+
+The nearby DJ vocabulary is a phrase-timed **cut** or **slam**. Here the incoming
+groove is already established, so only the remaining ownership changes.
+[Phrase timing and fast mixes](https://www.digitaldjtips.com/questions-superstar-djs-make-fast-mixes-sound-great/)
+
+The implementation measures source-aligned bass and other stems in 20 ms
+windows. A pause must be quiet on **both** retained lanes relative to the
+preceding bar and pass peak limits. A local crescendo release requires three
+successively rising 100 ms windows (at least 1.8× total growth) followed by at
+least 100 ms below half the final level. Rising energy without a completed
+release never qualifies. A known longer buildup must also have finished.
+
+After a 20 ms post-event guard, an 80 ms smooth exchange transfers the
+accompaniment; B drums continue unchanged. The event must fall in the final
+half-bar and the exchange must fit inside the measured window. Vocal ownership
+still requires complete lines, measured quiet gates and the existing ≥300 ms
+separation. A vocal that cannot finish by the exchange rejects this variant.
+
+The planner retains the conventional resolve, pause/release variant and rhythmic dense-handoff variant,
+measuring each actual schedule independently. Extended hold stability, density,
+harmony, lead collision, leakage and headroom must all pass again. Ranking
+credits the actual additional held seconds, including partial bars. Missing
+sub-bar evidence or a rejected swift variant leaves the conventional resolve
+available. This is a normal held-tactic refinement, not a fallback cut.
+
+## Positive reference: stable drum-and-accompaniment handoffs
+
+Anges → Seshat illustrates the target: a sustained outgoing musical bed, very
+steady incoming drums, low lead competition, compatible harmony, and a drum
+entry timed to the outgoing track's measured return. The rule contains no track
+names or artist preferences. Preserve its gradual accompaniment resolution;
+a successful lingering handoff is not automatically a reason to cut faster.
+
+S05/S06 get quality-weighted held-time credit alongside dense mashups when at
+least four bars retain a real musical bed: outgoing stability ≥0.80, incoming
+stability ≥0.85, retained-bed density ≥0.15, complementarity ≥0.60, harmonic
+distance ≤0.30 and lead conflict ≤0.25 throughout the measured schedule.
+Ordinary admission still checks the return/entry, vocals, isolation and headroom.
+The set objective sums dense and handoff credit, retaining separate diagnostic
+values. The search reserves twelve concrete anchor opportunities for each
+family, plus an unconstrained search. Quiet emptiness and long but unstable
+holds receive no handoff credit.
+
+A **sub-four-bar S03 bass swap** is a short upper-band fade with a quick bass
+exchange, and is last resort unless measured short-fade band compatibility
+supports it. A longer, well-matched S03 remains eligible. Naming an operation
+"bass swap" does not exempt it from short-transition policy.
+
 ## The dense-mashup rule
 
 **Given A has a stable, intense passage whose vocals and accompaniment work
 over B's drums, and B has a stable drum passage with a compatible arrival,
 hold the mashup until a supported ending, then resolve across the final two
-bars. Keep at least six complete hold bars.**
+bars or use a measured swift phrase exit below. Keep at least six complete hold bars.**
 
 This preference applies only after checking the actual selected layers. Two
 loud songs do not necessarily make a dense composite, and two individually good
@@ -219,7 +321,7 @@ limits are this specification's design inferences.
 
 ### Mashups
 
-#### M01 — Dense drum-and-accompaniment mashup with a two-bar exit
+#### M01 — Dense drum-and-accompaniment mashup with a measured exit
 
 - **Given A** has a stable vocal/texture/bass passage whose drums can be removed,
   **and B** supplies a complementary, steady groove and compatible resolution.
@@ -228,8 +330,8 @@ limits are this specification's design inferences.
   but clear. Keep B's drums stable, preserve A's phrase, then transfer the other
   layers over the final two bars. Character `subtle`.
 - **Reject** crowding, unreliable isolation or a vocal finish outside the safe
-  window. Try another cue or S04/S05; never reward density alone.
-- **Status** Implemented variable-length holds with a final two-bar accompaniment exit, independent phrase-safe vocal gates and measured selected-layer density admission.
+  window. Try another cue or S05; reserve S04 for last resort. Never reward density alone.
+- **Status** Implemented variable-length holds with a final two-bar accompaniment exit or a separately measured swift phrase exit, independent phrase-safe vocal gates and measured selected-layer density admission.
   [Double-drop density guidance][double-drop], [stem controls][stems].
 
 #### M02 — Spacious drum-and-texture mashup with a brisk resolution
@@ -333,7 +435,7 @@ repeat or use the content of a line still require positive phrase evidence.
   useful upper layers. In stem mode distinguish bass from kick/drums.
 - **Reject** an energy hole or doubled low end. Do not assume a zero low-EQ
   setting produces perfect isolation.
-- A whole-arrangement exchange completed in one bar is subject to the same
+- A whole-arrangement exchange completed in fewer than four bars is subject to the same
   last-resort policy as S02. Calling it a bass swap does not exempt it. Only
   measured quiet matching audio or the supported band-match exceptions promote it.
 - **Status** Implemented bounded bass ownership exchange with measured upper-layer compatibility.
@@ -341,6 +443,15 @@ repeat or use the content of a line still require positive phrase evidence.
 
 #### S04 — Three-band staged exchange
 
+- **Selection policy: last resort.** Listening feedback has consistently rejected
+  this tactic. Automatic selection MUST exhaust routes without S04 before using
+  it; it consumes the shared last-resort budget. An admitted S04 remains above
+  an unmatched cut or unqualified short fade. Explicit audition remains available.
+  Passing energy/occupancy checks does not establish clean musical separation:
+  S04 exchanges broad EQ regions of stereo recordings, not isolated instruments.
+- **Preferred alternatives:** S05/S06 separated-stem drum handoffs and M01/M02
+  sustained mashups. The positively received Anges → Seshat → Tinsel Teeth →
+  Mareux sequence uses S06/S06/M01, not S04. Preserve those behaviors and priorities.
 - **Given A** remains useful in some frequency regions, **and B** can enter
   progressively without colliding with A's vocals or lead.
 - **Use** an ordered exchange of highs, bass and mids, with independently timed
@@ -488,7 +599,7 @@ Matching tempo/key, vocal silence, or zero simultaneous clashes cannot promote
 a cut. A one-band-difference exception permits a short fade, not a full-band cut.
 These rules do not remove buildup, line-ending, grid or headroom checks.
 Automatic sets allow at most one last-resort join by default, including ordinary
-short fades and unmatched one-bar bass swaps. Exhausting that budget widens the cue search and can reject the set
+short fades and unmatched sub-four-bar bass swaps. Exhausting that budget widens the cue search and can reject the set
 instead of silently producing a chain of cuts. The saved mixing-policy extension
 `max_last_resort_transitions` can explicitly change that budget.
 
@@ -736,7 +847,7 @@ measurements from another tactic.
 | Spacious bed, stable incoming drums, decisive clean arrival | M02 or S05, with hold chosen from phrase evidence | That every successful mashup needs a long fade |
 | Drumless outgoing vocals/texture and usable incoming percussion | S05, extending to M01/M02 when supported | That the absence of loud bass proves drums are absent |
 | Outgoing break followed by a supported drum return | S06 at that return and phrase boundary | Permission to enter a beat or partial phrase early |
-| Useful compatible upper layers but conflicting bass | S03 or S04 | Permission to mute all drums by removing low EQ |
+| Useful compatible upper layers but conflicting bass | S03; S04 only as last resort | Permission to mute all drums by removing low EQ |
 | Sparse intro/outro and no valuable sustained composite | S01 or S02 | A need to manufacture a mashup |
 | Dense competing drops with a strong replacement landing | C02 | A reason to force a double drop |
 | Modest tempo gap with stable shared rhythm | D01 attached to the selected tactic | Unbounded stretching to make a route feasible |

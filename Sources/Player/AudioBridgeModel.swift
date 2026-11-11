@@ -11,6 +11,9 @@ import PlayerControl
     private var pollTask: Task<Void,Never>?
     private var latestTrack: RecordingTrack?
     private var hasObservedPlayback = false
+    private var captureTrack = true
+    private var observationTask: Task<Void,Error>?
+    private var observationGeneration = 0
     init() {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -30,10 +33,56 @@ import PlayerControl
         try await Task.detached { try BridgeControl.request(method,arguments:arguments) }.value
     }
     private func metadata(_ track: RecordingTrack) -> [String:Any] {
-        ["trackID":track.id,"album":track.album,"artist":track.artist,"track":track.name,
-         "positionSeconds":track.positionSeconds,"playing":true]
+        var result: [String:Any] = ["trackID":track.id,"album":track.album,"artist":track.artist,"track":track.name,
+                                   "positionSeconds":track.positionSeconds,"playing":true]
+        if let duration = track.expectedDurationSeconds { result["expectedDurationSeconds"] = duration }
+        return result
     }
-    func observe(_ track: RecordingTrack?) { latestTrack = track; hasObservedPlayback = true }
+    func observe(_ track: RecordingTrack?, capture: Bool = true) {
+        latestTrack = track; captureTrack = capture; hasObservedPlayback = true
+    }
+    func pushObservation() async throws {
+        let previous = observationTask
+        observationGeneration += 1; let current = observationGeneration
+        let task = Task { @MainActor in
+            _ = try? await previous?.value
+            // Snapshot after earlier submissions finish. An old heartbeat must
+            // never re-enable capture after a newer suppression boundary.
+            var arguments = latestTrack.map(metadata) ?? ["playing":false]
+            arguments["capture"] = captureTrack
+            let response = try await request("bridge_record_track", arguments)
+            guard response["ok"] as? Bool == true else {
+                throw ControlError.message(response["error"] as? String ?? "Could not update recording metadata.")
+            }
+        }
+        observationTask = task
+        defer { if current == observationGeneration { observationTask = nil } }
+        try await task.value
+    }
+    func perform(_ method: String, _ arguments: [String:Any] = [:]) async throws {
+        for _ in 0..<100 {
+            if !pending { break }
+            try await Task.sleep(for:.milliseconds(100))
+        }
+        guard !pending else { throw ControlError.message("Audio Bridge is handling another command.") }
+        pending = true
+        defer { pending = false }
+        let response = try await request(method, arguments)
+        guard response["ok"] as? Bool == true else {
+            throw ControlError.message(response["error"] as? String ?? "Audio Bridge rejected the request.")
+        }
+        for _ in 0..<100 {
+            let state = try await request("bridge_status")
+            status = state
+            if state["busy"] as? Bool != true {
+                if let message = state["controlError"] as? String, !message.isEmpty { throw ControlError.message(message) }
+                onRecordingChange?()
+                return
+            }
+            try await Task.sleep(for:.milliseconds(100))
+        }
+        throw ControlError.message("Audio Bridge did not finish the command in time.")
+    }
     func refresh() async {
         do {
             let response = try await request("bridge_status")
@@ -43,7 +92,7 @@ import PlayerControl
             if error.isEmpty { error = response["error"] as? String ?? "" }
             onRecordingChange?()
             if recordingEnabled && hasObservedPlayback && response["usesTrackMetadata"] as? Bool == true {
-                _ = try await request("bridge_record_track",latestTrack.map(metadata) ?? ["playing":false])
+                try await pushObservation()
             }
         } catch { self.error = error.localizedDescription }
     }
@@ -61,8 +110,14 @@ import PlayerControl
             } catch { self.error = error.localizedDescription }
         }
     }
+    func startRecording(directory: URL, track: RecordingTrack?) async throws {
+        latestTrack = track; captureTrack = true; hasObservedPlayback = true
+        var args: [String:Any] = ["directory":directory.path,"leaseSeconds":10,"playing":track != nil]
+        if let track { args.merge(metadata(track)) { _,new in new } }
+        try await perform("bridge_record_start",args)
+    }
     func record(directory: URL, track: RecordingTrack?) {
-        latestTrack = track
+        latestTrack = track; captureTrack = true
         var args: [String:Any] = ["directory":directory.path,"leaseSeconds":10,"playing":track != nil]
         if let track { args.merge(metadata(track)) { _,new in new } }
         command("bridge_record_start",args)
