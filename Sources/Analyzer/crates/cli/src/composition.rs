@@ -134,6 +134,75 @@ pub(super) struct Context {
     profiles: Vec<Profile>,
     ids: BTreeMap<String, usize>,
 }
+/// Counts the actual closing decisions, without turning a proposal into an
+/// admitted ending or changing the composition and replay contracts.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(super) struct CloseDiagnostics {
+    pub no_duration_window: u64,
+    pub duration_windows: u64,
+    pub closing_errors: BTreeMap<String, u64>,
+    pub closing_error_details: BTreeMap<String, u64>,
+    pub replay_shortfall: u64,
+    pub ending_retries: u64,
+    pub replay_shortfall_min_raw_seconds: Option<f64>,
+    pub replay_shortfall_max_raw_seconds: Option<f64>,
+    pub composition_rejections: BTreeMap<String, u64>,
+    pub approved_windows: u64,
+}
+impl CloseDiagnostics {
+    pub fn merge(&mut self, other: &Self) {
+        self.no_duration_window += other.no_duration_window;
+        self.duration_windows += other.duration_windows;
+        self.replay_shortfall += other.replay_shortfall;
+        self.ending_retries += other.ending_retries;
+        self.approved_windows += other.approved_windows;
+        if let Some(seconds) = other.replay_shortfall_min_raw_seconds {
+            self.replay_shortfall_min_raw_seconds = Some(
+                self.replay_shortfall_min_raw_seconds
+                    .map_or(seconds, |old| old.min(seconds)),
+            );
+        }
+        if let Some(seconds) = other.replay_shortfall_max_raw_seconds {
+            self.replay_shortfall_max_raw_seconds = Some(
+                self.replay_shortfall_max_raw_seconds
+                    .map_or(seconds, |old| old.max(seconds)),
+            );
+        }
+        for (destination, source) in [
+            (&mut self.closing_errors, &other.closing_errors),
+            (
+                &mut self.closing_error_details,
+                &other.closing_error_details,
+            ),
+            (
+                &mut self.composition_rejections,
+                &other.composition_rejections,
+            ),
+        ] {
+            for (reason, count) in source {
+                *destination.entry(reason.clone()).or_default() += count;
+            }
+        }
+    }
+}
+const MAX_CLOSING_ENDINGS: usize = 8;
+
+/// A nicer early ending may need more measured loops than this route has. Keep
+/// later musical endings alive, without extending the original clock window.
+fn later_closing_window(
+    window: mixlib_planner::ChainClosingWindow,
+    previous_end: u64,
+    attempt: usize,
+) -> Option<mixlib_planner::ChainClosingWindow> {
+    let earliest = previous_end.checked_add(1)?;
+    (attempt + 1 < MAX_CLOSING_ENDINGS
+        && previous_end >= window.earliest
+        && earliest <= window.latest)
+        .then_some(mixlib_planner::ChainClosingWindow {
+            earliest,
+            latest: window.latest,
+        })
+}
 #[derive(Default)]
 struct Passage {
     seconds: f64,
@@ -349,6 +418,14 @@ impl Context {
         result
     }
     pub(super) fn evaluate(&self, plan: &MixPlan, complete: bool) -> Option<Value> {
+        self.evaluate_diagnosed(plan, complete, &mut None)
+    }
+    fn evaluate_diagnosed(
+        &self,
+        plan: &MixPlan,
+        complete: bool,
+        rejection: &mut Option<&'static str>,
+    ) -> Option<Value> {
         let credits = overlap_credits(
             &read_tactics(plan).ok()?,
             plan.placements.len(),
@@ -361,6 +438,7 @@ impl Context {
             .as_ref()
             .map_or(plan.total_output_frames, |a| a.base_output_frames);
         if complete && !self.request.accepts(duration) {
+            *rejection = Some("duration_outside_window");
             return None;
         }
         let mut error = 0.;
@@ -381,6 +459,7 @@ impl Context {
                 .get(i)
                 .map_or(base_end, |t| t.start_output_frame);
             if end <= begin {
+                *rejection = Some("no_solo_runway");
                 return None;
             }
             let a = p.time_map.source_at(begin as f64).round() as u64;
@@ -439,6 +518,7 @@ impl Context {
             // Bookends are checked only after choosing their musical endpoints.
             let development_seconds = passage.seconds + credits[i];
             if development_seconds + 0.05 < passage.minimum {
+                *rejection = Some("insufficient_development");
                 return None;
             }
             error += passage.error * passage.seconds;
@@ -546,45 +626,90 @@ impl Context {
     }
 
     /// Closing is a real musical endpoint, optionally followed by verified loops.
-    pub(super) fn close(
+    pub(super) fn close_with_diagnostics(
         &self,
         store: &Store,
         plan: &MixPlan,
         cancel: &Cancellation,
-    ) -> Result<Option<MixPlan>> {
+    ) -> Result<(Option<MixPlan>, CloseDiagnostics)> {
+        let mut diagnostics = CloseDiagnostics::default();
         let mut best = None;
         for window in [
             self.closing_window(plan),
             self.closing_window_from(plan, self.request.min() / (1. + MAX_REPLAY_FRACTION)),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            match chain::finish_measured_in_window(store, plan.clone(), Some(window), cancel) {
-                Ok(finished) => {
-                    if let Some(mut finished) = self.replays.arrange(
-                        store,
-                        &finished,
-                        self.request.min(),
-                        self.request.max(),
-                        cancel,
-                    )? {
-                        if let Some(evidence) = self.evaluate(&finished, true) {
-                            finished
-                                .header
-                                .extensions
-                                .insert("set_composition".into(), evidence);
-                            if best.as_ref().is_none_or(|p| better(&finished, p)) {
-                                best = Some(finished);
+        ] {
+            let Some(mut window) = window else {
+                diagnostics.no_duration_window += 1;
+                continue;
+            };
+            diagnostics.duration_windows += 1;
+            for attempt in 0..MAX_CLOSING_ENDINGS {
+                cancel.check()?;
+                diagnostics.ending_retries += u64::from(attempt > 0);
+                match chain::finish_measured_in_window(store, plan.clone(), Some(window), cancel) {
+                    Ok(finished) => {
+                        if let Some(mut finished) = self.replays.arrange(
+                            store,
+                            &finished,
+                            self.request.min(),
+                            self.request.max(),
+                            cancel,
+                        )? {
+                            let mut rejection = None;
+                            if let Some(evidence) =
+                                self.evaluate_diagnosed(&finished, true, &mut rejection)
+                            {
+                                diagnostics.approved_windows += 1;
+                                finished
+                                    .header
+                                    .extensions
+                                    .insert("set_composition".into(), evidence);
+                                if best.as_ref().is_none_or(|p| better(&finished, p)) {
+                                    best = Some(finished);
+                                }
+                            } else {
+                                *diagnostics
+                                    .composition_rejections
+                                    .entry(rejection.unwrap_or("invalid_evidence").into())
+                                    .or_default() += 1;
+                            }
+                        } else {
+                            diagnostics.replay_shortfall += 1;
+                            let seconds = finished.total_output_frames as f64
+                                / f64::from(finished.output.sample_rate_hz);
+                            diagnostics.replay_shortfall_min_raw_seconds = Some(
+                                diagnostics
+                                    .replay_shortfall_min_raw_seconds
+                                    .map_or(seconds, |old| old.min(seconds)),
+                            );
+                            diagnostics.replay_shortfall_max_raw_seconds = Some(
+                                diagnostics
+                                    .replay_shortfall_max_raw_seconds
+                                    .map_or(seconds, |old| old.max(seconds)),
+                            );
+                            if let Some(later) = later_closing_window(
+                                window,
+                                finished.placements.last().unwrap().source_end_frame,
+                                attempt,
+                            ) {
+                                window = later;
+                                continue;
                             }
                         }
                     }
+                    Err(e) if measured_beam::route_local(&e) => {
+                        *diagnostics.closing_errors.entry(e.code).or_default() += 1;
+                        *diagnostics
+                            .closing_error_details
+                            .entry(e.message)
+                            .or_default() += 1;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) if measured_beam::route_local(&e) => {}
-                Err(e) => return Err(e),
+                break;
             }
         }
-        Ok(best)
+        Ok((best, diagnostics))
     }
     fn closing_window_from(
         &self,
@@ -1183,6 +1308,67 @@ mod tests {
             context.evaluate(&plan, true).is_none(),
             "source lengths sum to 60 minutes, but overlaps make this undersized"
         );
+    }
+    #[test]
+    fn closing_diagnostics_distinguish_clock_and_development_rejections() {
+        let (context, mut plan) = long_plan(20);
+        let mut rejection = None;
+        assert!(context
+            .evaluate_diagnosed(&plan, true, &mut rejection)
+            .is_none());
+        assert_eq!(rejection, Some("duration_outside_window"));
+        // Reaching the requested clock cannot legitimize an undeveloped song.
+        plan.total_output_frames = 57 * 60 * u64::from(plan.output.sample_rate_hz);
+        plan.transitions[0].start_output_frame = 40 * u64::from(plan.output.sample_rate_hz);
+        rejection = None;
+        assert!(context
+            .evaluate_diagnosed(&plan, true, &mut rejection)
+            .is_none());
+        assert_eq!(rejection, Some("insufficient_development"));
+        assert!(context.evaluate(&plan, true).is_none());
+    }
+    #[test]
+    fn replay_shortfall_keeps_later_measured_endings_inside_the_original_window() {
+        let mut window = mixlib_planner::ChainClosingWindow {
+            earliest: 100,
+            latest: 200,
+        };
+        // Only these endpoints passed the musical-ending gate. The first two
+        // cannot reach the target using the route's measured replay material.
+        let measured_endings = [120, 150, 190, 240];
+        let mut heard = vec![];
+        for attempt in 0..MAX_CLOSING_ENDINGS {
+            let end = measured_endings
+                .into_iter()
+                .find(|end| *end >= window.earliest && *end <= window.latest)
+                .unwrap();
+            heard.push(end);
+            if end >= 180 {
+                break;
+            }
+            window = later_closing_window(window, end, attempt).unwrap();
+            assert_eq!(window.latest, 200);
+        }
+        assert_eq!(heard, [120, 150, 190]);
+        assert!(later_closing_window(window, 200, 0).is_none());
+        assert!(later_closing_window(window, window.earliest - 1, 0).is_none());
+    }
+    #[test]
+    fn ending_alternatives_stop_after_eight_distinct_candidates() {
+        let mut window = mixlib_planner::ChainClosingWindow {
+            earliest: 100,
+            latest: 1000,
+        };
+        let mut attempts = 0;
+        loop {
+            let end = window.earliest;
+            let next = later_closing_window(window, end, attempts);
+            attempts += 1;
+            let Some(next) = next else { break };
+            assert!(next.earliest > end);
+            window = next;
+        }
+        assert_eq!(attempts, 8);
     }
     #[test]
     fn repeats_fill_clock_but_do_not_earn_development_credit() {

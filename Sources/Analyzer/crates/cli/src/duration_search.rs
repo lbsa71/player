@@ -5,7 +5,9 @@ use crate::{
     search_cache::Cache,
     tactics::{CandidateQueue, MeasuredEdge},
 };
-use mixlib_planner::{BaselineCueIndex, CandidateEvidenceCache, EventCueIndex, StitchRequest, TrackPacing};
+use mixlib_planner::{
+    BaselineCueIndex, CandidateEvidenceCache, EventCueIndex, StitchRequest, TrackPacing,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -278,14 +280,24 @@ impl Search<'_> {
             outgoing_after_frame: after,
         };
         let plans = if limit == 1 {
-            self.baseline_cues.candidates(&self.snapshot,&request,self.policy,4,cancel)?
+            self.baseline_cues
+                .candidates(&self.snapshot, &request, self.policy, 4, cancel)?
         } else if limit == 0 {
-            self.event_cues.candidates(&self.snapshot,&request,self.policy,2,cancel)?
+            self.event_cues
+                .candidates(&self.snapshot, &request, self.policy, 2, cancel)?
         } else {
-            match mixlib_planner::tactic_stitch_candidates(&self.snapshot,&request,self.policy,limit,cancel) {
-                Ok(plans)=>plans,
-                Err(e) if matches!(e.code.as_str(),"STITCH_INFEASIBLE"|"STITCH_EXCLUDED")=>vec![],
-                Err(e)=>return Err(e),
+            match mixlib_planner::tactic_stitch_candidates(
+                &self.snapshot,
+                &request,
+                self.policy,
+                limit,
+                cancel,
+            ) {
+                Ok(plans) => plans,
+                Err(e) if matches!(e.code.as_str(), "STITCH_INFEASIBLE" | "STITCH_EXCLUDED") => {
+                    vec![]
+                }
+                Err(e) => return Err(e),
             }
         };
         self.stats.proposed_pairs += 1;
@@ -342,46 +354,86 @@ impl Search<'_> {
     }
     /// Independent PCM windows share four persistent worker caches. Registration
     /// and durable writes remain serial after the scoped workers finish.
-    fn measure_batch(&mut self,seeds:&[MixPlan],cancel:&Cancellation)->Result<Vec<Measurement>> {
-        let mut result=vec![Measurement::default();seeds.len()];
-        let mut fresh=vec![];
-        let mut seen=BTreeSet::new();
-        for (i,seed) in seeds.iter().enumerate() {
-            let key=window_key(&self.cache,seed)?;
-            if !seen.insert(key.clone()) {continue;}
+    fn measure_batch(
+        &mut self,
+        seeds: &[MixPlan],
+        cancel: &Cancellation,
+    ) -> Result<Vec<Measurement>> {
+        let mut result = vec![Measurement::default(); seeds.len()];
+        let mut fresh = vec![];
+        let mut seen = BTreeSet::new();
+        for (i, seed) in seeds.iter().enumerate() {
+            let key = window_key(&self.cache, seed)?;
+            if !seen.insert(key.clone()) {
+                continue;
+            }
             if self.measured_keys.contains(&key) || self.negative_windows.contains(&key) {
-                result[i]=self.measure(seed,cancel)?;
-            } else { fresh.push((i,key,seed)); }
+                result[i] = self.measure(seed, cancel)?;
+            } else {
+                fresh.push((i, key, seed));
+            }
         }
-        if self.worker_facts.is_empty() {self.worker_facts=(0..4).map(|_|CandidateEvidenceCache::new()).collect();}
-        let n=self.worker_facts.len();
-        let snapshot=&self.snapshot; let policy=self.policy;let cache=&self.cache;let context=self.context;
-        let measured=std::thread::scope(|scope|->Result<Vec<_>> {
-            let tasks=self.worker_facts.iter_mut().enumerate().map(|(worker,facts)| {
-                let fresh=&fresh;
-                scope.spawn(move||->Result<Vec<_>> {
-                    fresh.iter().skip(worker).step_by(n).map(|(i,key,seed)| {
-                        cancel.check()?;
-                        Ok((*i,key.clone(),measure_candidate(snapshot,policy,cache,facts,seed,context,cancel)?))
-                    }).collect()
+        if self.worker_facts.is_empty() {
+            self.worker_facts = (0..4).map(|_| CandidateEvidenceCache::new()).collect();
+        }
+        let n = self.worker_facts.len();
+        let snapshot = &self.snapshot;
+        let policy = self.policy;
+        let cache = &self.cache;
+        let context = self.context;
+        let measured = std::thread::scope(|scope| -> Result<Vec<_>> {
+            let tasks = self
+                .worker_facts
+                .iter_mut()
+                .enumerate()
+                .map(|(worker, facts)| {
+                    let fresh = &fresh;
+                    scope.spawn(move || -> Result<Vec<_>> {
+                        fresh
+                            .iter()
+                            .skip(worker)
+                            .step_by(n)
+                            .map(|(i, key, seed)| {
+                                cancel.check()?;
+                                Ok((
+                                    *i,
+                                    key.clone(),
+                                    measure_candidate(
+                                        snapshot, policy, cache, facts, seed, context, cancel,
+                                    )?,
+                                ))
+                            })
+                            .collect()
+                    })
                 })
-            }).collect::<Vec<_>>();
-            let mut all=vec![];
-            for task in tasks {all.extend(task.join().map_err(|_|Error::new("TACTIC_WORKER","measurement worker failed"))??);}
+                .collect::<Vec<_>>();
+            let mut all = vec![];
+            for task in tasks {
+                all.extend(
+                    task.join()
+                        .map_err(|_| Error::new("TACTIC_WORKER", "measurement worker failed"))??,
+                );
+            }
             Ok(all)
         })?;
-        for (i,key,measurement) in measured {
-            self.stats.measured_windows+=1;
-            self.stats.admitted_choices+=measurement.edges.len();
-            self.cache.write(self.store,"windows",&key,&measurement)?;
+        for (i, key, measurement) in measured {
+            self.stats.measured_windows += 1;
+            self.stats.admitted_choices += measurement.edges.len();
+            self.cache
+                .write(self.store, "windows", &key, &measurement)?;
             self.measured_keys.insert(key.clone());
-            if measurement.edges.iter().all(|e|e.last_resort) && measurement.continuations.is_empty() {self.negative_windows.insert(key);}
-            for edge in &measurement.edges {self.register(edge)?;}
-            result[i]=measurement;
+            if measurement.edges.iter().all(|e| e.last_resort)
+                && measurement.continuations.is_empty()
+            {
+                self.negative_windows.insert(key);
+            }
+            for edge in &measurement.edges {
+                self.register(edge)?;
+            }
+            result[i] = measurement;
         }
         Ok(result)
     }
-
 }
 pub(super) fn window_key(cache: &Cache, seed: &MixPlan) -> Result<String> {
     // Time maps (including all tempo ramps), source intervals and cue facts

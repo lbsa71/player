@@ -1,8 +1,8 @@
 mod chain;
 mod composition;
 mod cue_sweep;
-mod duration_search;
 mod discovery_schedule;
+mod duration_search;
 mod historical_seeds;
 mod lazy_solver;
 mod measured_beam;

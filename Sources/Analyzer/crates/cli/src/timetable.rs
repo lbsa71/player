@@ -102,6 +102,59 @@ fn held_bars(t: &TacticPlan) -> f64 {
         .sum()
 }
 
+fn search_evidence(plan: &MixPlan) -> Option<(&'static str, &Value)> {
+    ["set_refinement", "lazy_search", "dense_anchor_search"]
+        .into_iter()
+        .find_map(|key| plan.header.extensions.get(key).map(|value| (key, value)))
+}
+
+fn search_footer(plan: &MixPlan) -> String {
+    let Some((kind, search)) = search_evidence(plan) else {
+        return String::new();
+    };
+    if kind == "set_refinement" {
+        let count = |key: &str| {
+            search[key]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        };
+        return format!(
+            "\n## Set search evidence\n\nStopped at `{}` after {:.1} seconds: {} prepared tracks, {} newly measured windows, {} cached windows, and {} known good choices. The search examined {} complete drafts, measured {} ordered track pairs, attempted {} musical closings, and pruned {} branches by their objective bound. These are the finalized run statistics.\n",
+            search["status"].as_str().unwrap_or("unknown"),
+            search["elapsed_seconds"].as_f64().unwrap_or(0.),
+            count("prepared_tracks"), count("measured_windows"), count("cached_windows"),
+            count("known_good_choices"), count("complete_drafts_examined"),
+            count("measured_ordered_pairs"), count("closing_attempts"), count("bound_pruned")
+        );
+    }
+    let mut markdown = String::new();
+    if let Some(search) = plan.header.extensions.get("lazy_search") {
+        let stats = &search["stats"];
+        markdown.push_str(&format!(
+            "\n## Lazy search evidence\n\nStopped at `{}` after {:.1} seconds: {} measured windows, {} cached uses, {} cheap branch rejections, {} objective-bound rejections, and {} frontier drops. Frontier drops are budget decisions, not proofs of infeasibility.\n\n| Origin | Seconds | Measurements | Sustained quality after pacing | Composition score |\n|---|---:|---:|---:|---:|\n",
+            search["status"].as_str().unwrap_or("unknown"),
+            search["elapsed_seconds"].as_f64().unwrap_or(0.),
+            stats["measured_windows"], stats["cached_window_uses"],
+            stats["cheap_rejections"], stats["bound_rejections"], stats["frontier_dropped"]
+        ));
+        for entry in search["improvements"].as_array().into_iter().flatten() {
+            markdown.push_str(&format!(
+                "| {} | {:.1} | {} | {:.3} | {} |\n",
+                cell(entry["origin"].as_str().unwrap_or("searched")),
+                entry["elapsed_seconds"].as_f64().unwrap_or(0.),
+                entry["measured_windows"],
+                entry["sustained_after_pacing"].as_f64().unwrap_or(0.),
+                entry["composition"]["objective"]
+                    .as_f64()
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "—".into())
+            ));
+        }
+    }
+    markdown
+}
+
 pub(super) fn build(
     store: &Store,
     plan: &MixPlan,
@@ -177,7 +230,7 @@ pub(super) fn build(
     let comparisons = measured_beam::route_comparisons(plan);
     let data = json!({"version":1,"plan_id":plan.plan_id,"duration_seconds":plan.total_output_frames as f64/rate,
         "evidence_basis":"Exact saved schedule; profiles remeasured without cue/tactic selection. Heuristic scores, not probabilities.",
-        "rows":rows,"set_config":plan.header.extensions.get("set_config"),"required_pairs":plan.header.extensions.get("required_pairs"),"set_arrangement":arrangement,"frame_coordinate_system":"base timeline; mix_seconds includes replays","set_composition":plan.header.extensions.get("set_composition"),"route_comparisons":comparisons,"search":plan.header.extensions.get("lazy_search").or_else(||plan.header.extensions.get("dense_anchor_search"))});
+        "rows":rows,"set_config":plan.header.extensions.get("set_config"),"required_pairs":plan.header.extensions.get("required_pairs"),"set_arrangement":arrangement,"frame_coordinate_system":"base timeline; mix_seconds includes replays","set_composition":plan.header.extensions.get("set_composition"),"route_comparisons":comparisons,"search":search_evidence(plan).map(|(_, value)| value)});
     let mut markdown = format!("# Mix timetable and evidence\n\nPlan `{}` · duration **{}**.\n\nRows describe the saved choices. Evidence is remeasured for those cues and the chosen exit variant; no tracks or tactics are reselected. Scores are heuristics, not probabilities.\n\n| # | Track | Mix presence | Incoming transition | Hold / resolution | Source excerpt | Evidence / reason |\n|---|---|---|---|---|---|---|\n", plan.plan_id, clock(plan.total_output_frames as f64/rate));
     for row in &rows {
         let t = &row["transition"];
@@ -362,35 +415,51 @@ pub(super) fn build(
             }
         }
     }
-    if let Some(search) = plan.header.extensions.get("lazy_search") {
-        let stats = &search["stats"];
-        markdown.push_str(&format!(
-            "\n## Lazy search evidence\n\nStopped at `{}` after {:.1} seconds: {} measured windows, {} cached uses, {} cheap branch rejections, {} objective-bound rejections, and {} frontier drops. Frontier drops are budget decisions, not proofs of infeasibility.\n\n| Origin | Seconds | Measurements | Sustained quality after pacing | Composition score |\n|---|---:|---:|---:|---:|\n",
-            search["status"].as_str().unwrap_or("unknown"),
-            search["elapsed_seconds"].as_f64().unwrap_or(0.),
-            stats["measured_windows"], stats["cached_window_uses"],
-            stats["cheap_rejections"], stats["bound_rejections"], stats["frontier_dropped"]
-        ));
-        for entry in search["improvements"].as_array().into_iter().flatten() {
-            markdown.push_str(&format!(
-                "| {} | {:.1} | {} | {:.3} | {} |\n",
-                cell(entry["origin"].as_str().unwrap_or("searched")),
-                entry["elapsed_seconds"].as_f64().unwrap_or(0.),
-                entry["measured_windows"],
-                entry["sustained_after_pacing"].as_f64().unwrap_or(0.),
-                entry["composition"]["objective"]
-                    .as_f64()
-                    .map(|v| format!("{v:.3}"))
-                    .unwrap_or_else(|| "—".into())
-            ));
-        }
-    }
+    markdown.push_str(&search_footer(plan));
     Ok((data, markdown))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_refinement_statistics_replace_stale_incumbent_search_evidence() {
+        let mut plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        let stale =
+            json!({"status":"incumbent","elapsed_seconds":133.,"stats":{"measured_windows":0}});
+        let final_run = json!({
+            "status":"refinement_budget","elapsed_seconds":480.,"prepared_tracks":73,
+            "measured_windows":362,"cached_windows":130,"known_good_choices":883,
+            "complete_drafts_examined":45678,"measured_ordered_pairs":188,
+            "closing_attempts":192,"bound_pruned":4
+        });
+        plan.header
+            .extensions
+            .insert("lazy_search".into(), stale.clone());
+        plan.header
+            .extensions
+            .insert("set_refinement".into(), final_run.clone());
+        assert_eq!(search_evidence(&plan), Some(("set_refinement", &final_run)));
+        let footer = search_footer(&plan);
+        for expected in [
+            "480.0 seconds",
+            "73 prepared tracks",
+            "362 newly measured windows",
+            "130 cached windows",
+            "883 known good choices",
+        ] {
+            assert!(
+                footer.contains(expected),
+                "missing finalized statistic: {expected}"
+            );
+        }
+        assert!(!footer.contains("133.0 seconds"));
+        assert!(!footer.contains("null"));
+        plan.header.extensions.remove("set_refinement");
+        assert_eq!(search_evidence(&plan), Some(("lazy_search", &stale)));
+        assert!(search_footer(&plan).contains("133.0 seconds"));
+    }
     #[test]
     fn exit_evidence_never_falls_back_to_a_different_variant() {
         let mut pair = PairEvidence::default();

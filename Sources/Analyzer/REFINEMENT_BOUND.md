@@ -57,3 +57,19 @@ The bounds and lock invariants are implemented and tested in
 `crates/cli/src/refinement_branches.rs`. Actual pruning, required-order checks,
 draft preservation and frontier resume are covered by tests in
 `crates/cli/src/complete_refinement.rs`.
+
+
+## Discovery and persistence are separate budgets
+
+Expensive cue measurements alternate targeted repairs with fair whole-pool
+probes. Reaching the measurement allowance does not stop assembly immediately:
+a final bounded pass can use the last measured edges, remaining branches and
+retained layouts, subject to the overall time limit. Exhausting that slice is
+still a budget outcome, not a proof that every possible set was searched.
+
+The best complete draft and approved incumbent are persisted immediately.
+Full candidate/branch snapshots are throttled to once per minute and forced
+at normal completion. Stable content-addressed buckets keep unchanged chunks
+reusable; existing chunks are checksum-verified before reuse. The latest small
+best checkpoint restores independently of an older full frontier. Search
+reports expose closing failures separately from missing measured joins.

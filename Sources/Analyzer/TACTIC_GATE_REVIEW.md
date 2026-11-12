@@ -120,3 +120,71 @@ retain the separate unresolved/export meaning above.
    Record the effect of each density/stability threshold before changing it.
 6. Diagnostics distinguish a short-window M01 shape failure from a measured
    harmonic clash and distinguish unknown headroom from an excessive peak.
+
+## Historical windows are remeasured, never grandfathered
+
+Changing cue-generation code can change the admission cache fingerprint even
+when the audible rules stay the same. Search recovers up to 256 promising pair
+windows from the two newest previous namespaces for the same musical policy.
+Each record must pass its payload checksum, current source signature, and the
+audio, analysis and correction pins for both tracks. Missing signatures and
+changed recordings are discarded. Completed sets and frontier checkpoints are
+not imported.
+
+Only source intervals, tempo maps and timing intent become new proposals.
+Historical tactic schedules, approval evidence and quality scores are stripped;
+the current selector measures and admits every recovered window again. The
+bounded queue balances long mashup/handoff windows with baseline windows and
+spreads both groups across track pairs. Previous success can prioritize where
+to measure, but cannot bypass any present vocal, harmony, rhythm or headroom
+gate. Regression tests cover obsolete approvals, changed source pins, duplicate
+windows and corrupt checksums.
+
+## Coverage and baseline cue repair
+
+The 73-track audit found only 157 measured ordered pairs out of 5,256, with
+admitted choices touching 24 tracks. Of 359 baseline diagnostics, 219 failed
+construction at actual vocal gates; none of the 121 successfully constructed
+profiles failed measured headroom. Unknown headroom after a vocal failure was
+not evidence of an excessively strict peak gate. Even a deliberately optimistic
+path through those measured cues reached only 35.64 minutes before replays.
+
+The baseline proposal index now checks the actual incoming start and outgoing
+finish for supported vocal gaps, ranks possible interior overlap, and preserves
+late outgoing and early incoming alternatives. Continuing vocals at the outgoing
+start or incoming finish do not constitute a vocal switch. Full schedule-specific
+vocal checks still decide admission. Source descriptors and quiet spans are
+cached once per track; four worker caches measure independent windows in parallel.
+
+Discovery alternates targeted repairs with an independent ordered-pair sweep.
+Each global round touches every source before starting another destination
+rotation. The first four sweeps request baseline exits after 60%, 35%, 80%, and
+the minimum usable source point, with duplicates removed; event and generic
+proposals follow. Targeted baseline probes account for the retained entry and
+minimum development at the allowed playback speed. Event and held-mashup probes
+retain their phrase-based threshold because their actual audible holds can earn
+development credit. Exploration also reserves a measurement lane for dynamic
+and revalidated historical proposals.
+
+Assembly rotates its edge repair queue and retains long resolved components
+alongside strong musical alternatives. A resolved component is eligible for
+musical closing when its available tail plus the permitted verified replays
+could reach the requested duration. This eligibility only triggers the ordinary
+closing and replay checks; it is never permission to invent source time or
+export unresolved joins. Search reports include proposed/measured ordered pairs,
+global sweep cursor and closing attempts so future coverage failures are visible.
+
+
+The duration-retention quota is diversified by terminal song first, then by
+measured incoming cue and used-song state. Keeping many near-identical routes
+at one blocked endpoint is not meaningful order coverage. The measured legacy
+frontier contained 31 active drafts but only two terminal states; the regression
+now preserves distinct continuation opportunities without deleting parked work.
+
+Closing diagnostics separate absent duration windows, rejected musical endings,
+insufficient measured replay material and final composition failures. When a
+preferred ending leaves too much time to fill with verified loops, the composer
+tries up to eight successively later musical endpoints inside the original
+allowed source window. Each endpoint is chosen and checked by the same musical
+bookend path. The retry does not extend the replay allowance or weaken the
+ending, vocal, buildup or development checks.

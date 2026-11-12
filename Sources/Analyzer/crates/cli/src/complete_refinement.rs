@@ -1,7 +1,11 @@
 //! Whole-set local refinement. Nil is an unresolved planning edge, never an
 //! executable or admitted musical tactic. Only a fully validated plan exports.
 use super::*;
-use crate::{discovery_schedule::{Probe, Schedule}, refinement_branches::Branch, refinement_layout};
+use crate::{
+    discovery_schedule::{Probe, Schedule},
+    refinement_branches::Branch,
+    refinement_layout,
+};
 use std::collections::VecDeque;
 
 #[derive(Clone)]
@@ -45,11 +49,13 @@ struct Scheduler {
     generation: usize,
     pool_cursor: usize,
     repair_cursor: usize,
-    proposed_pairs: BTreeSet<(usize,usize)>,
-    measured_pairs: BTreeSet<(usize,usize)>,
+    proposed_pairs: BTreeSet<(usize, usize)>,
+    measured_pairs: BTreeSet<(usize, usize)>,
     closing_attempts: usize,
+    closing_diagnostics: crate::composition::CloseDiagnostics,
     bound_pruned: usize,
     cache_loaded: bool,
+    frontier_saved: Option<Instant>,
     branches: VecDeque<Branch>,
     branch_roots: BTreeSet<String>,
     branches_expanded: usize,
@@ -64,8 +70,32 @@ fn unrestricted_upper_bound(pool_len: usize, request: Request) -> f64 {
     pool_len.saturating_sub(1) as f64 * mixlib_planner::MAX_TACTIC_CONTINUATION_SECONDS
         / (request.min() / 60.)
 }
-fn closing_capacity(maximum:u64,rate:f64,minimum_seconds:f64)->bool {
-    maximum as f64/rate*(1.+MAX_REPLAY_FRACTION)+1e-6>=minimum_seconds
+fn closing_capacity(maximum: u64, rate: f64, minimum_seconds: f64) -> bool {
+    maximum as f64 / rate * (1. + MAX_REPLAY_FRACTION) + 1e-6 >= minimum_seconds
+}
+fn frontier_parts(cache: &Cache, store: &Store, rows: Vec<Value>) -> Result<Vec<String>> {
+    // Removing the first parked item or changing the best candidate must not
+    // shift every subsequent chunk. Stable hash buckets localize membership
+    // changes, and content-addressed chunks remain reusable across snapshots.
+    let mut buckets: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
+    for row in rows {
+        let key = canonical_hash(&row)?.digest;
+        buckets
+            .entry(key[..2].to_owned())
+            .or_default()
+            .insert(key, row);
+    }
+    let mut parts = vec![];
+    for bucket in buckets.into_values() {
+        let rows = bucket.into_values().collect::<Vec<_>>();
+        for chunk in rows.chunks(128) {
+            let payload = json!(chunk);
+            let part = canonical_hash(&payload)?.digest;
+            cache.write_immutable(store, "refinement-frontier-parts", &part, &payload)?;
+            parts.push(part);
+        }
+    }
+    Ok(parts)
 }
 fn shuffled_key(index: usize, generation: usize) -> u64 {
     let mut x = (index as u64).wrapping_add((generation as u64).wrapping_mul(0x9e3779b97f4a7c15));
@@ -418,7 +448,10 @@ impl Refiner<'_> {
         }
         Ok(())
     }
-    fn branch_step(&mut self, cancel: &Cancellation) -> Result<()> {
+    fn branch_step(&mut self, cancel: &Cancellation, deadline: Instant) -> Result<()> {
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
         let Some(branch) = self.scheduler.branches.pop_front() else {
             return Ok(());
         };
@@ -452,6 +485,13 @@ impl Refiner<'_> {
             priority(b).total_cmp(&priority(a))
         });
         for mut child in branch.children(&alternatives).into_iter().rev() {
+            cancel.check()?;
+            if Instant::now() >= deadline {
+                // Revisit this root on resume. Already admitted completions
+                // remain deduplicated; unvisited alternatives must not vanish.
+                self.scheduler.branches.push_front(branch);
+                return Ok(());
+            }
             // Nil is allowed in the uncommitted completion. Permanently fixing
             // a nil join can never satisfy the export contract, so this child is
             // provably infeasible. A later graph revision seeds a new root.
@@ -473,6 +513,67 @@ impl Refiner<'_> {
             }
             if !child.leaf() {
                 self.scheduler.branches.push_front(child);
+            }
+        }
+        Ok(())
+    }
+    /// The PCM budget limits discovery, not assembly of already measured joins.
+    /// Give the final bridges a bounded chance to become a complete set, even
+    /// when the last batch exhausted discovery or its measurement allowance.
+    fn drain_pending(
+        &mut self,
+        cancel: &Cancellation,
+        deadline: Instant,
+        remaining_generations: usize,
+    ) -> Result<()> {
+        if self.edges.is_empty() || Instant::now() >= deadline {
+            return Ok(());
+        }
+        let deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(60));
+        let mut rotations = 0;
+        let rotation_limit = remaining_generations.min(8);
+        let mut progress = Instant::now();
+        for turn in 0..256 {
+            cancel.check()?;
+            if Instant::now() >= deadline {
+                break;
+            }
+            let before = (
+                self.seen.len(),
+                self.attempted_repairs.len(),
+                self.scheduler.branches.len(),
+                self.scheduler.branches_expanded,
+                self.scheduler.closing_attempts,
+            );
+            for _ in 0..4 {
+                self.branch_step(cancel, deadline)?;
+            }
+            self.repair(
+                cancel,
+                deadline.min(Instant::now() + std::time::Duration::from_millis(400)),
+            )?;
+            let after = (
+                self.seen.len(),
+                self.attempted_repairs.len(),
+                self.scheduler.branches.len(),
+                self.scheduler.branches_expanded,
+                self.scheduler.closing_attempts,
+            );
+            let worked = before != after;
+            if rotations < rotation_limit && (!worked || turn % 4 == 3) {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                // Rotation also restores a parked candidate, so a retained
+                // alternative can benefit from the most recent measured edge.
+                self.regenerate(cancel)?;
+                rotations += 1;
+            } else if !worked && self.scheduler.branches.is_empty() {
+                break;
+            }
+            if progress.elapsed().as_secs() >= 10 {
+                self.checkpoint("assembling_measured_graph")?;
+                progress = Instant::now();
             }
         }
         Ok(())
@@ -563,15 +664,35 @@ impl Refiner<'_> {
             "measured_windows":self.search.stats.measured_windows,"cached_windows":self.search.stats.cached_windows,
             "known_good_choices":self.edges.len(),"complete_drafts_examined":self.seen.len(),"rounds":self.rounds,
             "rejected_layouts":self.rejected_layouts,"history":self.history,
-            "generated_layouts":self.scheduler.generation,"global_pair_cursor":self.scheduler.pool_cursor,"proposed_ordered_pairs":self.scheduler.proposed_pairs.len(),"measured_ordered_pairs":self.scheduler.measured_pairs.len(),"closing_attempts":self.scheduler.closing_attempts,"parked_candidates":self.scheduler.parked.len(),
+            "generated_layouts":self.scheduler.generation,"global_pair_cursor":self.scheduler.pool_cursor,"proposed_ordered_pairs":self.scheduler.proposed_pairs.len(),"measured_ordered_pairs":self.scheduler.measured_pairs.len(),"closing_attempts":self.scheduler.closing_attempts,"closing_diagnostics":self.scheduler.closing_diagnostics,"parked_candidates":self.scheduler.parked.len(),
             "bound_pruned":self.scheduler.bound_pruned,"fixed_order_branches":self.scheduler.branches.len(),"branches_expanded":self.scheduler.branches_expanded,"infeasible_committed_nil_branches":self.scheduler.impossible_branches,"optimistic_objective_bound":unrestricted_upper_bound(self.search.pool.len(),self.search.request),
             "bound_scope":"Unrestricted replacements; at most 120 sustained quality-seconds per possible unique-song join, all future penalties relaxed. Loose until more choices are fixed.",
             "best_plan_id":self.search.incumbent.as_ref().map(|p|&p.plan_id)}));
         self.search.store.report(&self.draft_report)?;
         if self.scheduler.cache_loaded {
-            self.save_frontier()?;
+            self.save_best()?;
+            if self
+                .scheduler
+                .frontier_saved
+                .is_none_or(|at| at.elapsed().as_secs() >= 60)
+            {
+                self.save_frontier()?;
+                self.scheduler.frontier_saved = Some(Instant::now());
+            }
         }
-        eprintln!("set refinement: {status} | full {:.2} min draft | {} nil / {} measured joins | score {:.4} | {} fresh / {} cached windows | {:.1}s",
+        let approved = self.search.incumbent.as_ref().map_or_else(
+            || "not yet approved".to_owned(),
+            |plan| {
+                let seconds = plan.total_output_frames / u64::from(plan.output.sample_rate_hz);
+                format!(
+                    "approved {:02}:{:02} / {} tracks",
+                    seconds / 60,
+                    seconds % 60,
+                    plan.placements.len()
+                )
+            },
+        );
+        eprintln!("set refinement: {status} | {approved} | full {:.2} min draft | {} nil / {} measured draft joins | draft score {:.4} | {} fresh / {} cached windows | {:.1}s",
             best.lengths.iter().sum::<u64>() as f64/self.rate()/60.,best.nil(),best.edges().len(),best.score,
             self.search.stats.measured_windows,self.search.stats.cached_windows,self.search.started.elapsed().as_secs_f64());
         Ok(())
@@ -590,12 +711,22 @@ impl Refiner<'_> {
         // A resolved component can already fill the hour using verified phrase
         // replays. Do not force a raw57-minute chain before asking the composer.
         for block in &draft.blocks {
-            if !closing_capacity(block.maximum,self.rate(),self.search.request.min()) {continue;}
-            if let Some(plan)=&block.plan {
-                if self.search.required.satisfied(plan) && self.attempted_final.insert(block.edges.clone()) {
-                    self.scheduler.closing_attempts+=1;
-                    if let Some(finished)=self.search.composer.close(&self.search.snapshot,plan,cancel)? {
-                        self.search.save(finished,"whole_set_refinement",cancel)?;
+            if !closing_capacity(block.maximum, self.rate(), self.search.request.min()) {
+                continue;
+            }
+            if let Some(plan) = &block.plan {
+                if self.search.required.satisfied(plan)
+                    && self.attempted_final.insert(block.edges.clone())
+                {
+                    self.scheduler.closing_attempts += 1;
+                    let (finished, diagnostics) = self.search.composer.close_with_diagnostics(
+                        &self.search.snapshot,
+                        plan,
+                        cancel,
+                    )?;
+                    self.scheduler.closing_diagnostics.merge(&diagnostics);
+                    if let Some(finished) = finished {
+                        self.search.save(finished, "whole_set_refinement", cancel)?;
                     }
                 }
             }
@@ -613,6 +744,18 @@ impl Refiner<'_> {
         self.seed_branch(&draft)?;
         self.population.push(draft);
         Ok(())
+    }
+    fn continuation_state(&self, draft: &Draft) -> Option<(usize, u64, Vec<usize>)> {
+        let block = draft
+            .blocks
+            .iter()
+            .filter(|b| !b.edges.is_empty())
+            .max_by_key(|b| b.maximum)?;
+        let last = *block.tracks.last()?;
+        let entry = self.edges[*block.edges.last()?].entry_end;
+        let mut used = block.tracks.clone();
+        used.sort_unstable();
+        Some((last, entry, used))
     }
     fn prune(&mut self) {
         self.population.sort_by(|a, b| {
@@ -638,12 +781,61 @@ impl Refiner<'_> {
         }
         // Long resolved components are useful stepping stones toward duration,
         // even when ordinary blends give them little sustained-quality credit.
-        self.population.sort_by(|a,b| {
-            let length=|d:&Draft|d.blocks.iter().filter(|b|!b.edges.is_empty()).map(|b|b.maximum).max().unwrap_or(0);
-            length(b).cmp(&length(a)).then_with(||b.score.total_cmp(&a.score))
+        self.population.sort_by(|a, b| {
+            let length = |d: &Draft| {
+                d.blocks
+                    .iter()
+                    .filter(|b| !b.edges.is_empty())
+                    .map(|b| b.maximum)
+                    .max()
+                    .unwrap_or(0)
+            };
+            length(b)
+                .cmp(&length(a))
+                .then_with(|| b.score.total_cmp(&a.score))
         });
-        for d in self.population.iter().take(8) {
-            if !kept.iter().any(|k|k.key==d.key){kept.push(d.clone());}
+        let limit = kept.len() + 8;
+        let mut states = kept
+            .iter()
+            .filter_map(|d| self.continuation_state(d))
+            .collect::<BTreeSet<_>>();
+        let mut terminals = states.iter().map(|s| s.0).collect::<BTreeSet<_>>();
+        // Extending a component depends on its last song, entry cue and which
+        // songs remain unused. Eight variants of one blocked endpoint are not
+        // eight useful duration alternatives. Cover new terminal songs first.
+        for draft in &self.population {
+            if kept.len() >= limit {
+                break;
+            }
+            if let Some(state) = self.continuation_state(draft) {
+                if terminals.insert(state.0) {
+                    states.insert(state);
+                    kept.push(draft.clone());
+                }
+            }
+        }
+        // Then preserve alternate entry/used-song states at known endpoints.
+        // Exact measured entry coordinates avoid inventing an admission gate.
+        for draft in &self.population {
+            if kept.len() >= limit {
+                break;
+            }
+            if let Some(state) = self.continuation_state(draft) {
+                if states.insert(state) {
+                    kept.push(draft.clone());
+                }
+            }
+        }
+        // If the graph has fewer distinct continuation states, fill the rest
+        // with its longest resolved alternatives rather than dropping capacity.
+        for draft in &self.population {
+            if kept.len() >= limit {
+                break;
+            }
+            if self.continuation_state(draft).is_some() && !kept.iter().any(|k| k.key == draft.key)
+            {
+                kept.push(draft.clone());
+            }
         }
         for draft in self.population.drain(..) {
             if !kept.iter().any(|k| k.key == draft.key) {
@@ -689,38 +881,119 @@ impl Refiner<'_> {
             let choices=self.assignments(d).into_iter().map(|i|i.map(|i|self.persistent_key(i)).transpose()).collect::<Result<Vec<_>>>()?;
             Ok(json!({"choices":choices,"tracks":d.tracks().iter().map(|&i|&self.search.pool[i].track_id).collect::<Vec<_>>() }))
         }).collect::<Result<Vec<_>>>()?;
-        let mut parts = vec![];
-        for chunk in seeds.chunks(128) {
-            let payload = json!(chunk);
-            let part = canonical_hash(&payload)?.digest;
-            self.search.cache.write(
-                self.search.store,
-                "refinement-frontier-parts",
-                &part,
-                &payload,
-            )?;
-            parts.push(part);
-        }
+        let parts = frontier_parts(&self.search.cache, self.search.store, seeds)?;
         // Persist fixed-order work separately. Rebuild/rescore every restored
         // completion; no stale draft admission is trusted.
         let branches=self.scheduler.branches.iter().map(|b| {
             let choices=b.choices.iter().map(|i|i.map(|i|self.persistent_key(i)).transpose()).collect::<Result<Vec<_>>>()?;
             Ok(json!({"choices":choices,"tracks":b.order.iter().map(|&i|&self.search.pool[i].track_id).collect::<Vec<_>>(),"locked":b.locked}))
         }).collect::<Result<Vec<_>>>()?;
-        let mut branch_parts = vec![];
-        for chunk in branches.chunks(128) {
-            let payload = json!(chunk);
-            let part = canonical_hash(&payload)?.digest;
-            self.search.cache.write(
-                self.search.store,
-                "refinement-frontier-parts",
-                &part,
-                &payload,
-            )?;
-            branch_parts.push(part);
-        }
+        let branch_parts = frontier_parts(&self.search.cache, self.search.store, branches)?;
         self.search.cache.write(self.search.store,"refinement-frontiers",&key,&json!({
             "version":2,"sources":self.search.cache.sources,"generation":self.scheduler.generation,"pool_cursor":self.scheduler.pool_cursor,"parts":parts,"branch_parts":branch_parts}))
+    }
+    fn save_best(&self) -> Result<()> {
+        let Some(best) = &self.best else {
+            return Ok(());
+        };
+        let choices = self
+            .assignments(best)
+            .into_iter()
+            .map(|i| i.map(|i| self.persistent_key(i)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let key = Cache::set_key(self.search.policy)?;
+        self.search.cache.write(self.search.store, "refinement-best", &key, &json!({
+            "version":1,"sources":self.search.cache.sources,
+            "generation":self.scheduler.generation,"pool_cursor":self.scheduler.pool_cursor,
+            "tracks":best.tracks().iter().map(|&i| &self.search.pool[i].track_id).collect::<Vec<_>>(),
+            "choices":choices
+        }))
+    }
+    fn restore_best(&mut self, cancel: &Cancellation) -> Result<()> {
+        let key = Cache::set_key(self.search.policy)?;
+        let Some(seed) =
+            self.search
+                .cache
+                .read::<Value>(self.search.store, "refinement-best", &key)?
+        else {
+            return Ok(());
+        };
+        let valid = seed["sources"].as_object().is_some_and(|sources| {
+            sources.iter().all(|(id, key)| {
+                self.search
+                    .cache
+                    .sources
+                    .get(id)
+                    .is_some_and(|v| key.as_str() == Some(v))
+            })
+        });
+        if !valid {
+            self.search.cache.invalid += 1;
+            return Ok(());
+        }
+        let mut lookup = self
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(i, e)| Ok((route_key(&e.plan)?, i)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        for (legacy, key) in &self.search.edge_aliases {
+            if let Some(&index) = lookup.get(key) {
+                lookup.insert(legacy.clone(), index);
+            }
+        }
+        let Some(order) = seed["tracks"].as_array().and_then(|v| {
+            v.iter()
+                .map(|id| {
+                    self.search
+                        .pool
+                        .iter()
+                        .position(|t| Some(t.track_id.as_str()) == id.as_str())
+                })
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            return Ok(());
+        };
+        let Some(choices) = seed["choices"].as_array().and_then(|v| {
+            v.iter()
+                .map(|key| {
+                    if key.is_null() {
+                        Some(None)
+                    } else {
+                        Some(Some(*lookup.get(key.as_str()?)?))
+                    }
+                })
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            return Ok(());
+        };
+        if let Some(draft) = self.fixed_candidate(&order, &choices)? {
+            self.admit(draft, cancel)?;
+            self.scheduler.generation = self
+                .scheduler
+                .generation
+                .max(seed["generation"].as_u64().unwrap_or(0) as usize);
+            self.scheduler.pool_cursor = self
+                .scheduler
+                .pool_cursor
+                .max(seed["pool_cursor"].as_u64().unwrap_or(0) as usize);
+        }
+        Ok(())
+    }
+    fn restore_state(&mut self, cancel: &Cancellation) -> Result<()> {
+        // Rebuilding frontier candidates may immediately close and save a set.
+        // Install the durable incumbent first so those completions compete with
+        // it instead of overwriting the saved winner while incumbent is empty.
+        if let Some(plan) = self
+            .search
+            .cache
+            .saved_set(self.search.store, self.search.policy)?
+        {
+            if self.search.required.satisfied(&plan) {
+                self.search.save(plan, "cached_complete_set", cancel)?;
+            }
+        }
+        self.restore_frontier(cancel)
     }
     fn restore_frontier(&mut self, cancel: &Cancellation) -> Result<()> {
         let key = Cache::set_key(self.search.policy)?;
@@ -740,7 +1013,7 @@ impl Refiner<'_> {
             });
             if valid {
                 self.scheduler.generation = saved["generation"].as_u64().unwrap_or(0) as usize;
-                self.scheduler.pool_cursor=saved["pool_cursor"].as_u64().unwrap_or(0) as usize;
+                self.scheduler.pool_cursor = saved["pool_cursor"].as_u64().unwrap_or(0) as usize;
                 let mut lookup = self
                     .edges
                     .iter()
@@ -829,7 +1102,9 @@ impl Refiner<'_> {
                 self.search.cache.invalid += 1;
             }
         }
+        self.restore_best(cancel)?;
         self.scheduler.cache_loaded = true;
+        self.scheduler.frontier_saved = Some(Instant::now());
         Ok(())
     }
     fn repair(&mut self, cancel: &Cancellation, deadline: Instant) -> Result<()> {
@@ -846,10 +1121,10 @@ impl Refiner<'_> {
                 };
                 benefit(b).total_cmp(&benefit(a))
             });
-            let cursor=self.scheduler.repair_cursor % ids.len().max(1);
+            let cursor = self.scheduler.repair_cursor % ids.len().max(1);
             ids.rotate_left(cursor);
-            for (offset,&edge) in ids.iter().enumerate() {
-                self.scheduler.repair_cursor=(cursor+offset+1)%ids.len().max(1);
+            for (offset, &edge) in ids.iter().enumerate() {
+                self.scheduler.repair_cursor = (cursor + offset + 1) % ids.len().max(1);
                 for parent in &parents {
                     cancel.check()?;
                     if Instant::now() >= deadline {
@@ -906,39 +1181,68 @@ impl Refiner<'_> {
         }
         Ok(())
     }
-    fn minimum_after(&self,track:usize,entry:u64)->u64 {
-        let rate=f64::from(self.search.pool[track].format.sample_rate_hz);
-        let development=(90f64).min(self.track_seconds(track)*0.45)*(1.+self.search.policy.max_speed_deviation);
-        self.search.pacing[track].earliest_exit(entry).max(entry.saturating_add((development*rate).ceil() as u64))
+    fn minimum_after(&self, track: usize, entry: u64) -> u64 {
+        let rate = f64::from(self.search.pool[track].format.sample_rate_hz);
+        let development = (90f64).min(self.track_seconds(track) * 0.45)
+            * (1. + self.search.policy.max_speed_deviation);
+        self.search.pacing[track]
+            .earliest_exit(entry)
+            .max(entry.saturating_add((development * rate).ceil() as u64))
     }
-    fn demands(&self)->Vec<Probe> {
-        let mut output=vec![];let mut seen=BTreeSet::new();
-        let drafts=self.best.iter().chain(self.population.iter().take(12));
+    fn demands(&self) -> Vec<Probe> {
+        let mut output = vec![];
+        let mut seen = BTreeSet::new();
+        let drafts = self.best.iter().chain(self.population.iter().take(12));
         for draft in drafts {
             // Direct unresolved boundaries first, then alternatives that reorder
             // retained components. A separate global lane cannot be starved.
-            let mut pairs=(0..draft.blocks.len().saturating_sub(1)).map(|i|(i,i+1)).collect::<Vec<_>>();
-            for a in 0..draft.blocks.len(){for b in 0..draft.blocks.len(){if a!=b{pairs.push((a,b));}}}
-            for (a,b) in pairs {
-                let from=*draft.blocks[a].tracks.last().unwrap();let to=draft.blocks[b].tracks[0];
-                let entry=draft.blocks[a].edges.last().map_or(0,|&i|self.edges[i].entry_end);
-                let minimum=self.minimum_after(from,entry);
-                let frames=self.search.pool[from].format.frames;
-                for fraction in [0.60,0.80,0.35,0.] {
-                    let probe=Probe{from,to,after:minimum.max((frames as f64*fraction) as u64),tier:1};
-                    if probe.after<frames && seen.insert(probe){output.push(probe);}
+            let mut pairs = (0..draft.blocks.len().saturating_sub(1))
+                .map(|i| (i, i + 1))
+                .collect::<Vec<_>>();
+            for a in 0..draft.blocks.len() {
+                for b in 0..draft.blocks.len() {
+                    if a != b {
+                        pairs.push((a, b));
+                    }
+                }
+            }
+            for (a, b) in pairs {
+                let from = *draft.blocks[a].tracks.last().unwrap();
+                let to = draft.blocks[b].tracks[0];
+                let entry = draft.blocks[a]
+                    .edges
+                    .last()
+                    .map_or(0, |&i| self.edges[i].entry_end);
+                let minimum = self.minimum_after(from, entry);
+                let frames = self.search.pool[from].format.frames;
+                for fraction in [0.60, 0.80, 0.35, 0.] {
+                    let probe = Probe {
+                        from,
+                        to,
+                        after: minimum.max((frames as f64 * fraction) as u64),
+                        tier: 1,
+                    };
+                    if probe.after < frames && seen.insert(probe) {
+                        output.push(probe);
+                    }
                 }
                 // Event/long-hold proposals may earn development credit and keep
                 // the original phrase-aware lower bound available as well.
-                for tier in [0,24] {
-                    let probe=Probe{from,to,after:self.search.pacing[from].earliest_exit(entry),tier};
-                    if seen.insert(probe){output.push(probe);}
+                for tier in [0, 24] {
+                    let probe = Probe {
+                        from,
+                        to,
+                        after: self.search.pacing[from].earliest_exit(entry),
+                        tier,
+                    };
+                    if seen.insert(probe) {
+                        output.push(probe);
+                    }
                 }
             }
         }
         output
     }
-
 }
 
 pub(super) fn run(
@@ -992,71 +1296,128 @@ pub(super) fn run(
     let measurement_limit = option("lazy_measurement_budget", 1536) as usize;
     r.search.load_known(cancel)?;
     r.sync_edges()?;
-    r.restore_frontier(cancel)?;
-    if let Some(plan) = r.search.cache.saved_set(store, policy)? {
-        if r.search.required.satisfied(&plan) {
-            r.search.save(plan, "cached_complete_set", cancel)?;
-        }
-    }
+    r.restore_state(cancel)?;
     r.repair(
         cancel,
         deadline.min(Instant::now() + std::time::Duration::from_secs(1)),
     )?;
-    let mut discovery=Schedule::new(r.scheduler.pool_cursor);
-    let frames=r.search.pool.iter().map(|t|t.format.frames).collect::<Vec<_>>();
-    let minimum=(0..r.search.pool.len()).map(|i|r.minimum_after(i,0)).collect::<Vec<_>>();
-    let mut measured=BTreeSet::new();
-    let mut pending=VecDeque::new();
-    let mut exploration=VecDeque::from(crate::historical_seeds::load(store,policy,&r.search.pool,&r.search.cache,cancel)?);
-    let mut progress=Instant::now();
-    let mut status="refinement_budget";
-    let generation_limit=measurement_limit.saturating_mul(2).clamp(64,10000);
-    let generation_start=r.scheduler.generation;
-    let mut turns=0usize;
-    while Instant::now()<deadline && r.search.stats.measured_windows<measurement_limit {
+    let mut discovery = Schedule::new(r.scheduler.pool_cursor);
+    let frames = r
+        .search
+        .pool
+        .iter()
+        .map(|t| t.format.frames)
+        .collect::<Vec<_>>();
+    let minimum = (0..r.search.pool.len())
+        .map(|i| r.minimum_after(i, 0))
+        .collect::<Vec<_>>();
+    let mut measured = BTreeSet::new();
+    let mut pending = VecDeque::new();
+    let mut exploration = VecDeque::from(crate::historical_seeds::load(
+        store,
+        policy,
+        &r.search.pool,
+        &r.search.cache,
+        cancel,
+    )?);
+    let mut progress = Instant::now();
+    let mut status = "refinement_budget";
+    let generation_limit = measurement_limit.saturating_mul(2).clamp(64, 10000);
+    let generation_start = r.scheduler.generation;
+    let mut turns = 0usize;
+    while Instant::now() < deadline && r.search.stats.measured_windows < measurement_limit {
         cancel.check()?;
-        if progress.elapsed().as_secs()>=10 {r.checkpoint("refining")?;progress=Instant::now();}
-        turns+=1;
-        r.branch_step(cancel)?;
-        if turns%4==0 && r.scheduler.generation-generation_start<generation_limit {
+        if progress.elapsed().as_secs() >= 10 {
+            r.checkpoint("refining")?;
+            progress = Instant::now();
+        }
+        turns += 1;
+        r.branch_step(cancel, deadline)?;
+        if turns % 4 == 0 && r.scheduler.generation - generation_start < generation_limit {
             r.regenerate(cancel)?;
         }
-        let mut batch=vec![];
-        let mut probes=0;
-        while batch.len()<4.min(measurement_limit-r.search.stats.measured_windows) && Instant::now()<deadline {
+        let mut batch = vec![];
+        let mut probes = 0;
+        while batch.len() < 4.min(measurement_limit - r.search.stats.measured_windows)
+            && Instant::now() < deadline
+        {
             // Reserve one of every four measurements for event/dynamic and
             // historical proposals. Baseline coverage keeps three lanes.
-            let seed=if batch.len()==3 && !exploration.is_empty(){exploration.pop_front()}else{pending.pop_front()};
-            if let Some(seed)=seed {
-                let key=window_key(&r.search.cache,&seed)?;
-                if measured.insert(key){batch.push(seed);}
+            let seed = if batch.len() == 3 && !exploration.is_empty() {
+                exploration.pop_front()
+            } else {
+                pending.pop_front()
+            };
+            if let Some(seed) = seed {
+                let key = window_key(&r.search.cache, &seed)?;
+                if measured.insert(key) {
+                    batch.push(seed);
+                }
                 continue;
             }
-            let targets=r.demands();
-            let Some(probe)=discovery.next(&targets,&frames,&minimum) else {
-                if let Some(seed)=exploration.pop_front(){pending.push_back(seed);continue;}
-                status="generated_probe_scope_exhausted";break;
+            let targets = r.demands();
+            let Some(probe) = discovery.next(&targets, &frames, &minimum) else {
+                if let Some(seed) = exploration.pop_front() {
+                    pending.push_back(seed);
+                    continue;
+                }
+                status = "generated_probe_scope_exhausted";
+                break;
             };
-            r.scheduler.pool_cursor=discovery.pool_cursor;
-            r.scheduler.proposed_pairs.insert((probe.from,probe.to));
-            let proposals=r.search.proposals(probe.from,probe.to,probe.after,probe.tier,cancel)?;
-            if probe.tier==1 {pending.extend(proposals);} else {exploration.extend(proposals);}
-            probes+=1;
-            if probes>=32 && batch.is_empty() && !exploration.is_empty(){pending.push_back(exploration.pop_front().unwrap());}
+            r.scheduler.pool_cursor = discovery.pool_cursor;
+            r.scheduler.proposed_pairs.insert((probe.from, probe.to));
+            let proposals =
+                r.search
+                    .proposals(probe.from, probe.to, probe.after, probe.tier, cancel)?;
+            if probe.tier == 1 {
+                pending.extend(proposals);
+            } else {
+                exploration.extend(proposals);
+            }
+            probes += 1;
+            if probes >= 32 && batch.is_empty() && !exploration.is_empty() {
+                pending.push_back(exploration.pop_front().unwrap());
+            }
         }
-        if batch.is_empty(){if status=="generated_probe_scope_exhausted"{break;}continue;}
+        if batch.is_empty() {
+            if status == "generated_probe_scope_exhausted" {
+                break;
+            }
+            continue;
+        }
         for seed in &batch {
-            let from=r.search.pool.iter().position(|t|t.track_id==seed.placements[0].track_id).unwrap();
-            let to=r.search.pool.iter().position(|t|t.track_id==seed.placements[1].track_id).unwrap();
-            r.scheduler.measured_pairs.insert((from,to));
+            let from = r
+                .search
+                .pool
+                .iter()
+                .position(|t| t.track_id == seed.placements[0].track_id)
+                .unwrap();
+            let to = r
+                .search
+                .pool
+                .iter()
+                .position(|t| t.track_id == seed.placements[1].track_id)
+                .unwrap();
+            r.scheduler.measured_pairs.insert((from, to));
         }
-        for result in r.search.measure_batch(&batch,cancel)? {exploration.extend(result.continuations);}
+        for result in r.search.measure_batch(&batch, cancel)? {
+            exploration.extend(result.continuations);
+        }
         r.sync_edges()?;
         // A small fair mutation slice after every batch prevents both cached
         // permutations and high-ranked early edges from starving new bridges.
-        r.repair(cancel,deadline.min(Instant::now()+std::time::Duration::from_millis(400)))?;
+        r.repair(
+            cancel,
+            deadline.min(Instant::now() + std::time::Duration::from_millis(400)),
+        )?;
     }
+    r.drain_pending(
+        cancel,
+        deadline,
+        generation_limit.saturating_sub(r.scheduler.generation - generation_start),
+    )?;
     r.search.snapshot.verify_read_snapshot(cancel)?;
+    r.scheduler.frontier_saved = None;
     r.checkpoint(status)?;
     let path = store.path(&format!("reports/{}.json", r.draft_report.report_id))?;
     let draft = r.draft_report.header.extensions["draft"].clone();
@@ -1328,7 +1689,11 @@ mod tests {
             .insert("set_composition".into(), json!({"objective":bound}));
         r.search.incumbent = Some(approved);
         r.scheduler.branches.push_back(branch);
-        r.branch_step(&Cancellation::default()).unwrap();
+        r.branch_step(
+            &Cancellation::default(),
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(r.scheduler.bound_pruned, 1);
         assert_eq!(r.scheduler.branches_expanded, 0);
         assert!(r.scheduler.branches.is_empty());
@@ -1351,7 +1716,11 @@ mod tests {
         let branch = Branch::new(draft.tracks(), r.assignments(&draft)).unwrap();
         r.admit(draft, &Cancellation::default()).unwrap();
         r.scheduler.branches.push_back(branch);
-        r.branch_step(&Cancellation::default()).unwrap();
+        r.branch_step(
+            &Cancellation::default(),
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(r.scheduler.impossible_branches, 1);
         assert_eq!(r.scheduler.bound_pruned, 0);
         assert!(r.scheduler.branches.is_empty());
@@ -1563,5 +1932,276 @@ mod tests {
             .branches
             .iter()
             .any(|branch| branch.choices.contains(&Some(0))));
+    }
+
+    #[test]
+    fn closing_capacity_keeps_replay_eligible_components_below_the_hour_floor() {
+        let rate = 48_000.;
+        // A fifty-minute component can reach the 57-minute floor with legal
+        // phrase replays. Requiring 57 native minutes would discard it first.
+        assert!(closing_capacity(50 * 60 * 48_000, rate, 57. * 60.));
+        assert!(!closing_capacity(49 * 60 * 48_000, rate, 57. * 60.));
+        assert!(closing_capacity(57 * 60 * 48_000, rate, 57. * 60.));
+        // The gate follows the requested set clock and actual output rate.
+        assert!(!closing_capacity(50 * 60 * 48_000, rate, 117. * 60.));
+        assert!(closing_capacity(102 * 60 * 44_100, 44_100., 117. * 60.));
+    }
+
+    #[test]
+    fn final_assembly_uses_a_last_measured_bridge_without_more_pcm_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 12]);
+        let initial = r.candidate(&[], 0).unwrap().unwrap();
+        let initial_nil = initial.nil();
+        r.admit(initial, &Cancellation::default()).unwrap();
+        let measured = edge(&mut r, 0, 1, 25., 0.);
+        // The bridge has already been measured; block compilation is stubbed
+        // so an accidental PCM read of these metadata-only sources would fail.
+        r.blocks.insert(
+            vec![measured],
+            Some(Arc::new(Block {
+                tracks: vec![0, 1],
+                edges: vec![measured],
+                plan: None,
+                minimum: 180 * 48_000,
+                maximum: 700 * 48_000,
+            })),
+        );
+        r.drain_pending(
+            &Cancellation::default(),
+            Instant::now() + std::time::Duration::from_secs(5),
+            0,
+        )
+        .unwrap();
+        let best = r.best.as_ref().unwrap();
+        assert!(best.nil() < initial_nil);
+        assert_eq!(best.edges(), vec![measured]);
+        assert_eq!(r.search.stats.measured_windows, 0);
+        assert_eq!(r.search.stats.cached_windows, 0);
+        assert!(r.scheduler.branches.is_empty());
+        assert!(!r.attempted_repairs.is_empty());
+        assert_eq!(r.scheduler.generation, 0);
+    }
+
+    #[test]
+    fn final_assembly_preserves_pending_work_when_the_deadline_has_passed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 12]);
+        let initial = r.candidate(&[], 0).unwrap().unwrap();
+        r.admit(initial, &Cancellation::default()).unwrap();
+        edge(&mut r, 0, 1, 25., 0.);
+        let branch = Branch::new(vec![0, 1], vec![Some(0)]).unwrap();
+        r.scheduler.branches.push_back(branch.clone());
+        r.drain_pending(&Cancellation::default(), Instant::now(), 8)
+            .unwrap();
+        assert_eq!(r.scheduler.branches, VecDeque::from([branch]));
+        assert!(r.attempted_repairs.is_empty());
+        assert_eq!(r.scheduler.generation, 0);
+    }
+    #[test]
+    fn stable_frontier_chunks_survive_reordering_and_localize_membership_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let cache = Cache::open(&MixingConfig::default(), &[]).unwrap();
+        let mut rows = (0..24).map(|i| json!({"candidate":i})).collect::<Vec<_>>();
+        let before = frontier_parts(&cache, &store, rows.clone()).unwrap();
+        rows.reverse();
+        assert_eq!(
+            frontier_parts(&cache, &store, rows.clone()).unwrap(),
+            before
+        );
+        rows.remove(0);
+        rows.insert(0, json!({"candidate":"new best"}));
+        let after = frontier_parts(&cache, &store, rows).unwrap();
+        let reused = before.iter().filter(|key| after.contains(key)).count();
+        assert!(
+            reused >= before.len().saturating_sub(2),
+            "only changed hash buckets need new chunks"
+        );
+    }
+
+    #[test]
+    fn throttled_frontier_still_restores_a_newer_best_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 12]);
+        let initial = r.candidate(&[], 0).unwrap().unwrap();
+        r.admit(initial, &Cancellation::default()).unwrap();
+        r.save_frontier().unwrap();
+        let key = Cache::set_key(&policy).unwrap();
+        let old_frontier = r
+            .search
+            .cache
+            .read::<Value>(&store, "refinement-frontiers", &key)
+            .unwrap();
+        let measured = edge(&mut r, 0, 1, 25., 0.);
+        r.blocks.insert(
+            vec![measured],
+            Some(Arc::new(Block {
+                tracks: vec![0, 1],
+                edges: vec![measured],
+                plan: None,
+                minimum: 180 * 48_000,
+                maximum: 700 * 48_000,
+            })),
+        );
+        r.scheduler.cache_loaded = true;
+        r.scheduler.frontier_saved = Some(Instant::now());
+        let improved = r.candidate(&[measured], 0).unwrap().unwrap();
+        r.admit(improved, &Cancellation::default()).unwrap();
+        assert_eq!(
+            r.search
+                .cache
+                .read::<Value>(&store, "refinement-frontiers", &key)
+                .unwrap(),
+            old_frontier
+        );
+        assert!(r
+            .search
+            .cache
+            .read::<Value>(&store, "refinement-best", &key)
+            .unwrap()
+            .is_some());
+        r.population.clear();
+        r.scheduler = Scheduler::default();
+        r.best = None;
+        r.seen.clear();
+        r.history.clear();
+        r.search.snapshot = store.read_snapshot();
+        r.restore_frontier(&Cancellation::default()).unwrap();
+        assert_eq!(r.best.as_ref().unwrap().edges(), vec![measured]);
+    }
+    #[test]
+    fn duration_retention_preserves_distinct_terminal_tracks_and_entry_states() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 12]);
+        let make = |key: String, edge: usize, end: usize, maximum: u64, score: f64| Draft {
+            blocks: vec![Arc::new(Block {
+                tracks: vec![0, end],
+                edges: vec![edge],
+                plan: None,
+                minimum: 100,
+                maximum,
+            })],
+            lengths: vec![maximum],
+            score,
+            key,
+        };
+        let dominant = edge(&mut r, 0, 1, 25., 0.);
+        // Both quality quotas are filled by variants of one long component.
+        for i in 0..24 {
+            r.population.push(make(
+                format!("dominant-{i}"),
+                dominant,
+                1,
+                3_000,
+                100. + i as f64,
+            ));
+        }
+        for last in 2..12 {
+            let measured = edge(&mut r, 0, last, 5., 0.);
+            r.population.push(make(
+                format!("endpoint-{last}"),
+                measured,
+                last,
+                2_900 - last as u64,
+                1.,
+            ));
+        }
+        r.prune();
+        let terminals = r
+            .population
+            .iter()
+            .filter_map(|d| r.continuation_state(d).map(|s| s.0))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            terminals.len(),
+            9,
+            "the duration lane adds eight useful endpoints"
+        );
+        assert_eq!(r.population.len(), 32);
+        assert_eq!(
+            r.scheduler.parked.len(),
+            2,
+            "unselected candidates remain resumable"
+        );
+
+        // With no new terminal song, an earlier measured entry is still a
+        // distinct continuation opportunity and must survive cue variants.
+        r.population.retain(|d| d.key.starts_with("dominant-"));
+        let earlier = edge(&mut r, 0, 1, 5., 0.);
+        Arc::make_mut(&mut r.edges[dominant]).entry_end = 200;
+        Arc::make_mut(&mut r.edges[earlier]).entry_end = 100;
+        r.population
+            .push(make("earlier-entry".into(), earlier, 1, 2_900, 1.));
+        r.prune();
+        assert!(r.population.iter().any(|d| d.key == "earlier-entry"));
+    }
+
+    #[test]
+    fn resumed_incumbent_prevents_weaker_restored_completion_from_replacing_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[1_260; 3]);
+        let mut good: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        // Stretch the metadata-only fixture's complete arrangement to58:48.
+        // No source PCM or closing detector is needed to test resume ordering.
+        for (i, placement) in good.placements.iter_mut().enumerate() {
+            placement.track_id = r.search.pool[i].track_id.clone();
+            placement.audio_hash = r.search.pool[i].audio_hash.clone();
+            placement.source_start_frame *= 63;
+            placement.source_end_frame *= 63;
+            for anchor in &mut placement.time_map.anchors {
+                anchor.source_frame *= 63;
+                anchor.output_frame *= 63;
+            }
+            for point in &mut placement.automation {
+                point.output_frame *= 63;
+            }
+        }
+        for (i, transition) in good.transitions.iter_mut().enumerate() {
+            transition.from_track_id = r.search.pool[i].track_id.clone();
+            transition.to_track_id = r.search.pool[i + 1].track_id.clone();
+            transition.start_output_frame *= 63;
+            transition.end_output_frame *= 63;
+        }
+        good.total_output_frames *= 63;
+        good.header
+            .extensions
+            .insert("chain_joins".into(), json!([{"score":25.},{"score":25.}]));
+        let mut weak = good.clone();
+        weak.header
+            .extensions
+            .insert("chain_joins".into(), json!([{"score":5.},{"score":5.}]));
+        assert!(r
+            .search
+            .save(good, "test_previous_run", &Cancellation::default())
+            .unwrap());
+        let previous_score = crate::composition::score(r.search.incumbent.as_ref().unwrap());
+        r.search.incumbent = None;
+        r.restore_state(&Cancellation::default()).unwrap();
+        let resumed = r.search.incumbent.as_ref().unwrap();
+        let resumed_id = resumed.plan_id.clone();
+        assert_eq!(crate::composition::score(resumed), previous_score);
+        // This is the same save path used when restoring a closable component.
+        assert!(!r
+            .search
+            .save(weak, "whole_set_refinement", &Cancellation::default())
+            .unwrap());
+        assert_eq!(r.search.incumbent.as_ref().unwrap().plan_id, resumed_id);
+        let cached = r.search.cache.saved_set(&store, &policy).unwrap().unwrap();
+        assert_eq!(
+            cached.plan_id, resumed_id,
+            "the durable winner must also remain monotone"
+        );
     }
 }

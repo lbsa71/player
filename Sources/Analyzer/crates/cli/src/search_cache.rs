@@ -77,7 +77,11 @@ impl Cache {
             }
         }
         roots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        Ok(roots.into_iter().take(limit).map(|(_, root)| root).collect())
+        Ok(roots
+            .into_iter()
+            .take(limit)
+            .map(|(_, root)| root)
+            .collect())
     }
     /// Migrate the earlier, over-specific namespace only when it matches this
     /// exact executable's musical sources. All payloads retain their checksums.
@@ -185,6 +189,33 @@ impl Cache {
         record.header.extensions.insert("payload".into(), payload);
         store.write(&format!("{}/{kind}/{key}.json", self.root), &record)?;
         Ok(())
+    }
+    /// Reuse a verified immutable payload instead of rewriting and fsyncing it.
+    /// A missing or damaged chunk is rebuilt from the caller's current value.
+    pub fn write_immutable(
+        &self,
+        store: &Store,
+        kind: &str,
+        key: &str,
+        payload: &Value,
+    ) -> Result<()> {
+        let expected = canonical_hash(payload)?;
+        require(
+            expected.digest == key,
+            "SEARCH_CACHE",
+            "immutable key differs from payload",
+        )?;
+        let path = format!("{}/{kind}/{key}.json", self.root);
+        if store.path(&path)?.exists() {
+            if let Ok(record) = store.read::<Report>(&path) {
+                if record.header.extensions.get("digest") == Some(&json!(expected))
+                    && canonical_hash(&record.header.extensions["payload"])? == expected
+                {
+                    return Ok(());
+                }
+            }
+        }
+        self.write(store, kind, key, payload)
     }
     pub fn set_key(policy: &MixingConfig) -> Result<String> {
         let minutes = policy
@@ -463,5 +494,34 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(restarted.invalid, 1);
+    }
+    #[test]
+    fn immutable_chunks_are_not_rewritten_and_corruption_is_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(dir.path()).unwrap();
+        let mut cache = Cache::open(&MixingConfig::default(), &[]).unwrap();
+        let payload = json!([{"tracks":["a","b"],"choices":[null]}]);
+        let key = canonical_hash(&payload).unwrap().digest;
+        cache
+            .write_immutable(&store, "parts", &key, &payload)
+            .unwrap();
+        let path = store
+            .path(&format!("{}/parts/{key}.json", cache.root))
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let modified = path.metadata().unwrap().modified().unwrap();
+        cache
+            .write_immutable(&store, "parts", &key, &payload)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(path.metadata().unwrap().modified().unwrap(), modified);
+        std::fs::write(&path, b"broken").unwrap();
+        cache
+            .write_immutable(&store, "parts", &key, &payload)
+            .unwrap();
+        assert_eq!(
+            cache.read::<Value>(&store, "parts", &key).unwrap(),
+            Some(payload)
+        );
     }
 }
