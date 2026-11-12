@@ -112,6 +112,8 @@ pub(super) fn build(
     let mut cache = CandidateEvidenceCache::new();
     let tactics = read_tactics(plan)?;
     let rate = f64::from(plan.output.sample_rate_hz);
+    let arrangement = read_arrangement(plan)?;
+    let on_clock = |frame| arrangement.as_ref().map_or(frame, |a| a.output_at(frame));
     let mut rows = Vec::new();
     for (index, placement) in plan.placements.iter().enumerate() {
         cancel.check()?;
@@ -129,8 +131,8 @@ pub(super) fn build(
         let source_rate = f64::from(placement.time_map.source_sample_rate_hz);
         let mut row = json!({"number":index+1,"track_id":placement.track_id,"track":label,
             "source_seconds":[placement.source_start_frame as f64/source_rate, placement.source_end_frame as f64/source_rate],
-            "mix_seconds":[placement.time_map.anchors.first().unwrap().output_frame as f64/rate,
-                placement.time_map.anchors.last().unwrap().output_frame as f64/rate]});
+            "mix_seconds":[on_clock(placement.time_map.anchors.first().unwrap().output_frame) as f64/rate,
+                on_clock(placement.time_map.anchors.last().unwrap().output_frame) as f64/rate]});
         if let Some(t) = tactics.iter().find(|t| t.incoming_placement == index) {
             let transition_index = plan
                 .transitions
@@ -158,7 +160,7 @@ pub(super) fn build(
                 t.phrase_exit.as_ref().map(|e| e.kind),
             );
             row["transition"] = json!({"tactic":t.tactic_id,"arrangement":t.arrangement,"character":t.character,
-                "mix_seconds":[t.start_frame as f64/rate,t.end_frame as f64/rate],
+                "mix_seconds":[on_clock(t.start_frame) as f64/rate,on_clock(t.end_frame) as f64/rate],
                 "outgoing_source_cue_seconds":plan.placements[t.outgoing_placement].time_map.source_at(t.start_frame as f64)/f64::from(plan.placements[t.outgoing_placement].time_map.source_sample_rate_hz),
                 "incoming_source_cue_seconds":placement.time_map.source_at(t.start_frame as f64)/source_rate,
                 "bars":t.bar_frames.len()-1,"timing_basis":t.timing_basis,"held_bars":held_bars(t),"phrase_exit":t.phrase_exit,
@@ -175,7 +177,7 @@ pub(super) fn build(
     let comparisons = measured_beam::route_comparisons(plan);
     let data = json!({"version":1,"plan_id":plan.plan_id,"duration_seconds":plan.total_output_frames as f64/rate,
         "evidence_basis":"Exact saved schedule; profiles remeasured without cue/tactic selection. Heuristic scores, not probabilities.",
-        "rows":rows,"set_composition":plan.header.extensions.get("set_composition"),"route_comparisons":comparisons,"search":plan.header.extensions.get("lazy_search").or_else(||plan.header.extensions.get("dense_anchor_search"))});
+        "rows":rows,"set_config":plan.header.extensions.get("set_config"),"required_pairs":plan.header.extensions.get("required_pairs"),"set_arrangement":arrangement,"frame_coordinate_system":"base timeline; mix_seconds includes replays","set_composition":plan.header.extensions.get("set_composition"),"route_comparisons":comparisons,"search":plan.header.extensions.get("lazy_search").or_else(||plan.header.extensions.get("dense_anchor_search"))});
     let mut markdown = format!("# Mix timetable and evidence\n\nPlan `{}` · duration **{}**.\n\nRows describe the saved choices. Evidence is remeasured for those cues and the chosen exit variant; no tracks or tactics are reselected. Scores are heuristics, not probabilities.\n\n| # | Track | Mix presence | Incoming transition | Hold / resolution | Source excerpt | Evidence / reason |\n|---|---|---|---|---|---|---|\n", plan.plan_id, clock(plan.total_output_frames as f64/rate));
     for row in &rows {
         let t = &row["transition"];
@@ -251,8 +253,46 @@ pub(super) fn build(
             cell(&evidence)
         ));
     }
+    if let Some(config) = plan.header.extensions.get("set_config") {
+        markdown.push_str(&format!("\nSet recipe: **{}**. The saved plan includes the effective configuration and its content hash.\n",cell(config["name"].as_str().unwrap_or("Unnamed set"))));
+    }
+    if let Some(required) = plan.header.extensions.get("required_pairs") {
+        markdown.push_str(&format!(
+            "\n## Required pairs\n\nMode: **{}**. All required pairs are satisfied.\n\n",
+            required["mode"].as_str().unwrap_or("either")
+        ));
+        for pair in required["pairs"].as_array().into_iter().flatten() {
+            let label = |index: usize| {
+                rows.iter()
+                    .find(|r| r["track_id"] == pair["track_ids"][index])
+                    .and_then(|r| r["track"].as_str())
+                    .unwrap_or("Unknown track")
+            };
+            markdown.push_str(&format!(
+                "- {} / {} — Spotify `{}` / `{}`\n",
+                cell(label(0)),
+                cell(label(1)),
+                pair["spotify_ids"][0].as_str().unwrap_or(""),
+                pair["spotify_ids"][1].as_str().unwrap_or("")
+            ));
+        }
+    }
+    if let Some(a) = &arrangement {
+        markdown.push_str("\n## Measured phrase replays\n\nRepeated time counts toward duration, but earns no new development credit. Every insertion resumes the original passage and preserves the selected joins.\n\n| Track | Replay in mix | Captured source | Extra cycles | Evidence |\n|---|---|---|---:|---|\n");
+        for r in &a.replays {
+            let p = &plan.placements[r.placement];
+            let sr = f64::from(p.time_map.source_sample_rate_hz);
+            let end = a.output_at(r.insert_before);
+            markdown.push_str(&format!("| {} | {}–{} | {}–{} | {} × {} bars | {}. PCM seam {:.3}; tonal distance {:.3}; verified vocal absence. |\n",
+                cell(rows[r.placement]["track"].as_str().unwrap()),
+                clock((end-r.added_frames()) as f64/rate),clock(end as f64/rate),
+                clock(p.time_map.source_at(r.capture_start as f64)/sr),clock(p.time_map.source_at(r.capture_end as f64)/sr),
+                r.repetitions,r.bars,if r.insert_before == r.capture_end {"Loop extension"} else {"Earlier loop reused at a measured compatible boundary"},
+                r.evidence["continuation_error"].as_f64().unwrap_or(0.),r.evidence["tonal_distance"].as_f64().unwrap_or(0.)));
+        }
+    }
     if let Some(c) = plan.header.extensions.get("set_composition") {
-        markdown.push_str(&format!("\n## Set structure\n\n{} arc; {}–{} minutes required. Actual duration {}. Composition objective {:.3}; mean intensity mismatch {:.3}; development-shortage penalty {:.3}. These are acoustic heuristics, not emotion probabilities.\n\n| Track | Solo time | Minimum | Preferred | Intensity percentile | Arc mismatch |\n|---|---:|---:|---:|---:|---:|\n",
+        markdown.push_str(&format!("\n## Set structure\n\n{} arc; {}–{} minutes required. Actual duration {}. Composition objective {:.3}; mean intensity mismatch {:.3}; development-shortage penalty {:.3}. These are acoustic heuristics, not emotion probabilities.\n\n| Track | Solo time | Development with hold credit | Minimum development | Preferred development | Intensity percentile | Arc mismatch |\n|---|---:|---:|---:|---:|---:|---:|\n",
             c["structure"].as_str().unwrap_or("unknown"), c["minimum_seconds"].as_f64().unwrap_or(0.) / 60., c["maximum_seconds"].as_f64().unwrap_or(0.) / 60.,
             clock(c["duration_seconds"].as_f64().unwrap_or(0.)), c["objective"].as_f64().unwrap_or(0.), c["arc_error"].as_f64().unwrap_or(0.), c["dwell_penalty"].as_f64().unwrap_or(0.)));
         for passage in c["passages"].as_array().into_iter().flatten() {
@@ -264,9 +304,10 @@ pub(super) fn build(
                     |r| r["track"].as_str().unwrap_or("unknown").to_owned(),
                 );
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {:.3} | {:.3} |\n",
+                "| {} | {} | {} | {} | {} | {:.3} | {:.3} |\n",
                 cell(&label),
                 clock(passage["solo_seconds"].as_f64().unwrap_or(0.)),
+                clock(passage["development_seconds"].as_f64().unwrap_or(0.)),
                 clock(passage["minimum_seconds"].as_f64().unwrap_or(0.)),
                 clock(passage["preferred_seconds"].as_f64().unwrap_or(0.)),
                 passage["intensity_percentile"].as_f64().unwrap_or(0.),

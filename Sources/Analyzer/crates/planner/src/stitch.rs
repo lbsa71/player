@@ -1,6 +1,13 @@
 //! A short, ordered transition between two locally steady passages.
 use super::*;
 
+#[path = "event_cues.rs"]
+mod event_cues;
+pub use event_cues::EventCueIndex;
+#[path = "baseline_cues.rs"]
+mod baseline_cues;
+pub use baseline_cues::BaselineCueIndex;
+
 const MAX_BEAT_SKEW_SECONDS: f64 = 0.030;
 /// Upper duration of dynamically discovered tactic continuations.
 pub const MAX_TACTIC_CONTINUATION_SECONDS: f64 = 120.;
@@ -2194,6 +2201,12 @@ fn pick_tracks_in_pool(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ChainClosingWindow {
+    pub earliest: u64,
+    pub latest: u64,
+}
+
 pub struct ChainBookends {
     pub start: u64,
     pub end: u64,
@@ -2271,15 +2284,51 @@ pub fn choose_chain_bookends(
     last: &Placement,
     cancel: &Cancellation,
 ) -> Result<ChainBookends> {
+    choose_chain_bookends_in_window(store, first, last, None, cancel)
+}
+
+/// Duration-targeted endings must be musical within the supplied source window;
+/// an arbitrary source-tail fade is not a substitute for a feasible ending.
+pub fn choose_chain_bookends_in_window(
+    store: &Store,
+    first: &Placement,
+    last: &Placement,
+    window: Option<ChainClosingWindow>,
+    cancel: &Cancellation,
+) -> Result<ChainBookends> {
     let start = read_chain_opening(store, &first.track_id, first.source_start_frame, cancel)?;
     let last_track = load_analyzed(store, store.track(&last.track_id)?)?;
     let closing = ReturnFeatures::read(store, &last_track, cancel)?;
     let rate = u64::from(last_track.track.format.sample_rate_hz);
     let source_end = last_track.track.format.frames;
     let solo_start = last.time_map.anchors[last.time_map.anchors.len() - 2].source_frame;
-    let earliest = (solo_start + 16 * rate)
-        .min(source_end)
-        .max(last.source_end_frame);
+    let earliest = window.map_or_else(
+        || {
+            (solo_start + 16 * rate)
+                .min(source_end)
+                .max(last.source_end_frame)
+        },
+        |w| w.earliest.max(solo_start + 1),
+    );
+    let latest = window.map_or((earliest + 48 * rate).min(source_end), |w| {
+        w.latest.min(source_end)
+    });
+    require(
+        earliest <= latest,
+        "CHAIN_BOOKEND",
+        "no closing runway within the set duration window",
+    )?;
+    let tactic = if window.is_some() {
+        crate::load_tactic_track_analysis(store, last)?
+    } else {
+        None
+    };
+    let protected = |end: u64, fade: u64| {
+        window.is_some()
+            && tactic
+                .as_ref()
+                .is_none_or(|record| !closing_is_clear(record, end.saturating_sub(fade), end))
+    };
     let rms = last_track.analysis.rms.max(1e-6);
     let tail = closing.rms(source_end.saturating_sub(rate), source_end);
     let before_tail = closing.rms(
@@ -2292,13 +2341,20 @@ pub fn choose_chain_bookends(
             .iter()
             .rfind(|f| f.rms >= 0.06 * rms)
             .map_or(source_end, |f| f.source_frame);
-        let end = (last_audible + rate / 2).clamp(earliest, source_end);
-        return Ok(ChainBookends {
-            start,
-            end,
-            outro_fade_frames: rate / 2,
-            ending: "natural_tail",
-        });
+        let end = (last_audible + rate / 2).min(source_end);
+        let end = if window.is_none() {
+            end.max(earliest)
+        } else {
+            end
+        };
+        if end >= earliest && (window.is_none() || end <= latest) && !protected(end, rate / 2) {
+            return Ok(ChainBookends {
+                start,
+                end,
+                outro_fade_frames: rate / 2,
+                ending: "natural_tail",
+            });
+        }
     }
 
     let accents: BTreeSet<_> = last_track.beats.downbeat_ids.iter().collect();
@@ -2309,7 +2365,6 @@ pub fn choose_chain_bookends(
         .filter(|beat| accents.contains(&beat.event_id) && beat.score >= 0.5)
         .map(|beat| beat.source_frame)
         .collect();
-    let latest = (earliest + 48 * rate).min(source_end);
     let mut best = None;
     let mut cost = f64::INFINITY;
     for bar in bars.windows(2) {
@@ -2319,13 +2374,28 @@ pub fn choose_chain_bookends(
         }
         let before = closing.rms(previous.saturating_sub(2 * rate), previous) / rms;
         let last_bar = closing.rms(previous, end) / rms;
+        let fade = (end - previous).clamp(rate / 2, 3 * rate);
+        if protected(end, fade) || (window.is_some() && last_bar > 0.70 && last_bar > 0.70 * before)
+        {
+            continue;
+        }
         let score = last_bar - 0.35 * (before - last_bar).max(0.)
-            + 0.12 * (end - earliest) as f64 / (48 * rate) as f64;
+            + 0.12 * (end - earliest) as f64
+                / if window.is_some() {
+                    latest.saturating_sub(earliest).max(1)
+                } else {
+                    48 * rate
+                } as f64;
         if score < cost {
             cost = score;
-            best = Some((end, (end - previous).clamp(rate / 2, 3 * rate)));
+            best = Some((end, fade));
         }
     }
+    require(
+        window.is_none() || best.is_some(),
+        "CHAIN_BOOKEND",
+        "no clear musical ending within the set duration window",
+    )?;
     let (end, outro_fade_frames, ending) = best
         .map_or((source_end, 2 * rate, "source_tail_fade"), |(end, fade)| {
             (end, fade, "phrase_fade")
@@ -2336,6 +2406,63 @@ pub fn choose_chain_bookends(
         outro_fade_frames,
         ending,
     })
+}
+
+fn closing_is_clear(record: &TacticTrackAnalysis, start: u64, end: u64) -> bool {
+    let vocals_clear = record.vocal_evidence.get("track").is_some_and(|track| {
+        crate::cached_tactic_evidence::verified_absence(
+            track,
+            start,
+            end,
+            record.source_sample_rate_hz,
+        )
+    });
+    // Acoustic silence inside a continuing recognized line is not a line ending.
+    let phrase_overlap = record
+        .vocal_evidence
+        .pointer("/track/phrases")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|phrase| {
+            let Some(a) = phrase
+                .get("start_seconds")
+                .and_then(serde_json::Value::as_f64)
+            else {
+                return true;
+            };
+            let Some(b) = phrase
+                .get("end_seconds")
+                .and_then(serde_json::Value::as_f64)
+            else {
+                return true;
+            };
+            !a.is_finite()
+                || !b.is_finite()
+                || a < 0.
+                || b <= a
+                || (a * f64::from(record.source_sample_rate_hz) < end as f64
+                    && b * f64::from(record.source_sample_rate_hz) > start as f64)
+        });
+    let build_overlap = record
+        .signal_evidence
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|event| {
+            if event.get("kind").and_then(serde_json::Value::as_str) != Some("build") {
+                return false;
+            }
+            let Some(a) = event.get("frame").and_then(serde_json::Value::as_u64) else {
+                return true;
+            };
+            let Some(b) = event.get("end_frame").and_then(serde_json::Value::as_u64) else {
+                return true;
+            };
+            a < end && crate::transition_endpoints::build_release(record, a, b) > start
+        });
+    vocals_clear && !phrase_overlap && !build_overlap
 }
 
 fn build_stitch(
@@ -3097,6 +3224,57 @@ mod mashup_tests {
 #[cfg(test)]
 mod opening_cue_tests {
     use super::*;
+    #[test]
+    fn composed_ending_cannot_fade_a_vocal_line_or_unreleased_build() {
+        let plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        let p = &plan.placements[0];
+        let mut record = TacticTrackAnalysis {
+            header: Header::default(),
+            tactic_analysis_id: "ending-fixture".into(),
+            track_id: p.track_id.clone(),
+            audio_hash: p.audio_hash.clone(),
+            audio_revision: 1,
+            source_sample_rate_hz: 100,
+            source_frames: 1000,
+            base_analysis: p.analysis.clone(),
+            beat_artifact: p.analysis.clone(),
+            override_revision: 0,
+            method: TACTIC_ANALYSIS_METHOD.into(),
+            implementation_hash: p.audio_hash.clone(),
+            component_hashes: BTreeMap::new(),
+            cache_key: p.audio_hash.clone(),
+            models: BTreeMap::new(),
+            stems: BTreeMap::new(),
+            vocal_evidence: serde_json::json!({"track":{"verified_absence_spans":[{
+                "start_seconds":2.,"end_seconds":9.,
+                "verification_method":"separated_vocal_rms_and_peak_negligible/1","reference":"fixture"}]}}),
+            signal_evidence: serde_json::json!({"events":[{"kind":"build","frame":300,"end_frame":600}]}),
+            limitations: vec![],
+            created_at: "fixture".into(),
+        };
+        assert!(
+            !closing_is_clear(&record, 500, 700),
+            "a clear vocal gap cannot authorize fading the crescendo"
+        );
+        assert!(closing_is_clear(&record, 600, 700));
+        record.vocal_evidence["track"]["phrases"] =
+            serde_json::json!([{"start_seconds":3.,"end_seconds":8.}]);
+        assert!(
+            !closing_is_clear(&record, 600, 700),
+            "a quiet breath inside a continuing line cannot end the song"
+        );
+        record.vocal_evidence["track"]["phrases"] = serde_json::json!([]);
+        assert!(
+            !closing_is_clear(&record, 800, 950),
+            "the complete fade must lie within verified vocal absence"
+        );
+        record.vocal_evidence = serde_json::json!({"track":{"words":[],"instrumental":true}});
+        assert!(
+            !closing_is_clear(&record, 600, 700),
+            "no transcript is not acoustic absence evidence"
+        );
+    }
     #[test]
     fn cached_opening_keeps_the_before_frame_constraint() {
         let cue = ChainOpening {

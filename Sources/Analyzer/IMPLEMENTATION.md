@@ -1,12 +1,68 @@
 # mixlib engineering CLI
 
 The Rust CLI now implements the scan → analysis → planning → WAV-render workflow.
-It also implements the 38-ID mixing-tactic contract, measured cue/tactic
+It also implements the 39-ID mixing-tactic contract, measured cue/tactic
 selection, stem/effect/source-edit rendering, and a separate live recovery API.
 This remains an engineering implementation, **not a completed first release**.
 The product specification remains in [README.md](README.md).
 The release gates and remaining work are listed below so successful synthetic
 tests are not mistaken for musical validation.
+
+## Duration search and reusable resolutions
+
+`search-set --config Sets/hour.json` first saves a complete 57–60 minute draft
+from available source capacity and required adjacencies. Unresolved joins are
+explicit `nil` placeholders worth zero points. These drafts have provisional
+endpoints and are not executable mix plans. A request with insufficient source
+capacity or conflicting required adjacencies can still fail draft construction.
+
+The application then measures broad, inexpensive real arrangements before
+exploring rarer tactics. S13 is a four-to-eight-bar gradual stereo crossfade
+worth five transition points, with no held-mashup bonus. It retains actual
+audible-vocal, grid, harmony, peak and buildup checks, while omitting sparse-role
+and exact structural-phrase requirements. It is a low-score refinement baseline,
+not a guarantee that arbitrary vocal passages can overlap.
+
+`complete_refinement.rs` repeatedly generates whole-set layouts, repairs or
+replaces joins, changes track order and retains alternatives. Fixed-order
+branches also explore different cue/tactic assignments without committing to
+the first measured entry. Short bounded repair slices are interleaved with
+fresh measurements so a growing cached graph cannot monopolize the search.
+Heuristic population limits park candidates for later consideration. A branch
+is permanently quality-pruned only when its optimistic score bound cannot beat
+the approved incumbent. The bound uses locked sustained-quality seconds plus
+120 seconds per still-open join, divided by the minimum set duration in minutes,
+minus locked fit shortfalls divided by maximum set minutes, with all other
+composition penalties relaxed. [The bound proof](REFINEMENT_BOUND.md) defines
+its fixed-order scope. Unrestricted replacements use the
+looser whole-pool bound. Neither parking nor a work budget proves optimality.
+
+The final JSON distinguishes `draft` from `ready`. Only `ready` includes an
+approved plan for normal rendering, after every nil join is replaced and musical
+bookends, final duration, pacing, source checks and required pairs all pass.
+Zero nil joins alone do not satisfy this export gate. Reports preserve the best
+complete draft even when the budget expires before any approved plan exists.
+The recipe's `search.seconds` and `search.measurements`, together with bounded
+candidate-generation work, limit refinement from the initial draft onward.
+
+Cache entries live under `<library>/search-cache/v1`, separate from the single
+metadata sidecar per WAV. Positive and negative measurements, generated
+alternatives, the layout-generation position, parked candidates and approved
+plans persist for compatible subsequent runs. The cache fingerprints source
+revisions, admission/rendering code, dependencies, compiler and target.
+Scheduling and set-scoring changes retain pair measurements. Restored candidates
+are reconstructed against current constraints, and approved plans are rescored
+and revalidated before reuse.
+
+Draft improvements immediately print full duration, unresolved/measured join
+counts, score and processing progress. Each approved-plan improvement also
+prints its ordered songs, score gain and saved path. Final stdout remains one
+JSON result. Reports distinguish generated layouts, parked candidates, branch
+bounds, measured/cached windows, rejected repairs, elapsed time and improvement
+history. Budget exhaustion leaves an anytime result, not a proof that no better
+set exists. See [set structure tactics](SET_STRUCTURE_TACTICS.md) for the musical
+constraints and cache contract. This describes implemented search behavior;
+it does not claim a successful nil-free hour on the current collection.
 
 ## Build and run
 
@@ -99,9 +155,9 @@ The saved mix plan includes the chosen source ranges, speed maps and crossfade.
 
 ## Automatic mixing tactics
 
-[MIXING_TACTICS.md](MIXING_TACTICS.md) defines the 38 IDs, A/B conditions and
+[MIXING_TACTICS.md](MIXING_TACTICS.md) defines the 39 IDs, A/B conditions and
 musical rules. All IDs have executable contracts, eligibility checks and
-schedules: M01–M06 mashups, S01–S12 blends/bridges, D01–D02 tempo modifiers,
+schedules: M01–M06 mashups, S01–S13 blends/bridges, D01–D02 tempo modifiers,
 C01–C14 structural/performance transitions, and E01–E04 runtime recovery.
 Implementation means the planner and renderer can represent and execute an
 admitted schedule. It does **not** mean every tactic has been auditioned,
@@ -572,7 +628,7 @@ claiming a synthetic signal is an acoustic recording. Static small fixtures are
 in `tests/fixtures`; example analysis/plan JSON is in `examples/`.
 
 
-Tactic tests cover all 38 contract IDs and every processing family with positive
+Tactic tests cover all 39 contract IDs and every processing family with positive
 and negative fixtures: event-bounded holds with two-bar resolutions, independent vocal gates,
 selected-layer compatibility, native/structural timing, bounded effects and wet
 tails, explicit source edits/pitch sampling, offline emergency refusal and live
@@ -752,6 +808,10 @@ available; a cold search does not silently seed itself with those plans.
 
 ## Set composition (2026-11-11)
 
+The graph-assembly scheduling described in this historical section is superseded
+by the complete-set refinement search described at the top of this document.
+The passage, musical admission, bookend and scoring contracts remain shared.
+
 `search-set` now defaults to a duration-constrained hour; `--set-minutes 120`
 selects 117–120 minutes. Explicit `--tracks 8` retains the short benchmark path.
 `--structure story|wave|ramp|chapters` selects a documented acoustic arc; auto
@@ -770,10 +830,106 @@ heuristic search; it does not certify global optimality or semantic emotion.
 Full `analyze-tactics` preparation now deduplicates available source song IDs,
 retains prepared captures, and visits every unique song instead of a shortlist.
 On machines with at least eight logical CPUs it runs two four-thread separator
-jobs, serializes fused-sidecar publication, and persists batch progress. Explicit
+jobs, serializes fused-sidecar publication, and persists per-song progress.
+Each free worker immediately takes another recording, without a batch barrier. Explicit
 track IDs still address particular recordings. Source data and the one-JSON-per-
 WAV layout are preserved.
 
 M04 timetable wording now identifies its isolated motif overlay and does not
 present zero held bars as a full-mix hold/resolve. Perceptual masking of a quiet
 motif beneath strong incoming material remains distinct from set composition.
+
+The duration composer now computes an optimistic capacity bound from the
+reachable union of unused songs in the measured graph, respecting retained entry
+frames and phrase runway. It does not count disconnected library material. These
+bounds prune only the current assembly; new measurements cause a fresh assembly.
+When a strong held transition leads to insufficient reachable music, bounded,
+decaying cue-family bonuses request measurements on viable onward connections.
+Beam diversity includes used-song identity as well as entry and output-time bins.
+
+Development accounting grants half-time credit to both participants in measured
+M01 holds, and to outgoing material in S05/S06 holds. Incoming drums-only handoffs
+earn no development credit. Minimum/preferred development and solo time remain
+separate in evidence. This avoids rejecting a substantial audible mashup merely
+because its later unmixed passage is shorter.
+
+Opening selection/transformation is shared with short-chain rendering and is
+applied before partial-arc scoring. A saved selected-opening marker prevents the
+final bookend pass from selecting a different beginning. Captures with materially
+broader source coverage supersede shorter captures of the same recorder song ID;
+unknown positions and later excerpts are not assumed to be fuller recordings.
+
+
+Passage scoring samples the actual cubic source-to-output map at one-second
+output intervals; slower bars receive their listening-time weight. Immutable
+closed passages reuse cached evidence only when timing, analysis, overlap credit
+and structure match. Missing measured coverage stays explicit in the evidence.
+
+Duration-targeted closing selection now receives the remaining output window
+mapped back into the last song, including its minimum development requirement.
+It searches later musical endpoints rather than inheriting the short demo's
+nearby outro. A composed ending must have verified vocal absence across its fade
+and avoid unfinished measured builds; no arbitrary tail fade fills a missing
+candidate. A failed closing attempt leaves the prefix eligible for extension.
+Short diagnostic mixes retain their existing bookend behavior.
+
+
+Partial-route pruning reserves a bounded minority of beam slots for up to eight
+strongest held cue/tactic families. This keeps defining mashups alive through a
+long lead-in or temporary arc mismatch without changing final full-set ranking.
+Composition checkpoints report development/duration/closing rejections and the
+furthest valid prefix. The final tenth of the wall-clock budget (at most five
+minutes) is reserved for assembly of newly measured evidence.
+
+A real-library proposal profile exposed repeated full-manifest validation for
+every directed cue family. Successful analysis validation is now memoized only
+inside the existing operation-scoped metadata snapshot, keyed by the complete
+manifest. Failures are never cached. Final byte revalidation and fresh-store
+source verification remain mandatory, and a new operation starts with no cache.
+
+
+Unfinished composition routes now use the full requested scoring horizon rather
+than their current length. Only the already heard fraction contributes arc/dwell
+penalties. This removes a quality-density bias toward rushed short prefixes.
+Finished-set scoring still uses the actual 57–60/117–120-minute output timeline.
+The beam explicitly reserves evenly spread elapsed-time bins in addition to held
+anchor families; deduplication within route identities was insufficient to keep
+longer development alive. Every composition checkpoint is persisted, including
+the deepest route, elapsed music and rejection reasons, before the first winner.
+
+### Measured phrase replay (2026-11-11)
+
+Set composition can now select bounded 4/8/16-bar instrumental replays, including
+later matching destinations within a solo passage. `planner/set_replays.rs` owns
+source evidence (verified absence, no build/drop interruption, stable clock,
+chroma/density/level compatibility, three stereo PCM splice measurements).
+`cli/set_replays.rs` owns cached choices and bounded duration selection.
+`types/arrangement.rs` owns the separate base/final clock contract and structural
+limits; the renderer caches processed captures and resumes base playback exactly.
+Replays do not count toward minimum development or held-mashup quality. Their
+actual clock contributes to the arc score and final duration, with a repetition
+penalty. Timetables expose each capture, destination, repetition and evidence.
+The existing `.wav.json` metadata layout is retained. See ST10 for current scope
+and conservative limits; this does not yet extend overlapping mashups or allow
+arbitrary song-section shuffling.
+
+### Required Spotify pairs
+
+`cli/required_pairs.rs` owns normalization, prepared-pool identity resolution,
+contradiction checks, prefix legality and final satisfaction. `search-set` accepts
+repeatable `--must-pair A,B`, with either-direction adjacency by default and explicit
+`--must-pair-mode ordered|anywhere` alternatives. Both full-set composition and
+short measured/lazy search enforce the requirements; discovery prioritizes the
+required edges without bypassing musical admission. Plans and timetables retain
+resolved pair evidence, and failed searches retain per-pair measured choice counts.
+No user pairs have been added to the ongoing unpinned hour search.
+
+### Per-set recipes
+
+`init-set --output FILE.json` creates a versioned, named recipe without a library
+lock or a search. `search-set --config FILE.json` validates and snapshots it before
+locking, then applies its target, structure, required pairs and search budget to a
+copy of the shared mixing policy. `cli/set_config.rs` owns this contract. A recipe
+clears stale per-set controls and cannot be combined with inline set choices.
+Plans, search reports and timetable JSON retain the effective recipe and canonical
+content hash. The shared library config and fused WAV sidecars remain untouched.

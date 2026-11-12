@@ -8,7 +8,7 @@ pub(super) struct PairSelection {
     pub examined: Vec<serde_json::Value>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct MeasuredEdge {
     pub plan: MixPlan,
     pub exit: u64,
@@ -27,7 +27,7 @@ pub(super) struct CandidateQueue {
     hold_reserve: usize,
 }
 
-fn cue_key(plan: &MixPlan) -> [u64; 4] {
+pub(super) fn cue_key(plan: &MixPlan) -> [u64; 4] {
     let t = &plan.transitions[0];
     [
         plan.placements[0]
@@ -140,7 +140,8 @@ fn window_diagnostic(
     selection: &mixlib_planner::TacticSelection,
 ) -> serde_json::Value {
     serde_json::json!({"cue":candidate.header.extensions.get("tactic_cue_candidate"),
-        "bars":facts.bar_frames.len()-1,"accepted":selection.candidates.iter().map(|c|c.plan.tactic_id).collect::<Vec<_>>(),
+        "bars":facts.bar_frames.len()-1,"filter_crowding":mixlib_planner::filter_crowding(facts),
+        "accepted":selection.candidates.iter().map(|c|c.plan.tactic_id).collect::<Vec<_>>(),
         "ranked":selection.candidates.iter().map(|c|serde_json::json!({"tactic":c.plan.tactic_id,"score":c.score,"dense_quality_seconds":c.dense_quality_seconds,"handoff_quality_seconds":c.handoff_quality_seconds,"phrase_exit":c.plan.phrase_exit})).collect::<Vec<_>>(),
         "profiles":facts.pair.profiles,"swift_profiles":facts.pair.swift_profiles,"rhythmic_profiles":facts.pair.rhythmic_profiles,"rhythmic_exit":facts.pair.rhythmic_exit,"a_roles":facts.a.roles,"b_roles":facts.b.roles,
         "a_endpoint":facts.a.endpoint_reasons,"b_endpoint":facts.b.endpoint_reasons,"rejected":selection.rejected})
@@ -594,6 +595,7 @@ fn choose_pair_inner(
 pub(super) fn policy(allow_expressive: bool) -> TacticPolicy {
     TacticPolicy {
         allow_expressive,
+        allow_one_sided_filter: true,
         capabilities: [
             RenderCapability::Gain,
             RenderCapability::Eq,

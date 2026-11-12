@@ -224,3 +224,95 @@ fn long_track_evidence_round_trips_without_relaxing_control_record_limits() {
     record.signal_evidence["payload"] = serde_json::json!("x".repeat(33 * 1024 * 1024));
     assert_eq!(encode(&record).unwrap_err().code, "RECORD_TOO_LARGE");
 }
+
+#[test]
+fn analysis_validation_cache_is_manifest_scoped_and_requires_final_byte_verification() {
+    let (_dir, store, _track) = setup();
+    let beats: Beats = serde_json::from_str(include_str!("../../../examples/beats.json")).unwrap();
+    let harmony = Harmony {
+        header: Header::default(),
+        harmony_id: "fixture".into(),
+        source_sample_rate_hz: 44100,
+        tonic_encoding: "pitch_class".into(),
+        mode_vocabulary: vec![],
+        score_semantics: "fixture".into(),
+        tuning_cents: None,
+        tuning_reason: None,
+        tuning_reference_hz: 440.,
+        feature_chunks: vec![],
+        windows: vec![],
+    };
+    let regions = Regions {
+        header: Header::default(),
+        regions_id: "fixture".into(),
+        source_frames: 4410,
+        regions: vec![],
+    };
+    let mut analysis: AnalysisManifest =
+        serde_json::from_str(include_str!("../../../examples/analysis.json")).unwrap();
+    analysis.stages.clear();
+    analysis.artifacts = std::collections::BTreeMap::from([
+        (
+            "beats".into(),
+            store.write("reports/beats.json", &beats).unwrap(),
+        ),
+        (
+            "harmony".into(),
+            store.write("reports/harmony.json", &harmony).unwrap(),
+        ),
+        (
+            "regions".into(),
+            store.write("reports/regions.json", &regions).unwrap(),
+        ),
+    ]);
+    let snapshot = store.read_snapshot();
+    for _ in 0..3 {
+        validate_analysis(&snapshot, &analysis).unwrap();
+    }
+    assert_eq!(
+        snapshot
+            .read_snapshot_stats()
+            .unwrap()
+            .unwrap()
+            .validated_analyses,
+        1
+    );
+    let mut changed = analysis.clone();
+    changed.artifacts.get_mut("beats").unwrap().hash = hash_bytes(b"incorrect");
+    assert_eq!(
+        validate_analysis(&snapshot, &changed).unwrap_err().code,
+        "CHECKSUM"
+    );
+    assert_eq!(
+        snapshot
+            .read_snapshot_stats()
+            .unwrap()
+            .unwrap()
+            .validated_analyses,
+        1,
+        "failures never enter the cache"
+    );
+    let mut changed_harmony = harmony;
+    changed_harmony.tuning_reference_hz = 442.;
+    store
+        .write("reports/harmony.json", &changed_harmony)
+        .unwrap();
+    validate_analysis(&snapshot, &analysis).unwrap();
+    assert_eq!(
+        snapshot
+            .verify_read_snapshot(&Cancellation::default())
+            .unwrap_err()
+            .code,
+        "READ_SNAPSHOT_CHANGED"
+    );
+    assert_eq!(
+        validate_analysis(&store.read_snapshot(), &analysis)
+            .unwrap_err()
+            .code,
+        "CHECKSUM"
+    );
+    assert_eq!(
+        validate_analysis(&store, &analysis).unwrap_err().code,
+        "CHECKSUM"
+    );
+}

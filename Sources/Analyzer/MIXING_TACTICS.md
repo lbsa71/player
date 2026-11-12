@@ -1,11 +1,11 @@
 # Mixing tactics
 
-Specification version 1.6 · 11 November 2026
+Specification version 1.7 · 12 November 2026
 
 This is the decision contract for choosing cues, layer ownership, transition
 duration and exit treatment. It extends [the analyzer specification](README.md).
 [IMPLEMENTATION.md](IMPLEMENTATION.md) documents commands, setup and engineering
-behavior. All 38 tactic IDs now have executable contracts, eligibility checks
+behavior. All 39 tactic IDs now have executable contracts, eligibility checks
 and schedules. Their render paths and negative cases are covered by automated
 tests. This is implementation status, **not a claim that every tactic has been
 auditioned or musically validated on the collection**. Unknown required evidence
@@ -504,8 +504,8 @@ repeat or use the content of a line still require positive phrase evidence.
 
 #### S08 — High-pass or low-pass filter fade
 
-- **Given A and B** have compatible but busy passages, with a clear frequency
-  region to withdraw from A as B takes ownership.
+- **Given A and B** have compatible passages and measured crowding on at least
+  one side, with a clear frequency region to withdraw from A as B takes ownership.
 - **Use** an intentional cutoff sweep plus gain/bass scheduling. High-pass
   withdrawal clears low frequencies; low-pass withdrawal clears highs and
   still requires a separate bass decision.
@@ -559,6 +559,26 @@ repeat or use the content of a line still require positive phrase evidence.
 - **Status** Implemented explicit finite loop edits, source transport, seam/tonal and language checks.
   Fixed-period loops require a steady output clock and cannot combine with D01.
   [Loop-based extensions][loops].
+
+#### S13 — Baseline gradual crossfade
+
+- **Given A and B** have four to eight reliably mapped bars with measured
+  compatible audible harmony, lead occupancy and headroom, and their audible
+  vocal lines can continue without overlap or truncation.
+- **Use** complementary gradual stereo gain fades across the whole window.
+  This is an inexpensive baseline arrangement for complete-set refinement. It
+  has no held mashup, staged band exchange, effect or source edit.
+- **Reject** unsafe vocal gates, unknown vocal evidence, clashes in the actual
+  audible schedule, grid failure, excessive peak bounds and any fade starting
+  before an outgoing buildup reaches its measured release. Never shorten this
+  tactic to a one- or two-bar cutover.
+- **Quality** award exactly five transition points and no dense-mashup or
+  handoff-duration credit. Sparse-role labels, uniform energy and exact
+  complete structural phrase endpoints are not requirements. The evidence must
+  disclose this limited structural claim; it still uses measured bars and safe
+  audible-line boundaries. More expressive measured strategies can replace it.
+- **Status** Implemented baseline stereo schedule, admission, persisted-shape
+  validation and positive/negative vocal, grid, harmony, peak and build checks.
 
 ### Tempo modifiers
 
@@ -1010,7 +1030,7 @@ the chosen result. `--allow-expressive` enables only the expressive family;
 it does not authorize emergencies. See [setup and commands](IMPLEMENTATION.md)
 for model installation, automatic chains and rendering the returned plan ID.
 
-Automated tests cover all 38 contract IDs and every processing family, including
+Automated tests cover all 39 contract IDs and every processing family, including
 unsafe-evidence refusal, vocal/tail collisions, exact ownership/envelope timing,
 source edits and live/offline recovery separation. Only selected real songs are
 being audited. A successful render proves execution and objective checks passed;

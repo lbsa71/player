@@ -70,40 +70,23 @@ pub(super) fn ensure_tactic_analysis(
     // Each separator owns four CPU threads. Keep at most two independent jobs
     // on machines with eight logical CPUs; publication remains serialized.
     let workers = std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).clamp(1, 2));
-    for batch in targets.chunks(workers) {
-        cancel.check()?;
-        let results = std::thread::scope(|scope| {
-            let jobs: Vec<_> = batch
-                .iter()
-                .map(|track_id| {
-                    let models = &models;
-                    let implementation_hash = &implementation_hash;
-                    let methods = &methods;
-                    scope.spawn(move || {
-                        eprintln!("tactic analysis: inspecting {track_id}");
-                        (
-                            track_id,
-                            analyze_one(
-                                store,
-                                track_id,
-                                python,
-                                models,
-                                implementation_hash,
-                                methods,
-                                cancel,
-                            ),
-                        )
-                    })
-                })
-                .collect();
-            jobs.into_iter()
-                .map(|j| {
-                    j.join()
-                        .map_err(|_| Error::new("TACTIC_WORKER", "analysis worker failed"))
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        for (track_id, result) in results {
+    run_preparations(
+        &targets,
+        workers,
+        |track_id| {
+            cancel.check()?;
+            eprintln!("tactic analysis: inspecting {track_id}");
+            analyze_one(
+                store,
+                track_id,
+                python,
+                &models,
+                &implementation_hash,
+                &methods,
+                cancel,
+            )
+        },
+        |track_id, result| {
             match result {
                 Ok(cached) => report.count(if cached { "cached" } else { "analyzed" }),
                 Err(error) if error.code == "CANCELLED" => {
@@ -120,19 +103,21 @@ pub(super) fn ensure_tactic_analysis(
                     report.error(track_id, &error);
                 }
             }
-        }
-        report
-            .header
-            .extensions
-            .insert("status".into(), serde_json::json!("running"));
-        store.report(&report)?;
-        eprintln!(
-            "tactic analysis: {} prepared/cached, {} failed, {} targets",
-            report.counts.get("cached").unwrap_or(&0) + report.counts.get("analyzed").unwrap_or(&0),
-            report.counts.get("failed").unwrap_or(&0),
-            targets.len()
-        );
-    }
+            report
+                .header
+                .extensions
+                .insert("status".into(), serde_json::json!("running"));
+            store.report(&report)?;
+            eprintln!(
+                "tactic analysis: {} prepared/cached, {} failed, {} targets",
+                report.counts.get("cached").unwrap_or(&0)
+                    + report.counts.get("analyzed").unwrap_or(&0),
+                report.counts.get("failed").unwrap_or(&0),
+                targets.len()
+            );
+            Ok(())
+        },
+    )?;
     report.header.extensions.insert(
         "status".into(),
         serde_json::json!(if report.counts.get("failed").copied().unwrap_or(0) == 0 {
@@ -143,6 +128,51 @@ pub(super) fn ensure_tactic_analysis(
     );
     store.report(&report)?;
     Ok(report)
+}
+
+/// A free worker immediately takes another recording. The caller publishes
+/// progress on the receiving thread; analyze_one serializes sidecar publication.
+fn run_preparations(
+    targets: &[String],
+    workers: usize,
+    prepare: impl Fn(&str) -> Result<bool> + Sync,
+    mut completed: impl FnMut(&str, Result<bool>) -> Result<()>,
+) -> Result<()> {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        let jobs: Vec<_> = (0..workers.max(1))
+            .map(|_| {
+                let tx = tx.clone();
+                let next = &next;
+                let prepare = &prepare;
+                scope.spawn(move || loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(track) = targets.get(index) else {
+                        break;
+                    };
+                    let result = prepare(track);
+                    let cancelled = result.as_ref().is_err_and(|e| e.code == "CANCELLED");
+                    if tx.send((index, result)).is_err() || cancelled {
+                        break;
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        for (index, result) in rx {
+            completed(&targets[index], result)?;
+        }
+        for job in jobs {
+            job.join()
+                .map_err(|_| Error::new("TACTIC_WORKER", "analysis worker failed"))?;
+        }
+        Ok(())
+    })
 }
 
 /// Shortlist using basic measurements, then publish through the normal fused
@@ -780,6 +810,37 @@ mod tests {
                 )
             })
             .collect()
+    }
+    #[test]
+    fn free_worker_starts_next_song_before_slow_partner_finishes() {
+        use std::sync::{mpsc, Mutex};
+        let (tx, rx) = mpsc::channel();
+        let rx = Mutex::new(rx);
+        let mut completed = Vec::new();
+        run_preparations(
+            &["fast".into(), "slow".into(), "next".into()],
+            2,
+            |name| {
+                if name == "slow" {
+                    rx.lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("next song must start without waiting for this slow song");
+                }
+                if name == "next" {
+                    tx.send(()).unwrap();
+                }
+                Ok(false)
+            },
+            |name, result| {
+                result?;
+                completed.push(name.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        completed.sort();
+        assert_eq!(completed, ["fast", "next", "slow"]);
     }
     #[test]
     fn expensive_components_have_independent_dependencies() {

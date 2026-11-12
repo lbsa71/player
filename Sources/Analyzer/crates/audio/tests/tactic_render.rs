@@ -165,6 +165,7 @@ fn lane(placement: usize, lane: StemLane, gain: f64) -> LaneSchedule {
 }
 fn tactic(id: TacticId) -> TacticPlan {
     TacticPlan {
+        phrase_exit: None,
         policy_version: TACTICS_POLICY_VERSION.into(),
         tactic_id: id,
         modifiers: vec![],
@@ -222,6 +223,43 @@ fn render_to(
 ) -> Vec<[f32; 2]> {
     render(plan, sources, path, false, range, &Cancellation::default()).unwrap();
     read(path)
+}
+
+#[test]
+fn saved_baseline_crossfade_is_gradual_and_rejects_a_disguised_short_cut() {
+    let d = tempfile::tempdir().unwrap();
+    let (mut plan, sources) = fixture(d.path(), |i| tone(440., i, 0.1), |i| tone(880., i, 0.1));
+    let mut join = tactic(TacticId::S13);
+    join.arrangement = TacticArrangement::Blend;
+    join.bar_frames = (0..=4).map(|i| START + (END - START) * i / 4).collect();
+    join.lanes[0].gain = scalar(START, END, 1., 0.);
+    join.lanes[1].gain = scalar(START, END, 0., 1.);
+    write_tactics(&mut plan, vec![join.clone()]).unwrap();
+    let saved: MixPlan = validate_value(&serde_json::to_value(&plan).unwrap()).unwrap();
+    let full = render_to(&saved, &sources, &d.path().join("baseline.wav"), None);
+    let early = &full[START as usize + 1000..START as usize + 11000];
+    let late = &full[END as usize - 11000..END as usize - 1000];
+    assert!(projection(early, 440.) > 3. * projection(early, 880.));
+    assert!(projection(late, 880.) > 3. * projection(late, 440.));
+    let preview = render_to(
+        &saved,
+        &sources,
+        &d.path().join("baseline-preview.wav"),
+        Some((START + 7777, END + 3333)),
+    );
+    assert_eq!(preview, full[START as usize + 7777..END as usize + 3333]);
+
+    let mut shortened = join.clone();
+    shortened.bar_frames = vec![START, (START + END) / 2, END];
+    assert!(write_tactics(&mut plan, vec![shortened]).is_err());
+    join.lanes[0].gain.insert(
+        1,
+        ScalarPoint {
+            output_frame: END - 1000,
+            value: 1.,
+        },
+    );
+    assert!(write_tactics(&mut plan, vec![join]).is_err());
 }
 
 #[test]

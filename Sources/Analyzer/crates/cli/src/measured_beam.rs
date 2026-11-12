@@ -311,7 +311,7 @@ struct Extension {
     to: usize,
     edge: usize,
     quality: Quality,
-    region: (usize, u64),
+    region: (usize, u64, u128),
     pacing: PacingDecision,
 }
 
@@ -423,6 +423,7 @@ pub(super) fn route_local(error: &Error) -> bool {
     matches!(
         error.code.as_str(),
         "CHAIN_CUES"
+            | "CHAIN_BOOKEND"
             | "CHAIN_PACING"
             | "TIME_MAP_SPEED"
             | "TIME_MAP_ACCELERATION"
@@ -444,6 +445,7 @@ fn search(
     width: usize,
     max_fallbacks: usize,
     anchor: Option<Anchor>,
+    required: &crate::required_pairs::RequiredPairs,
     cancel: &Cancellation,
 ) -> Result<Option<MixPlan>> {
     // Future fallback cost is part of feasibility, not merely the score of
@@ -451,7 +453,7 @@ fn search(
     for fallbacks in 0..=max_fallbacks {
         for beam_width in [width, width.saturating_mul(4)] {
             if let Some(mut plan) = search_with_fallback_budget(
-                store, graph, pool, pacing, count, beam_width, fallbacks, anchor, cancel,
+                store, graph, pool, pacing, count, beam_width, fallbacks, anchor, required, cancel,
             )? {
                 plan.header.extensions.insert(
                     "search_bounds".into(),
@@ -474,6 +476,7 @@ fn search_with_fallback_budget(
     width: usize,
     max_fallbacks: usize,
     anchor: Option<Anchor>,
+    required: &crate::required_pairs::RequiredPairs,
     cancel: &Cancellation,
 ) -> Result<Option<MixPlan>> {
     let n = pool.len();
@@ -485,7 +488,7 @@ fn search_with_fallback_budget(
         memo: BTreeMap::new(),
     };
     let mut beam: Vec<_> = (0..n)
-        .filter(|last| anchor.is_none_or(|a| *last != a.to))
+        .filter(|last| anchor.is_none_or(|a| *last != a.to) && required.start_allowed(*last))
         .map(|last| Route {
             used: 1 << last,
             last,
@@ -508,7 +511,7 @@ fn search_with_fallback_budget(
         let mut extensions = vec![];
         for (prefix, route) in beam.iter().enumerate() {
             for (to, track) in pool.iter().enumerate() {
-                if route.used & (1 << to) != 0 {
+                if !required.allows(route.used, route.last, to, remaining) {
                     continue;
                 }
                 let Some(latest) = bounds[remaining][to] else {
@@ -553,6 +556,7 @@ fn search_with_fallback_budget(
                         region: (
                             to,
                             choice.entry_end / (8 * u64::from(track.format.sample_rate_hz)),
+                            required.progress(route.used | (1 << to)),
                         ),
                     });
                 }
@@ -603,7 +607,10 @@ fn search_with_fallback_budget(
             }
             let plan = if remaining == 0 {
                 match chain::finish_measured(store, plan, cancel) {
-                    Ok(plan) => plan,
+                    Ok(mut plan) => {
+                        required.annotate(&mut plan)?;
+                        plan
+                    }
                     Err(error) if route_local(&error) => {
                         *rejected.entry(error.code).or_insert(0usize) += 1;
                         return Ok(None);
@@ -679,6 +686,7 @@ pub(super) fn assemble_measured(
     cancel: &Cancellation,
 ) -> Result<Option<MixPlan>> {
     let n = pool.len();
+    let required = crate::required_pairs::RequiredPairs::resolve(store, policy, pool, count)?;
     // Keep anchor opportunities from both successful musical patterns.
     // Neither plentiful dense mashups nor long sparse handoffs can evict
     // the other family before full-route comparison.
@@ -743,6 +751,7 @@ pub(super) fn assemble_measured(
                 width,
                 max_fallbacks,
                 anchor,
+                &required,
                 cancel,
             )?;
             let effective_width = candidate

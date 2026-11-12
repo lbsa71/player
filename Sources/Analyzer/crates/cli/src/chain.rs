@@ -189,6 +189,7 @@ pub(super) fn stitch_chain(
         chain.expect("validated chain has joins"),
         joins,
         chain_tactics,
+        None,
         cancel,
     )
 }
@@ -198,6 +199,7 @@ fn finish_chain(
     mut plan: MixPlan,
     joins: Vec<serde_json::Value>,
     chain_tactics: Vec<TacticPlan>,
+    closing_window: Option<mixlib_planner::ChainClosingWindow>,
     cancel: &Cancellation,
 ) -> Result<MixPlan> {
     plan.objective = "stitch_chain".into();
@@ -216,7 +218,7 @@ fn finish_chain(
     plan.header
         .extensions
         .insert("chain_joins".into(), serde_json::json!(joins));
-    let intro_shift = apply_bookends(store, &mut plan, cancel)?;
+    let intro_shift = apply_bookends(store, &mut plan, closing_window, cancel)?;
     if !chain_tactics.is_empty() {
         let translated = chain_tactics
             .iter()
@@ -290,7 +292,16 @@ pub(super) fn extend_measured(
 
 pub(super) fn finish_measured(
     store: &Store,
+    plan: MixPlan,
+    cancel: &Cancellation,
+) -> Result<MixPlan> {
+    finish_measured_in_window(store, plan, None, cancel)
+}
+
+pub(super) fn finish_measured_in_window(
+    store: &Store,
     mut plan: MixPlan,
+    closing_window: Option<mixlib_planner::ChainClosingWindow>,
     cancel: &Cancellation,
 ) -> Result<MixPlan> {
     let tactics = read_tactics(&plan)?;
@@ -301,7 +312,7 @@ pub(super) fn finish_measured(
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
     plan.plan_id = id();
-    finish_chain(store, plan, joins, tactics, cancel)
+    finish_chain(store, plan, joins, tactics, closing_window, cancel)
 }
 
 fn apply_opening(plan: &mut MixPlan, start: u64) -> u64 {
@@ -391,11 +402,17 @@ pub(super) fn open_measured(plan: &mut MixPlan, start: u64) -> Result<()> {
     plan.validate()
 }
 
-fn apply_bookends(store: &Store, plan: &mut MixPlan, cancel: &Cancellation) -> Result<u64> {
-    let mut cues = mixlib_planner::choose_chain_bookends(
+fn apply_bookends(
+    store: &Store,
+    plan: &mut MixPlan,
+    closing_window: Option<mixlib_planner::ChainClosingWindow>,
+    cancel: &Cancellation,
+) -> Result<u64> {
+    let mut cues = mixlib_planner::choose_chain_bookends_in_window(
         store,
         &plan.placements[0],
         plan.placements.last().unwrap(),
+        closing_window,
         cancel,
     )?;
     if plan

@@ -256,6 +256,8 @@ pub enum RenderCapability {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TacticPolicy {
     pub allow_expressive: bool,
+    #[serde(default)]
+    pub allow_one_sided_filter: bool,
     pub emergency: Option<EmergencyActivation>,
     pub max_beat_skew_ms: f64,
     pub max_harmonic_distance: f64,
@@ -273,6 +275,7 @@ impl Default for TacticPolicy {
     fn default() -> Self {
         Self {
             allow_expressive: false,
+            allow_one_sided_filter: false,
             emergency: None,
             max_beat_skew_ms: 30.,
             max_harmonic_distance: 0.30,
@@ -457,6 +460,12 @@ fn tonal(f: &CandidateFacts, p: &TacticPolicy) -> bool {
 fn complementary(f: &CandidateFacts) -> bool {
     known(f.pair.complementarity, |v| v >= 0.65)
 }
+/// Measured crowding on each side of the filter transfer. Both measurements
+/// must be known even when the quieter side need not reach the threshold.
+pub fn filter_crowding(facts: &CandidateFacts) -> [Option<f64>; 2] {
+    [density(&facts.a), density(&facts.b)]
+}
+
 fn density(p: &PassageFacts) -> Option<f64> {
     if p.bars.is_empty() {
         return None;
@@ -836,7 +845,9 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             && f.bar_frames.contains(&landing)
             && crate::vocal_audibility::quiet_landing(f, landing);
         need(
-            local_cut || boundary(&f.a, a_exit, false, p) && boundary(&f.b, b_entry, true, p),
+            id == S13
+                || local_cut
+                || boundary(&f.a, a_exit, false, p) && boundary(&f.b, b_entry, true, p),
             "supported complete entry/exit phrase boundaries are missing",
         );
     }
@@ -863,6 +874,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             | S10
             | S11
             | S12
+            | S13
             | C07
             | C11
     ) {
@@ -1044,8 +1056,16 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         S08 => {
+            let [a, b] = filter_crowding(f);
+            let crowded = a.zip(b).is_some_and(|(a, b)| {
+                if p.allow_one_sided_filter {
+                    a.max(b) >= 0.5
+                } else {
+                    a.min(b) >= 0.5
+                }
+            });
             need(
-                known(density(&f.a), |d| d >= 0.5) && known(density(&f.b), |d| d >= 0.5),
+                crowded,
                 "filter transfer requires measured crowded frequency occupancy",
             );
         }
@@ -1072,6 +1092,12 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             need(
                 loop_candidate(&f.a, p).is_some() || loop_candidate(&f.b, p).is_some(),
                 "no verified repeatable intro/outro span",
+            );
+        }
+        S13 => {
+            need(
+                (4..=8).contains(&bars),
+                "baseline gradual crossfade requires four to eight measured bars",
             );
         }
         D01 => {
@@ -1794,6 +1820,7 @@ pub(crate) fn candidate_tactic_schedule(
     };
     let shape_known = match id {
         TacticId::M01 => count >= 8,
+        TacticId::S13 => (4..=8).contains(&count),
         TacticId::M06 => f.a.vocal_phrases.is_some() && f.b.vocal_phrases.is_some(),
         TacticId::S04 => count >= 3 && band_exchange_order(f).is_some(),
         TacticId::M04 => motif_known(&f.a),
@@ -2117,7 +2144,7 @@ pub(crate) fn candidate_tactic_schedule(
                 plan.evidence.push(format!("S04 measured mean band occupancy A={:?}, B={:?}; exchange order {} -> {} -> {}, prioritizing incoming occupancy times outgoing space",occupancy[0],occupancy[1],names[order[0]],names[order[1]],names[order[2]]));
             }
         }
-        S02 | S07 => {}
+        S02 | S07 | S13 => {}
         S08 => {
             let ny = f.output_sample_rate_hz as f64 * 0.42;
             effect(
@@ -2616,6 +2643,7 @@ pub(crate) fn candidate_tactic_schedule(
         S10 => "verified nonvocal capture supports a bounded filtered frozen-delay bridge",
         S11 => "isolated A texture and spacious B entry leave room for a bounded reverb tail",
         S12 => "verified loop seam and complete captured language extend the candidate runway",
+        S13 => "low-priority baseline: gradual four-to-eight-bar stereo crossfade with measured grid, audible-vocal, harmony and peak checks; complete structural phrase endpoints are not claimed",
         C01|C02|C03|C04|C07 if f.pair.cut_band_matches.contains(&id) => "verified landing and matching mapped PCM in all bands support an ownership switch",
         C01|C02|C03|C04|C07 => "last resort: verified landing permits a cut, but all-band continuity is unproven",
         C05 => "verified rhythmic capture tightens in four bounded stages before the measured landing",
@@ -2662,6 +2690,11 @@ fn last_resort(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> bool {
 
 fn preference(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> f64 {
     use TacticId::*;
+    // An executable baseline earns finite credit, never a dense/held-tactic
+    // reward. Better musical strategies can replace it during set refinement.
+    if id == S13 {
+        return 5.;
+    }
     if last_resort(id, f, p) && !matches!(id, S03 | S04) {
         // A mutually exclusive schedule has no overlapping clashes. That is
         // safety evidence, not evidence of musical continuity across its cut.
@@ -3107,6 +3140,112 @@ pub(crate) mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn one_sided_filter_requires_measured_crowding_on_at_least_one_side() {
+        let mut window = facts(4);
+        let mut policy = policy();
+        let admitted = |facts: &CandidateFacts, policy: &TacticPolicy| {
+            select_tactics(facts, policy)
+                .unwrap()
+                .candidates
+                .iter()
+                .any(|candidate| candidate.plan.tactic_id == TacticId::S08)
+        };
+        assert!(admitted(&window, &policy));
+        for bar in &mut window.b.bars {
+            bar.active_stems = Some(1);
+            bar.mid_occupancy = Some(0.2);
+            bar.onsets_per_beat = Some(0.5);
+        }
+        assert!(!admitted(&window, &policy));
+        policy.allow_one_sided_filter = true;
+        assert!(admitted(&window, &policy));
+        window.b.bars[0].active_stems = None;
+        assert!(!admitted(&window, &policy));
+    }
+
+    #[test]
+    fn baseline_blend_uses_measured_safety_without_sparse_or_complete_phrase_claims() {
+        let mut window = facts(4);
+        for passage in [&mut window.a, &mut window.b] {
+            passage.roles.clear();
+            passage.phrase_boundaries.clear();
+            passage.endpoint_reasons.clear();
+            for bar in &mut passage.bars {
+                bar.stability = None;
+                bar.active_stems = None;
+                bar.mid_occupancy = None;
+            }
+        }
+        let selection = select_tactics(&window, &policy()).unwrap();
+        let baseline = selection
+            .candidates
+            .iter()
+            .find(|candidate| candidate.plan.tactic_id == TacticId::S13)
+            .unwrap();
+        assert_eq!(baseline.score, 5.);
+        assert!(!baseline.last_resort);
+        assert_eq!(baseline.dense_quality_seconds, 0.);
+        assert_eq!(baseline.handoff_quality_seconds, 0.);
+        assert_eq!(baseline.plan.lanes.len(), 2);
+        for lane in &baseline.plan.lanes {
+            assert_eq!(lane.lane, StemLane::Stereo);
+            assert!(lane.eq.is_empty());
+            assert_eq!(lane.gain.len(), 2);
+            assert_eq!(curve_value(&lane.gain, 2 * BAR), 0.5);
+        }
+        validate_compiled(&baseline.plan, &window);
+        assert!(schedule_tactic(TacticId::S01, &window, &policy()).is_err());
+    }
+
+    #[test]
+    fn baseline_blend_keeps_grid_tonal_peak_build_and_window_guards() {
+        let baseline = facts(4);
+        let rejected = |window: CandidateFacts| {
+            assert!(schedule_tactic(TacticId::S13, &window, &policy()).is_err());
+        };
+        for bars in [1, 2, 3, 9] {
+            rejected(facts(bars));
+        }
+        let mut window = baseline.clone();
+        window.a.bars[0].grid_score = None;
+        rejected(window);
+        let mut window = baseline.clone();
+        window.pair.beat_skew_ms = Some(31.);
+        rejected(window);
+        let mut window = baseline.clone();
+        window.pair.harmonic_distance = Some(0.31);
+        rejected(window);
+        let mut window = baseline.clone();
+        window.pair.lead_conflict = Some(0.26);
+        rejected(window);
+        let mut window = baseline.clone();
+        window.pair.predicted_peak_dbfs = Some(0.);
+        rejected(window);
+        let mut window = baseline.clone();
+        window.a.build_release_frame = Some(BAR);
+        rejected(window);
+        let mut window = baseline;
+        window.a.build_release_frame = Some(0);
+        assert!(schedule_tactic(TacticId::S13, &window, &policy()).is_ok());
+    }
+
+    #[test]
+    fn baseline_blend_requires_complete_audible_lines_without_overlap() {
+        let mut window = facts(4);
+        window.a.vocal_phrases = Some(vec![vocal(0, BAR)]);
+        window.b.vocal_phrases = Some(vec![vocal(2 * BAR, 3 * BAR)]);
+        let plan = schedule_tactic(TacticId::S13, &window, &policy()).unwrap();
+        assert_eq!(plan.vocal_occupancy.len(), 2);
+        window.b.vocal_phrases = Some(vec![vocal(BAR / 2, 2 * BAR)]);
+        assert!(schedule_tactic(TacticId::S13, &window, &policy()).is_err());
+        window.b.vocal_phrases = Some(vec![]);
+        window.a.vocal_phrases = Some(vec![vocal(3 * BAR, 5 * BAR)]);
+        assert!(schedule_tactic(TacticId::S13, &window, &policy()).is_err());
+        window.a.vocal_phrases = None;
+        assert!(schedule_tactic(TacticId::S13, &window, &policy()).is_err());
+    }
+
     fn role_set(p: &mut PassageFacts, roles: &[TacticRole]) {
         p.roles = roles.iter().map(|&r| (r, 0.9)).collect();
     }
@@ -3707,7 +3846,7 @@ pub(crate) mod tests {
         let f = dense();
         let a = select_tactics(&f, &policy()).unwrap();
         let b = select_tactics(&f, &policy()).unwrap();
-        assert_eq!(a.candidates.len() + a.rejected.len(), 36);
+        assert_eq!(a.candidates.len() + a.rejected.len(), 37);
         assert_eq!(a.candidates[0].plan.tactic_id, TacticId::M01);
         assert_eq!(
             serde_json::to_value(a).unwrap(),

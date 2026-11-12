@@ -1671,7 +1671,7 @@ mod tests {
         let (a, pa) = fixture(0, &f);
         let (b, pb) = fixture(1, &f);
         enrich_pair_evidence(&a, &b, [&pa, &pb], &mut f).unwrap();
-        assert_eq!(f.pair.profiles.len(), 32);
+        assert_eq!(f.pair.profiles.len(), 33);
         assert!(f
             .pair
             .profiles

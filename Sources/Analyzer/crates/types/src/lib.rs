@@ -1,6 +1,8 @@
 //! Portable contracts. JSON authority, schema validation and semantic invariants live here.
 mod tactics;
 pub use tactics::*;
+mod arrangement;
+pub use arrangement::*;
 mod segments;
 pub use segments::*;
 mod tactic_analysis;
@@ -1403,8 +1405,14 @@ impl Record for MixPlan {
             }
             end = a.last().unwrap().output_frame;
         }
+        let arrangement = read_arrangement(self)?;
+        if let Some(a) = &arrangement {
+            a.validate_for(self)?;
+        }
         require(
-            end == self.total_output_frames,
+            end == arrangement
+                .as_ref()
+                .map_or(self.total_output_frames, |a| a.base_output_frames),
             "PLAN_DURATION",
             "incorrect total duration",
         )

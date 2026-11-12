@@ -367,6 +367,7 @@ pub fn render(
 ) -> Result<Report> {
     plan.validate()?;
     let tactics = read_tactics(plan)?;
+    let arrangement = read_arrangement(plan)?;
     require(
         tactics
             .iter()
@@ -376,7 +377,9 @@ pub fn render(
     )?;
     require(
         plan.renderer_version
-            == if !tactics.is_empty() {
+            == if arrangement.is_some() {
+                ARRANGEMENT_RENDERER
+            } else if !tactics.is_empty() {
                 TACTIC_RENDERER
             } else {
                 match &plan.drum_intro {
@@ -464,7 +467,48 @@ pub fn render(
     let mut rng = plan.seed ^ 0x9e3779b97f4a7c15;
     let mut block = Vec::with_capacity(65536);
     let mut rendered = 0;
-    for frame in 0..last {
+    let base_end = arrangement
+        .as_ref()
+        .map_or(plan.total_output_frames, |a| a.base_output_frames);
+    let replays = arrangement
+        .as_ref()
+        .map_or(&[][..], |a| a.replays.as_slice());
+    let mut captured: Vec<[f32; 2]> = Vec::new();
+    let mut next_replay = 0;
+    let mut inserted_frames = 0;
+    let mut output_frame = 0u64;
+    let mut previous = [0f32; 2];
+    let mut emit = |sum: [f32; 2]| -> Result<()> {
+        if output_frame % 4096 == 0 {
+            cancel.check()?;
+        }
+        let dither: [f64; 2] = if plan.output.encoding == "pcm24" {
+            std::array::from_fn(|_| (random(&mut rng) - random(&mut rng)) / 8388608.)
+        } else {
+            [0.; 2]
+        };
+        if output_frame >= first && output_frame < last {
+            meter.push(sum);
+            for (s, noise) in sum.into_iter().zip(dither) {
+                if plan.output.encoding == "pcm24" {
+                    let v = ((s as f64 + noise) * 8388608.)
+                        .round()
+                        .clamp(-8388608., 8388607.) as i32;
+                    block.extend_from_slice(&v.to_le_bytes()[..3]);
+                } else {
+                    block.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+            rendered += 1;
+            if block.len() >= 65536 {
+                temp.write_all(&block)?;
+                block.clear();
+            }
+        }
+        output_frame += 1;
+        Ok(())
+    };
+    for frame in 0..base_end {
         if frame % 4096 == 0 {
             cancel.check()?;
         }
@@ -537,30 +581,55 @@ pub fn render(
             "DSP_NON_FINITE",
             "non-finite render output",
         )?;
-        // Dither belongs to absolute output time, including discarded preview
-        // pre-roll, so a preview is the exact PCM slice of the full export.
-        let dither: [f64; 2] = if plan.output.encoding == "pcm24" {
-            std::array::from_fn(|_| (random(&mut rng) - random(&mut rng)) / 8388608.)
-        } else {
-            [0.; 2]
-        };
-        if frame >= first {
-            meter.push(sum);
-            for (s, noise) in sum.into_iter().zip(dither) {
-                if plan.output.encoding == "pcm24" {
-                    let v = ((s as f64 + noise) * 8388608.)
-                        .round()
-                        .clamp(-8388608., 8388607.) as i32;
-                    block.extend_from_slice(&v.to_le_bytes()[..3]);
-                } else {
-                    block.extend_from_slice(&s.to_le_bytes());
+        // Cache the actual stretched/EQ'd solo passage. Replaying this buffer
+        // preserves its beat timing and avoids a second stretch generation.
+        if let Some(r) = replays.get(next_replay) {
+            if frame >= r.capture_start && frame < r.capture_end {
+                captured.push(sum);
+            }
+            if frame == r.insert_before {
+                require(
+                    captured.len() as u64 == r.capture_end - r.capture_start,
+                    "SET_REPLAY",
+                    "replay capture is incomplete",
+                )?;
+                for repetition in 0..r.repetitions {
+                    for (i, sample) in captured.iter().enumerate() {
+                        let mut value = *sample;
+                        let fade = r.declick_frames as usize;
+                        let seam = std::array::from_fn(|c| {
+                            (captured.last().unwrap()[c] + captured[0][c]) * 0.5
+                        });
+                        let before = if repetition == 0 { previous } else { seam };
+                        let after = if repetition + 1 == r.repetitions {
+                            sum
+                        } else {
+                            seam
+                        };
+                        if i < fade {
+                            let x = i as f32 / fade as f32;
+                            let w = x * x * (3. - 2. * x);
+                            value = std::array::from_fn(|c| before[c] * (1. - w) + value[c] * w);
+                        } else if i >= captured.len() - fade {
+                            let x = (captured.len() - 1 - i) as f32 / fade as f32;
+                            let w = x * x * (3. - 2. * x);
+                            value = std::array::from_fn(|c| after[c] * (1. - w) + value[c] * w);
+                        }
+                        emit(value)?;
+                    }
                 }
+                captured = Vec::new();
+                next_replay += 1;
+                inserted_frames += r.added_frames();
             }
-            rendered += 1;
-            if block.len() >= 65536 {
-                temp.write_all(&block)?;
-                block.clear();
-            }
+        }
+        emit(sum)?;
+        previous = sum;
+        // Dither is advanced on the arranged clock, so previews remain exact
+        // slices even when their start lies inside an inserted repetition.
+        let arranged = frame + 1 + inserted_frames;
+        if arranged >= last {
+            break;
         }
     }
     temp.write_all(&block)?;

@@ -933,6 +933,9 @@ pub fn validate(store: &Store, cancel: &Cancellation) -> Result<Report> {
     Ok(report)
 }
 pub fn validate_analysis(store: &Store, a: &AnalysisManifest) -> Result<()> {
+    store.validate_analysis_once(a, || validate_analysis_artifacts(store, a))
+}
+fn validate_analysis_artifacts(store: &Store, a: &AnalysisManifest) -> Result<()> {
     for name in ["beats", "harmony", "regions"] {
         require(
             a.artifacts.contains_key(name),

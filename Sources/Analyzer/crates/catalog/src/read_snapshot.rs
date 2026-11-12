@@ -9,6 +9,7 @@ pub(crate) struct ReadSnapshot {
     files: Mutex<BTreeMap<PathBuf, Arc<Vec<u8>>>>,
     records: Mutex<BTreeMap<String, Arc<Vec<u8>>>>,
     bundles: Mutex<BTreeMap<PathBuf, Arc<SidecarBundle>>>,
+    validated_analyses: Mutex<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +17,7 @@ pub struct ReadSnapshotStats {
     pub physical_files: usize,
     pub logical_records: usize,
     pub sidecar_bundles: usize,
+    pub validated_analyses: usize,
 }
 
 fn lock<T>(value: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
@@ -73,9 +75,30 @@ impl Store {
                     physical_files: lock(&cache.files)?.len(),
                     logical_records: lock(&cache.records)?.len(),
                     sidecar_bundles: lock(&cache.bundles)?.len(),
+                    validated_analyses: lock(&cache.validated_analyses)?.len(),
                 })
             })
             .transpose()
+    }
+
+    /// Successful validation belongs only to this immutable operation and the
+    /// complete manifest, including every artifact and stage reference. The
+    /// physical bytes remain in the snapshot's mandatory final revalidation.
+    pub(crate) fn validate_analysis_once(
+        &self,
+        analysis: &AnalysisManifest,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let Some(cache) = &self.read_cache else {
+            return validate();
+        };
+        let key = canonical_hash(analysis)?.digest;
+        if lock(&cache.validated_analyses)?.contains(&key) {
+            return Ok(());
+        }
+        validate()?;
+        lock(&cache.validated_analyses)?.insert(key);
+        Ok(())
     }
 
     pub(crate) fn snapshot_record_bytes(&self, relative: &str) -> Result<Vec<u8>> {

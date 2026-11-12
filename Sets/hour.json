@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "name": "Hour set",
+  "duration_minutes": 60,
+  "structure": "story",
+  "must_pairs": [],
+  "pair_mode": "either",
+  "search": {
+    "measurements": 8192,
+    "seconds": 7200
+  }
+}

@@ -170,12 +170,13 @@ fn propose(
     pool: &[Track],
     policy: &MixingConfig,
     context: usize,
+    required: &crate::required_pairs::RequiredPairs,
     cancel: &Cancellation,
 ) -> Result<(Vec<Pair>, Vec<Family>)> {
     let jobs: Vec<_> = (0..pool.len())
         .flat_map(|a| {
             (0..pool.len())
-                .filter(move |&b| a != b)
+                .filter(move |&b| a != b && required.permits_edge(a, b))
                 .map(move |b| (a, b))
         })
         .collect();
@@ -326,6 +327,8 @@ fn priority(parent: &Route, family: &Family, window: usize, refining: bool) -> f
 /// end or middle, even when it cannot start a complete set. These estimates
 /// order measurements; only measured tactic evidence admits a join.
 struct Discovery {
+    required_bonus: Vec<f64>,
+    duration_bonus: BTreeMap<usize, (f64, usize)>,
     temporal: bool,
     regions: BTreeMap<(usize, u64), usize>,
     counts: Vec<usize>,
@@ -395,6 +398,28 @@ impl Discovery {
             }
         }
     }
+    fn learn_duration_bridges(
+        &mut self,
+        demands: &[(usize, u64, f64)],
+        families: &[Family],
+        pairs: &[Pair],
+        pacing: &[TrackPacing],
+    ) {
+        self.duration_bonus.clear();
+        for &(from, entry, value) in demands {
+            for (index, family) in families.iter().enumerate() {
+                if pairs[family.pair].from == from
+                    && pacing[from].assess(entry, family.exit).is_some()
+                {
+                    let bonus = value.min(12.);
+                    self.duration_bonus
+                        .entry(index)
+                        .and_modify(|b| b.0 = b.0.max(bonus))
+                        .or_insert((bonus, self.counts[family.pair]));
+                }
+            }
+        }
+    }
     fn next(&self, families: &[Family], pairs: &[Pair]) -> Option<Work> {
         let mut best: Option<(usize, usize, f64)> = None;
         for (family, f) in families.iter().enumerate() {
@@ -446,6 +471,13 @@ impl Discovery {
                 let rank = rank
                     + self.bridge_bonus[f.pair]
                         / (1 + self.counts[f.pair].saturating_sub(self.bridge_at[f.pair])) as f64;
+                let rank = rank
+                    + self.duration_bonus.get(&family).map_or(0., |(bonus, at)| {
+                        bonus / (1 + self.counts[f.pair].saturating_sub(*at)) as f64
+                    });
+                let rank = rank
+                    + self.required_bonus.get(f.pair).copied().unwrap_or(0.)
+                        / (1. + self.counts[f.pair] as f64 / 4.);
                 if best.is_none_or(|(_, _, value)| rank > value) {
                     best = Some((family, window, rank));
                 }
@@ -594,8 +626,19 @@ fn musical_policy(policy: &MixingConfig) -> Result<ContentHash> {
         "lazy_measurement_budget",
         "lazy_search_seconds",
         "set_search_strategy",
+        "set_config", // Provenance; effective musical choices remain separate policy keys.
     ] {
         policy.header.extensions.remove(key);
+    }
+    if policy
+        .header
+        .extensions
+        .get(crate::required_pairs::KEY)
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        policy.header.extensions.remove(crate::required_pairs::KEY);
+        policy.header.extensions.remove("required_pair_mode");
     }
     canonical_hash(&policy)
 }
@@ -671,7 +714,7 @@ fn supplied_incumbent(
     verify_plan(store, &plan, cancel)?;
     plan.plan_id = crate::id();
     plan.planner_version = if plan.header.extensions.contains_key("set_composition") {
-        "set-composition-lazy/1"
+        "set-composition-lazy/2"
     } else {
         "lazy-constraint-search/3"
     }
@@ -692,6 +735,12 @@ fn save_improvement(
     origin: &str,
     cancel: &Cancellation,
 ) -> Result<bool> {
+    if let Some(config) = plan.policy.header.extensions.get("set_config").cloned() {
+        plan.header.extensions.insert("set_config".into(), config);
+    }
+    let pool = measured_beam::prepared_pool(snapshot)?;
+    crate::required_pairs::RequiredPairs::resolve(snapshot, &plan.policy, &pool, pool.len())?
+        .annotate(&mut plan)?;
     if incumbent
         .as_ref()
         .is_some_and(|old| !crate::composition::better(&plan, old))
@@ -701,7 +750,7 @@ fn save_improvement(
     snapshot.verify_read_snapshot(cancel)?;
     plan.plan_id = id();
     plan.planner_version = if plan.header.extensions.contains_key("set_composition") {
-        "set-composition-lazy/1"
+        "set-composition-lazy/2"
     } else {
         "lazy-constraint-search/3"
     }
@@ -744,6 +793,9 @@ pub(super) fn choose(
     pool: Vec<Track>,
     cancel: &Cancellation,
 ) -> Result<MixPlan> {
+    if let Some(request) = crate::composition::Request::from_policy(policy)? {
+        return crate::duration_search::choose(store, policy, context, pool, request, cancel);
+    }
     let duration_mode = crate::composition::Request::from_policy(policy)?.is_some();
     require(
         (3..=8).contains(&count)
@@ -759,8 +811,15 @@ pub(super) fn choose(
             .sum();
         require(request.capacity_possible(capacity, 1.-policy.max_speed_deviation), "SET_POOL_DURATION", "even the entire prepared pool is too short for this duration window; analyze more songs")?;
     }
+    let snapshot = store.read_snapshot();
+    let required = crate::required_pairs::RequiredPairs::resolve(
+        &snapshot,
+        policy,
+        &pool,
+        if duration_mode { pool.len() } else { count },
+    )?;
     let composition = crate::composition::Request::from_policy(policy)?
-        .map(|r| crate::composition::Context::load(store, &pool, r, cancel))
+        .map(|r| crate::composition::Context::load(&snapshot, &pool, r, cancel))
         .transpose()?;
     let option = |key: &str, default: u64| {
         policy
@@ -774,7 +833,6 @@ pub(super) fn choose(
     let seconds = option("lazy_search_seconds", 1200).clamp(1, 86400);
     let max_fallbacks = option("max_last_resort_transitions", 1).min((count - 1) as u64) as usize;
     let started = Instant::now();
-    let snapshot = store.read_snapshot();
     let pacing = pool
         .iter()
         .map(|t| mixlib_planner::read_track_pacing(&snapshot, &t.track_id, cancel))
@@ -783,7 +841,7 @@ pub(super) fn choose(
         "lazy search: proposing cue families from {} tracks before any pair PCM measurement",
         pool.len()
     );
-    let (mut pairs, mut families) = propose(&snapshot, &pool, policy, context, cancel)?;
+    let (mut pairs, mut families) = propose(&snapshot, &pool, policy, context, &required, cancel)?;
     let probes: Vec<_> = families
         .iter()
         .map(|f| Probe {
@@ -810,6 +868,9 @@ pub(super) fn choose(
         refining: false,
     };
     for last in 0..if composition.is_some() { 0 } else { pool.len() } {
+        if !required.start_allowed(last) {
+            continue;
+        }
         let root = Arc::new(Route {
             used: 1 << last,
             last,
@@ -840,8 +901,26 @@ pub(super) fn choose(
     admission.normal_speed_deviation = policy.max_speed_deviation;
     let mut cache = CandidateEvidenceCache::new();
     let mut incumbent = supplied_incumbent(&snapshot, policy, &pool, &pacing, count, cancel)?;
+    if let Some(seed) = &mut incumbent {
+        required.annotate(seed)?;
+        if let Some(config) = policy.header.extensions.get("set_config") {
+            seed.header
+                .extensions
+                .insert("set_config".into(), config.clone());
+        }
+    }
     let mut history = vec![];
     let mut progress = Report::new("lazy_set_search");
+    if let Some(config) = policy.header.extensions.get("set_config") {
+        progress
+            .header
+            .extensions
+            .insert("set_config".into(), config.clone());
+    }
+    progress
+        .header
+        .extensions
+        .insert("required_pairs".into(), required.evidence());
     if let Some(seed) = &mut incumbent {
         let q = route_quality(seed);
         history.push(json!({"origin":"provided_incumbent","plan_id":seed.plan_id,"elapsed_seconds":started.elapsed().as_secs_f64(),
@@ -860,6 +939,11 @@ pub(super) fn choose(
     }
     let mut stop = "frontier_exhausted";
     let mut discovery = Discovery {
+        required_bonus: pairs
+            .iter()
+            .map(|p| required.priority(p.from, p.to))
+            .collect(),
+        duration_bonus: BTreeMap::new(),
         temporal: composition.is_some(),
         regions: BTreeMap::new(),
         counts: vec![0; pairs.len()],
@@ -871,7 +955,17 @@ pub(super) fn choose(
     let mut assembled_at = 0;
     let mut assembly_history = vec![];
     let deadline = started + std::time::Duration::from_secs(seconds);
+    let measurement_deadline = if composition.is_some() {
+        deadline - std::time::Duration::from_secs((seconds / 10).clamp(1, 300))
+    } else {
+        deadline
+    };
     loop {
+        // Reserve time to assemble newly measured evidence even if the next
+        // periodic checkpoint would lie beyond the wall-clock budget.
+        let final_composition = composition.is_some()
+            && (Instant::now() >= measurement_deadline
+                || stats.work_items >= policy.max_expansions);
         // Recombine every measured edge, including anchors discovered on a
         // discarded prefix. A cached measurement must outlive route pruning.
         if checkpoint_due(
@@ -881,14 +975,15 @@ pub(super) fn choose(
             frontier.heap.is_empty(),
             composition.is_some(),
         ) || (stats.measured_windows > assembled_at
-            && families
-                .iter()
-                .all(|f| f.windows.iter().all(|w| w.measured.is_some())))
+            && (final_composition
+                || families
+                    .iter()
+                    .all(|f| f.windows.iter().all(|w| w.measured.is_some()))))
         {
             assembled_at = stats.measured_windows;
             stats.graph_assemblies += 1;
             let assembled = if let Some(composer) = &composition {
-                composer.assemble(
+                let result = composer.assemble(
                     &snapshot,
                     &graph,
                     &pool,
@@ -897,7 +992,8 @@ pub(super) fn choose(
                     deadline.min(
                         Instant::now()
                             + std::time::Duration::from_secs(
-                                if stats.measured_windows >= measurement_limit {
+                                if stats.measured_windows >= measurement_limit || final_composition
+                                {
                                     300
                                 } else {
                                     60
@@ -905,7 +1001,19 @@ pub(super) fn choose(
                             ),
                     ),
                     cancel,
-                )?
+                )?;
+                discovery.learn_duration_bridges(&result.bridges, &families, &pairs, &pacing);
+                assembly_history.push(json!({"kind":"composition","measured_windows":assembled_at,
+                    "complete":result.plan.is_some(),"assembly":result.stats,
+                    "bridge_demands":result.bridges.iter().map(|(from,entry,value)|json!({"from":pool[*from].track_id,"entry_end_frame":entry,"anchor_value":value})).collect::<Vec<_>>(),
+                    "composition":result.plan.as_ref().and_then(|p|p.header.extensions.get("set_composition"))}));
+                progress.header.extensions.insert(
+                    "composition_checkpoint".into(),
+                    assembly_history.last().unwrap().clone(),
+                );
+                store.report(&progress)?;
+                eprintln!("composition: {} candidates; reached {} tracks / {:.1} min; {} duration and {} development rejections; {} bridge demands; complete {}",result.stats.examined,result.stats.deepest_tracks,result.stats.furthest_join_seconds/60.,result.stats.duration_rejections,result.stats.development_rejections,result.bridges.len(),result.plan.is_some());
+                result.plan
             } else {
                 measured_beam::assemble_measured(
                     &snapshot,
@@ -920,6 +1028,9 @@ pub(super) fn choose(
                     cancel,
                 )?
             };
+            if assembly_history.len() > 16 {
+                assembly_history.remove(0);
+            }
             if let Some(plan) = assembled {
                 stats.complete_candidates += 1;
                 discovery.learn_bridges(&plan, &pool, &pairs);
@@ -944,6 +1055,14 @@ pub(super) fn choose(
                     frontier.refine(&families);
                 }
             }
+        }
+        if final_composition {
+            stop = if stats.work_items >= policy.max_expansions {
+                "work_budget"
+            } else {
+                "time_budget"
+            };
+            break;
         }
         let discover = stats.measured_windows < measurement_limit && stats.work_items % 2 == 0;
         let work = if discover {
@@ -977,6 +1096,10 @@ pub(super) fn choose(
         let f = &families[work.family];
         let pair = &pairs[f.pair];
         let remaining = count - parent.length;
+        if !work.discovery && !required.allows(parent.used, parent.last, pair.to, remaining - 1) {
+            stats.cheap_rejections += 1;
+            continue;
+        }
         if !work.discovery
             && !can_beat(
                 optimistic(parent.quality, remaining, upper),
@@ -1114,6 +1237,12 @@ pub(super) fn choose(
         if work.window + 1 < f.windows.len() {
             frontier.push(parent.clone(), work.family, work.window + 1, f);
         }
+        if !required.start_allowed(parent.last) && parent.length == 1
+            || !required.allows(parent.used, parent.last, pair.to, remaining - 1)
+        {
+            stats.cheap_rejections += 1;
+            continue;
+        }
         for edge in f.windows[work.window].measured.as_ref().unwrap() {
             let quality = parent
                 .quality
@@ -1222,8 +1351,22 @@ pub(super) fn choose(
         .extensions
         .insert("search".into(), evidence.clone());
     store.report(&progress)?;
+    progress.header.extensions.insert("required_pair_admission".into(),json!(required.pairs.iter().map(|pair| {
+        let [a,b]=pair.indices;
+        let mut choices:Vec<_>=graph[a*pool.len()+b].iter().collect();
+        if required.mode==crate::required_pairs::Mode::Either { choices.extend(&graph[b*pool.len()+a]); }
+        json!({"spotify_ids":pair.spotify_ids,"track_ids":pair.track_ids,"mode":required.mode,
+            "measured_admitted_choices":choices.len(),"clean_choices":choices.iter().filter(|e|!e.last_resort && e.score>=25.).count(),
+            "meaning":if required.mode==crate::required_pairs::Mode::Anywhere {"membership only; adjacency is optional"} else {"choices measured in this search budget; zero is not proof of global impossibility"}})
+    }).collect::<Vec<_>>()));
+    store.report(&progress)?;
     let Some(mut best) = incumbent else {
-        return Err(Error::new("LAZY_NO_INCUMBENT",format!("lazy search stopped at {stop} without a complete admitted set; evidence reports/{}.json",progress.report_id)));
+        let code = if required.pairs.is_empty() {
+            "LAZY_NO_INCUMBENT"
+        } else {
+            "REQUIRED_PAIRS_NO_SET"
+        };
+        return Err(Error::new(code,format!("lazy search stopped at {stop} without a complete admitted set; evidence reports/{}.json",progress.report_id)));
     };
     best.header
         .extensions
@@ -1236,6 +1379,60 @@ pub(super) fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn duration_bridge_feedback_only_boosts_exits_after_the_retained_entry() {
+        let mut discovery = Discovery {
+            required_bonus: vec![],
+            duration_bonus: BTreeMap::new(),
+            temporal: true,
+            regions: BTreeMap::new(),
+            counts: vec![3],
+            best: vec![0.],
+            bridge_bonus: vec![0.],
+            bridge_at: vec![0],
+        };
+        let pairs = vec![Pair {
+            from: 0,
+            to: 1,
+            expansion: CandidateQueue::expansion_only(&[], 24),
+            admitted: BTreeMap::new(),
+            rejected: BTreeMap::new(),
+            details: vec![],
+        }];
+        let families = vec![
+            Family {
+                pair: 0,
+                exit: 60,
+                entry_end: 0,
+                upper: 120.,
+                windows: vec![],
+            },
+            Family {
+                pair: 0,
+                exit: 100,
+                entry_end: 0,
+                upper: 120.,
+                windows: vec![],
+            },
+        ];
+        discovery.learn_duration_bridges(
+            &[(0, 50, 10.)],
+            &families,
+            &pairs,
+            &[TrackPacing::unknown(1)],
+        );
+        assert!(
+            !discovery.duration_bonus.contains_key(&0),
+            "an early exit cannot repair the retained route"
+        );
+        assert!(discovery.duration_bonus.contains_key(&1));
+        discovery.learn_duration_bridges(&[], &families, &pairs, &[TrackPacing::unknown(1)]);
+        assert!(
+            discovery.duration_bonus.is_empty(),
+            "stale bridge demand cannot permanently monopolize measurement"
+        );
+    }
+
     #[test]
     fn duration_discovery_does_not_reassemble_after_every_window() {
         assert!(!checkpoint_due(1, 0, 8192, true, true));
@@ -1287,6 +1484,7 @@ mod tests {
             "lazy_measurement_budget",
             "lazy_search_seconds",
             "set_search_strategy",
+            "set_config",
         ] {
             changed
                 .header
@@ -1297,6 +1495,28 @@ mod tests {
             musical_policy(&original).unwrap(),
             musical_policy(&changed).unwrap()
         );
+        changed
+            .header
+            .extensions
+            .insert(crate::required_pairs::KEY.into(), json!([]));
+        changed
+            .header
+            .extensions
+            .insert("required_pair_mode".into(), json!("either"));
+        assert_eq!(
+            musical_policy(&original).unwrap(),
+            musical_policy(&changed).unwrap()
+        );
+        changed.header.extensions.insert(
+            crate::required_pairs::KEY.into(),
+            json!([["required-a", "required-b"]]),
+        );
+        assert_ne!(
+            musical_policy(&original).unwrap(),
+            musical_policy(&changed).unwrap()
+        );
+        changed.header.extensions.remove(crate::required_pairs::KEY);
+        changed.header.extensions.remove("required_pair_mode");
         changed
             .header
             .extensions

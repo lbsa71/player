@@ -26,6 +26,7 @@ pub enum TacticId {
     S10,
     S11,
     S12,
+    S13,
     D01,
     D02,
     C01,
@@ -48,7 +49,7 @@ pub enum TacticId {
     E04,
 }
 impl TacticId {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::M01,
         Self::M02,
         Self::M03,
@@ -67,6 +68,7 @@ impl TacticId {
         Self::S10,
         Self::S11,
         Self::S12,
+        Self::S13,
         Self::D01,
         Self::D02,
         Self::C01,
@@ -1215,6 +1217,31 @@ impl TacticPlan {
                 .all(|l| lane_ids.contains(&(*p, *l)))
             }),
             S01 | S03 | S04 => self.lanes.iter().any(|l| !l.eq.is_empty()),
+            S13 => {
+                self.timing_basis == TacticTimingBasis::Bars
+                    && (5..=9).contains(&self.bar_frames.len())
+                    && self.hold_end_frame == self.start_frame
+                    && self.exit_start_frame == self.start_frame
+                    && self.effects.is_empty()
+                    && self.source_edits.is_empty()
+                    && self.lanes.len() == 2
+                    && self.lanes.iter().all(|lane| {
+                        let incoming = lane.placement == self.incoming_placement;
+                        lane.lane == StemLane::Stereo
+                            && lane.eq.is_empty()
+                            && lane.gain
+                                == vec![
+                                    ScalarPoint {
+                                        output_frame: self.start_frame,
+                                        value: if incoming { 0. } else { 1. },
+                                    },
+                                    ScalarPoint {
+                                        output_frame: self.end_frame,
+                                        value: if incoming { 1. } else { 0. },
+                                    },
+                                ]
+                    })
+            }
             S08 => self
                 .effects
                 .iter()

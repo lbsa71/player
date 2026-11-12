@@ -169,3 +169,118 @@ fn failed_or_cancelled_export_keeps_previous_output_and_pcm24_is_reproducible() 
     assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap());
     assert_eq!(WavReader::open(&out).unwrap().format.container_bits, 24);
 }
+
+#[test]
+fn set_replay_uses_processed_capture_resumes_exactly_and_previews_match() {
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("phrase.wav");
+    support::wav(
+        &source,
+        48000,
+        2,
+        32,
+        true,
+        false,
+        20 * 48000,
+        b"CC0",
+        |i, _| {
+            let t = i as f64 / 48000.;
+            0.15 * (std::f64::consts::TAU * (180. * t + 2. * t * t)).sin()
+        },
+    );
+    let sources = BTreeMap::from([("track".into(), source.clone())]);
+    let cancel = Cancellation::default();
+    for speed in [1., 1.02] {
+        let mut p = plan(&source, speed, 0.7);
+        p.output.encoding = "pcm24".into();
+        let base = d.path().join(format!("base-{speed}.wav"));
+        render(&p, &sources, &base, false, None, &cancel).unwrap();
+        let r = PassageReplay {
+            placement: 0,
+            capture_start: 2 * 48000,
+            capture_end: 3 * 48000,
+            insert_before: 8 * 48000,
+            repetitions: 2,
+            bars: 4,
+            declick_frames: 240,
+            evidence: serde_json::json!({"fixture":true}),
+        };
+        let a = SetArrangement {
+            version: 1,
+            base_output_frames: p.total_output_frames,
+            replays: vec![r.clone()],
+        };
+        p.total_output_frames += a.added_frames();
+        p.renderer_version = ARRANGEMENT_RENDERER.into();
+        p.header.extensions.insert(
+            ARRANGEMENT_EXTENSION.into(),
+            serde_json::to_value(&a).unwrap(),
+        );
+        let out = d.path().join(format!("replay-{speed}.wav"));
+        render(&p, &sources, &out, false, None, &cancel).unwrap();
+        let mut original = WavReader::open(&base).unwrap();
+        let mut expanded = WavReader::open(&out).unwrap();
+        assert_eq!(expanded.format.frames, p.total_output_frames);
+        for repetition in 0..2 {
+            original.seek_frame(r.capture_start + 12000).unwrap();
+            expanded
+                .seek_frame(r.insert_before + repetition * 48000 + 12000)
+                .unwrap();
+            for (x, y) in original
+                .read_frames(2000)
+                .unwrap()
+                .iter()
+                .zip(expanded.read_frames(2000).unwrap())
+            {
+                assert!(
+                    (x[0] - y[0]).abs() < 4. / 8388608.,
+                    "repeat must preserve the stretched capture"
+                );
+            }
+        }
+        original.seek_frame(r.insert_before + 100).unwrap();
+        expanded
+            .seek_frame(r.insert_before + r.added_frames() + 100)
+            .unwrap();
+        for (x, y) in original
+            .read_frames(2000)
+            .unwrap()
+            .iter()
+            .zip(expanded.read_frames(2000).unwrap())
+        {
+            assert!(
+                (x[0] - y[0]).abs() < 4. / 8388608.,
+                "original timeline must resume without skipping source"
+            );
+        }
+        let range = (
+            r.insert_before + 72000,
+            r.insert_before + r.added_frames() + 4567,
+        );
+        let preview = d.path().join(format!("preview-{speed}.wav"));
+        render(&p, &sources, &preview, false, Some(range), &cancel).unwrap();
+        let mut slice = WavReader::open(&preview).unwrap();
+        expanded.seek_frame(range.0).unwrap();
+        assert_eq!(
+            slice.read_frames((range.1 - range.0) as usize).unwrap(),
+            expanded.read_frames((range.1 - range.0) as usize).unwrap()
+        );
+        let mut bad = p.clone();
+        let mut invalid = a.clone();
+        invalid.replays[0].insert_before = 2 * 48000;
+        bad.header.extensions.insert(
+            ARRANGEMENT_EXTENSION.into(),
+            serde_json::to_value(invalid).unwrap(),
+        );
+        assert!(
+            bad.validate().is_err(),
+            "a capture cannot be replayed before it exists"
+        );
+        bad = p.clone();
+        bad.placements[0].automation[1].gain_linear = 0.5;
+        assert!(
+            bad.validate().is_err(),
+            "changing gain invalidates a measured splice"
+        );
+    }
+}

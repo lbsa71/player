@@ -248,6 +248,57 @@ mod tests {
     };
 
     #[test]
+    fn baseline_checks_actual_voice_entry_and_exit_not_continuing_boundaries() {
+        let mut f = facts(4);
+        let bar = f.bar_frames[1];
+        let end = *f.bar_frames.last().unwrap();
+        let source_end = f.a.source.output_end_frame;
+        f.a.vocal_phrases = None;
+        f.b.vocal_phrases = None;
+        // A's line is already playing when the fade starts. B's new line
+        // continues after it ends. Only B's entry and A's exit are gates.
+        f.a.vocal_quiet = Some(vec![[bar, source_end]]);
+        f.b.vocal_quiet = Some(vec![[0, 3 * bar]]);
+        let plan = candidate_tactic_schedule(TacticId::S13, &f, &TacticPolicy::default())
+            .expect("continuing vocals need no artificial gap at A start or B end");
+        assert!(plan
+            .vocal_occupancy
+            .iter()
+            .any(|v| { v.placement == f.a.placement && v.start_frame == plan.start_frame }));
+        assert!(plan
+            .vocal_occupancy
+            .iter()
+            .any(|v| { v.placement == f.b.placement && v.end_frame > plan.end_frame }));
+
+        let mut missing_exit = f.clone();
+        missing_exit.a.vocal_quiet = Some(vec![[bar, end - 1]]);
+        missing_exit.b.vocal_quiet = Some(vec![[0, source_end]]);
+        let error =
+            candidate_tactic_schedule(TacticId::S13, &missing_exit, &TacticPolicy::default())
+                .unwrap_err();
+        assert_eq!(error.code, "TACTIC_VOCALS");
+        assert!(error.message.contains("between-lines gap"));
+
+        let mut missing_entry = f.clone();
+        missing_entry.a.vocal_quiet = Some(vec![[0, source_end]]);
+        missing_entry.b.vocal_quiet = Some(vec![[bar / 2, 3 * bar]]);
+        let error =
+            candidate_tactic_schedule(TacticId::S13, &missing_entry, &TacticPolicy::default())
+                .unwrap_err();
+        assert_eq!(error.code, "TACTIC_VOCALS");
+        assert!(error.message.contains("between-lines gap"));
+
+        // Quiet gates alone do not authorize overlapping lines in the body.
+        let mut collision = f;
+        collision.a.vocal_quiet = Some(vec![[3 * bar, source_end]]);
+        collision.b.vocal_quiet = Some(vec![[0, 2 * bar]]);
+        let error = candidate_tactic_schedule(TacticId::S13, &collision, &TacticPolicy::default())
+            .unwrap_err();
+        assert_eq!(error.code, "TACTIC_VOCALS");
+        assert!(error.message.contains("potential vocals overlap"));
+    }
+
+    #[test]
     fn later_vocal_pocket_preserves_a_long_hold_with_audible_bleed() {
         let mut f = facts(8);
         let mut plan =

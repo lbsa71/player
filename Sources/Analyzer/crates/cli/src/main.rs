@@ -1,7 +1,17 @@
 mod chain;
 mod composition;
+mod cue_sweep;
+mod duration_search;
+mod discovery_schedule;
+mod historical_seeds;
 mod lazy_solver;
 mod measured_beam;
+mod refinement_branches;
+mod refinement_layout;
+mod required_pairs;
+mod search_cache;
+mod set_config;
+mod set_replays;
 mod tactic_analysis;
 mod tactics;
 mod timetable;
@@ -61,12 +71,24 @@ enum Command {
         #[arg(long, env = "MIXLIB_SEPARATOR_PYTHON")]
         separator_python: PathBuf,
     },
+    /// Measure event-anchored joins across the prepared library and compare filter admission.
+    AuditCues {
+        /// Previous policy namespace relative to the library, for a before/after comparison.
+        #[arg(long)]
+        prior_cache: String,
+        /// Max event windows measured per event family and ordered pair.
+        #[arg(long, default_value_t = 1, value_parser=clap::value_parser!(u8).range(1..=8))]
+        per_family: u8,
+    },
     Inspect {
         #[arg(long)]
         track: Option<String>,
         /// Include one- to four-bar texture and timing descriptions.
         #[arg(long, requires = "track")]
         bars: bool,
+        /// Measure clear instrumental phrase loops and compatible later destinations.
+        #[arg(long, requires = "track")]
+        loops: bool,
         /// Previous incoming transition end, in source time, for a pacing audit.
         #[arg(long, requires_all=["track","pacing_exit"], value_parser=parse_duration)]
         pacing_after: Option<f64>,
@@ -188,8 +210,30 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Create a named, editable set recipe without starting a search.
+    InitSet {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_parser=["60","120"], conflicts_with="tracks")]
+        set_minutes: Option<String>,
+        #[arg(long, value_parser=clap::value_parser!(u8).range(3..=8))]
+        tracks: Option<u8>,
+        #[arg(long, default_value="auto", value_parser=["auto","story","wave","ramp","chapters"])]
+        structure: String,
+    },
     /// Search for a full set, saving improved complete plans without rendering audio.
     SearchSet {
+        /// Read all set/search choices from this JSON recipe; do not mix with inline choices.
+        #[arg(long, conflicts_with_all=["must_pair","must_pair_mode","set_minutes","structure","incumbent","tracks","measurements","seconds"])]
+        config: Option<PathBuf>,
+        /// Required Spotify track pair A,B; repeat for multiple pairs.
+        #[arg(long, value_name = "SPOTIFY_A,SPOTIFY_B")]
+        must_pair: Vec<String>,
+        /// Pair semantics; default is an adjacent transition in either direction.
+        #[arg(long, requires="must_pair", value_parser=["ordered","either","anywhere"])]
+        must_pair_mode: Option<String>,
         /// Compose a full set lasting 57–60 or 117–120 minutes; song count is free.
         #[arg(long, value_parser=["60", "120"], conflicts_with="incumbent")]
         set_minutes: Option<String>,
@@ -201,10 +245,10 @@ enum Command {
         incumbent: Option<String>,
         #[arg(long, conflicts_with="set_minutes", value_parser=clap::value_parser!(u8).range(3..=8))]
         tracks: Option<u8>,
-        /// Default: 8192/16384 windows for full sets, 1536 for short diagnostics.
+        /// Refinement windows after a full baseline: 8192/16384. Short diagnostics: 1536 total.
         #[arg(long, value_parser=clap::value_parser!(u64).range(1..=100000))]
         measurements: Option<u64>,
-        /// Default search budget: 7200/14400 seconds for full sets, 1200 for diagnostics.
+        /// Refinement seconds after a full baseline: 7200/14400. Short diagnostics: 1200 total.
         #[arg(long, value_parser=clap::value_parser!(u64).range(1..=86400))]
         seconds: Option<u64>,
     },
@@ -291,6 +335,36 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
         schemas(output)?;
         return Ok(serde_json::json!({"schemas":output}));
     }
+    if let Command::InitSet {
+        output,
+        name,
+        set_minutes,
+        tracks,
+        structure,
+    } = &args.command
+    {
+        let name = name.clone().unwrap_or_else(|| {
+            output
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let document = set_config::SetConfig::starter(
+            name,
+            set_minutes.as_ref().map(|m| m.parse().unwrap()),
+            *tracks,
+            structure.clone(),
+        )?;
+        return set_config::create(output, &document);
+    }
+    // Validate and snapshot the recipe before waiting for the library writer.
+    let set_document = match &args.command {
+        Command::SearchSet {
+            config: Some(path), ..
+        } => Some(set_config::load(path)?),
+        _ => None,
+    };
     let root = args
         .library
         .clone()
@@ -317,6 +391,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
         Command::Scan { .. }
             | Command::Analyze { .. }
             | Command::AnalyzeTactics { .. }
+            | Command::AuditCues { .. }
             | Command::Plan { .. }
             | Command::Stitch { .. }
             | Command::SearchSet { .. }
@@ -374,11 +449,25 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                 )?)?
             }
         }
+        Command::AuditCues {
+            prior_cache,
+            per_family,
+        } => {
+            let policy: MixingConfig = store.read("config/mixing.json")?;
+            cue_sweep::run(
+                &store,
+                &policy,
+                prior_cache,
+                usize::from(*per_family),
+                cancel,
+            )?
+        }
         Command::Inspect {
             track,
             bars,
             pacing_after,
             pacing_exit,
+            loops,
         } => {
             if let Some(id) = track {
                 let t = store.track(id)?;
@@ -408,6 +497,11 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                     result["pacing"] = serde_json::json!({"admitted":decision.is_some(),"decision":decision,
                         "earliest_possible_exit_seconds":pacing.earliest_exit(entry_end) as f64/rate,
                         "scope":"Pacing only; concrete tactic vocal, buildup, layer and overlap admission remains required"});
+                }
+                if *loops {
+                    result["loop_candidates"] = serde_json::to_value(
+                        mixlib_planner::read_set_replays(&store, id, cancel)?,
+                    )?;
                 }
                 if *bars {
                     result["segments"] = analysis
@@ -766,6 +860,9 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             serde_json::to_value(reports)?
         }
         Command::SearchSet {
+            config: _,
+            must_pair,
+            must_pair_mode,
             set_minutes,
             structure,
             incumbent,
@@ -773,51 +870,54 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             measurements,
             seconds,
         } => {
-            let set_minutes = set_minutes
-                .clone()
-                .or_else(|| (tracks.is_none() && incumbent.is_none()).then(|| "60".to_string()));
-            let (default_measurements, default_seconds) = match set_minutes.as_deref() {
-                Some("120") => (16384, 14400),
-                Some(_) => (8192, 7200),
-                None => (1536, 1200),
-            };
-            let measurements = measurements.unwrap_or(default_measurements);
-            let seconds = seconds.unwrap_or(default_seconds);
             let mut policy: MixingConfig = store.read("config/mixing.json")?;
-            policy.header.extensions.insert(
-                "lazy_measurement_budget".into(),
-                serde_json::json!(measurements),
-            );
-            policy
-                .header
-                .extensions
-                .insert("lazy_search_seconds".into(), serde_json::json!(seconds));
-            if let Some(id) = incumbent {
-                policy
-                    .header
-                    .extensions
-                    .insert("lazy_incumbent_plan".into(), serde_json::json!(id));
-            }
-            if let Some(minutes) = set_minutes {
+            let count = if let Some((document, path)) = &set_document {
+                document.apply(&mut policy, path)?
+            } else {
+                let set_minutes = set_minutes.clone().or_else(|| {
+                    (tracks.is_none() && incumbent.is_none()).then(|| "60".to_string())
+                });
+                let (default_measurements, default_seconds) = match set_minutes.as_deref() {
+                    Some("120") => (16384, 14400),
+                    Some(_) => (8192, 7200),
+                    None => (1536, 1200),
+                };
+                let measurements = measurements.unwrap_or(default_measurements);
+                let seconds = seconds.unwrap_or(default_seconds);
                 policy.header.extensions.insert(
-                    "set_minutes".into(),
-                    serde_json::json!(minutes.parse::<u64>().unwrap()),
+                    "lazy_measurement_budget".into(),
+                    serde_json::json!(measurements),
                 );
                 policy
                     .header
                     .extensions
-                    .insert("set_structure".into(), serde_json::json!(structure));
-            }
+                    .insert("lazy_search_seconds".into(), serde_json::json!(seconds));
+                if let Some(id) = incumbent {
+                    policy
+                        .header
+                        .extensions
+                        .insert("lazy_incumbent_plan".into(), serde_json::json!(id));
+                }
+                if let Some(minutes) = set_minutes {
+                    policy.header.extensions.insert(
+                        "set_minutes".into(),
+                        serde_json::json!(minutes.parse::<u64>().unwrap()),
+                    );
+                    policy
+                        .header
+                        .extensions
+                        .insert("set_structure".into(), serde_json::json!(structure));
+                }
+                required_pairs::configure(&mut policy, must_pair, must_pair_mode.as_deref())?;
+                usize::from(tracks.unwrap_or(8))
+            };
             let pool = measured_beam::prepared_pool(&store.read_snapshot())?;
-            let plan = lazy_solver::choose(
-                &store,
-                &policy,
-                12,
-                usize::from(tracks.unwrap_or(8)),
-                pool,
-                cancel,
-            )?;
-            serde_json::json!({"plan":plan})
+            if let Some(request) = composition::Request::from_policy(&policy)? {
+                duration_search::refine_set(&store, &policy, 12, pool, request, cancel)?
+            } else {
+                let plan = lazy_solver::choose(&store, &policy, 12, count, pool, cancel)?;
+                serde_json::json!({"plan":plan})
+            }
         }
         Command::Play { plan } => {
             require(
@@ -873,7 +973,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             store.set_overrides(track, overrides)?;
             serde_json::to_value(store.overrides(&store.track(track)?)?)?
         }
-        Command::Init | Command::Schemas { .. } => unreachable!(),
+        Command::Init | Command::InitSet { .. } | Command::Schemas { .. } => unreachable!(),
     };
     Ok(result)
 }

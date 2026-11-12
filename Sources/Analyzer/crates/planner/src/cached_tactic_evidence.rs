@@ -555,7 +555,7 @@ pub(crate) fn source_quiet_spans(track: &Value, rate: u32) -> Vec<(u64, u64)> {
     intervals
 }
 
-fn verified_absence(track: &Value, start: u64, end: u64, rate: u32) -> bool {
+pub(crate) fn verified_absence(track: &Value, start: u64, end: u64, rate: u32) -> bool {
     let mut cursor = start;
     for (a, b) in source_quiet_spans(track, rate) {
         if a > cursor {
