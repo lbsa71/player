@@ -153,7 +153,6 @@ pub(crate) fn apply_cached_tactic_facts(
             .iter()
             .map(|r| format!("measured transition endpoint: {r}")),
     );
-    facts.phrase_exit = crate::phrase_exit::measure(store, record, p, anchors, facts, cancel)?;
     apply_motif(record, p, anchors, facts);
     apply_loops(record, p, anchors, facts);
     Ok(())

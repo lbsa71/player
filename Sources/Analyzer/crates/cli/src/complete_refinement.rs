@@ -8,6 +8,22 @@ use crate::{
 };
 use std::collections::VecDeque;
 
+#[cfg(feature = "cp-search")]
+#[path = "cp_archive.rs"]
+mod cp_archive;
+
+#[cfg(feature = "cp-search")]
+#[path = "cp_search.rs"]
+mod cp_search;
+
+#[cfg(feature = "cp-search")]
+#[path = "cp_manifest.rs"]
+mod cp_manifest;
+
+#[cfg(feature = "cp-search")]
+#[path = "cp_startup.rs"]
+mod cp_startup;
+
 #[derive(Clone)]
 struct Block {
     tracks: Vec<usize>,
@@ -52,6 +68,8 @@ struct Scheduler {
     proposed_pairs: BTreeSet<(usize, usize)>,
     measured_pairs: BTreeSet<(usize, usize)>,
     closing_attempts: usize,
+    #[cfg(feature = "cp-search")]
+    archive_revalidation: Option<Value>,
     closing_diagnostics: crate::composition::CloseDiagnostics,
     bound_pruned: usize,
     cache_loaded: bool,
@@ -67,18 +85,25 @@ struct Scheduler {
 // are restricted, pretending the currently measured graph is exhaustive would
 // give an invalid bound. All composition penalties are nonnegative.
 fn unrestricted_upper_bound(pool_len: usize, request: Request) -> f64 {
-    pool_len.saturating_sub(1) as f64 * mixlib_planner::MAX_TACTIC_CONTINUATION_SECONDS
-        / (request.min() / 60.)
+    unrestricted_score_upper(pool_len, request).unwrap_or(f64::INFINITY)
 }
 fn closing_capacity(maximum: u64, rate: f64, minimum_seconds: f64) -> bool {
     maximum as f64 / rate * (1. + MAX_REPLAY_FRACTION) + 1e-6 >= minimum_seconds
 }
-fn frontier_parts(cache: &Cache, store: &Store, rows: Vec<Value>) -> Result<Vec<String>> {
+fn frontier_parts(
+    cache: &Cache,
+    store: &Store,
+    rows: Vec<Value>,
+    deadline: Option<Instant>,
+) -> Result<Option<Vec<String>>> {
     // Removing the first parked item or changing the best candidate must not
     // shift every subsequent chunk. Stable hash buckets localize membership
     // changes, and content-addressed chunks remain reusable across snapshots.
     let mut buckets: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
     for row in rows {
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Ok(None);
+        }
         let key = canonical_hash(&row)?.digest;
         buckets
             .entry(key[..2].to_owned())
@@ -89,19 +114,41 @@ fn frontier_parts(cache: &Cache, store: &Store, rows: Vec<Value>) -> Result<Vec<
     for bucket in buckets.into_values() {
         let rows = bucket.into_values().collect::<Vec<_>>();
         for chunk in rows.chunks(128) {
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                return Ok(None);
+            }
             let payload = json!(chunk);
             let part = canonical_hash(&payload)?.digest;
             cache.write_immutable(store, "refinement-frontier-parts", &part, &payload)?;
             parts.push(part);
         }
     }
-    Ok(parts)
+    Ok(Some(parts))
 }
 fn shuffled_key(index: usize, generation: usize) -> u64 {
     let mut x = (index as u64).wrapping_add((generation as u64).wrapping_mul(0x9e3779b97f4a7c15));
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
     x ^ (x >> 31)
+}
+
+#[cfg_attr(not(feature = "cp-search"), allow(dead_code))]
+enum AssemblyRejection {
+    Prefix { len: usize, reason: String },
+    Unknown(String),
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StopReason {
+    Cancelled,
+    WallClock,
+    MeasurementWindows,
+    GeneratedProbeScope,
+    #[cfg(feature = "cp-search")]
+    DirectedDurationCapacity,
+    #[cfg(feature = "cp-search")]
+    RequiredAdjacencyChain,
 }
 
 struct Refiner<'a> {
@@ -119,8 +166,162 @@ struct Refiner<'a> {
     rounds: usize,
     rejected_layouts: usize,
     scheduler: Scheduler,
+    #[cfg(feature = "cp-search")]
+    cp: Option<cp_search::CpSearch>,
 }
-impl Refiner<'_> {
+impl<'a> Refiner<'a> {
+    fn new(search: Search<'a>) -> Self {
+        Self {
+            edges: vec![],
+            edge_keys: BTreeSet::new(),
+            blocks: BTreeMap::new(),
+            population: vec![],
+            best: None,
+            seen: BTreeSet::new(),
+            attempted_repairs: BTreeSet::new(),
+            attempted_final: BTreeSet::new(),
+            draft_report: Report::new("complete_set_refinement"),
+            history: vec![],
+            rounds: 0,
+            rejected_layouts: 0,
+            scheduler: Scheduler::default(),
+            #[cfg(feature = "cp-search")]
+            cp: (search
+                .policy
+                .header
+                .extensions
+                .get(crate::set_config::ENGINE_KEY)
+                .and_then(Value::as_str)
+                == Some("cp"))
+            .then(cp_search::CpSearch::default),
+            search,
+        }
+    }
+    #[cfg(feature = "cp-search")]
+    fn propose_cp_route(&mut self, deadline: Instant, cancel: &Cancellation) -> Result<()> {
+        if let Some(mut cp) = self.cp.take() {
+            let result = cp.step(self, deadline, cancel).and_then(|draft| {
+                cp.closing.checkpoint_routes(&self.search)?;
+                Ok(draft)
+            });
+            self.cp = Some(cp);
+            if let Some(draft) = result? {
+                self.admit(draft, cancel)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn close_cp_routes(&mut self, deadline: Instant, cancel: &Cancellation) -> Result<bool> {
+        if let Some(mut cp) = self.cp.take() {
+            let result = cp
+                .closing
+                .slice(self, deadline, cancel)
+                .and_then(|pending| {
+                    cp.closing.checkpoint_routes(&self.search)?;
+                    Ok(pending)
+                });
+            self.cp = Some(cp);
+            return result;
+        }
+        Ok(false)
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn schedule_closing_window(
+        &mut self,
+        discovery: &mut Schedule,
+        frames: &[u64],
+        minimum: &[u64],
+        measured: &mut BTreeSet<String>,
+        exploration: &mut VecDeque<MixPlan>,
+        cancel: &Cancellation,
+    ) -> Result<Option<MixPlan>> {
+        let Some(cp) = &self.cp else {
+            return Ok(None);
+        };
+        let targets = cp.closing_probes(self);
+        let Some(probe) = discovery.next_targeted(&targets, frames, minimum) else {
+            return Ok(None);
+        };
+        self.scheduler.proposed_pairs.insert((probe.from, probe.to));
+        let plans = self
+            .search
+            .proposals(probe.from, probe.to, probe.after, probe.tier, cancel)?;
+        let mut selected = None;
+        for seed in plans {
+            let key = window_key(&self.search.cache, &seed)?;
+            if self.search.measured_keys.contains(&key) || measured.contains(&key) {
+                continue;
+            }
+            if selected.is_none() && cp.matches_closing_window(self, probe, &seed) {
+                measured.insert(key);
+                selected = Some(seed);
+            } else {
+                exploration.push_back(seed);
+            }
+        }
+        self.cp
+            .as_mut()
+            .unwrap()
+            .note_closing_probe(selected.is_some());
+        Ok(selected)
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn bootstrap_measured_incumbent(
+        &mut self,
+        deadline: Instant,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let Some(cp) = &self.cp else {
+            return Ok(());
+        };
+        let required_growth = (cp.bootstrap_edges / 4).max(16);
+        if self.search.incumbent.is_some()
+            || self.edges.len() < 2
+            || Instant::now() >= deadline
+            || (cp.bootstrap_attempts > 0
+                && self.edges.len() < cp.bootstrap_edges + required_growth)
+        {
+            return Ok(());
+        }
+        let mut touched = BTreeSet::new();
+        for edge in &self.edges {
+            touched.extend(edge.plan.placements.iter().map(|p| p.track_id.as_str()));
+        }
+        let source_seconds = self
+            .search
+            .pool
+            .iter()
+            .filter(|t| touched.contains(t.track_id.as_str()))
+            .map(|t| seconds(t, t.format.frames))
+            .sum();
+        let min_speed = self
+            .edges
+            .iter()
+            .flat_map(|e| &e.plan.placements)
+            .map(|p| p.time_map.speed_ratio_limits[0])
+            .fold(1. - self.search.policy.max_speed_deviation, f64::min);
+        if !self
+            .search
+            .request
+            .capacity_possible(source_seconds, min_speed)
+        {
+            return Ok(());
+        }
+        let stats = cp_startup::search(self, deadline, cancel)?;
+        eprintln!("set search: measured bootstrap examined {} edges, reached {} tracks / {:.1} min, closing attempts {}, approved {}",
+            stats.examined, stats.deepest_tracks, stats.furthest_join_seconds / 60.,
+            stats.closing_attempts, stats.approved);
+        let cp = self.cp.as_mut().unwrap();
+        cp.bootstrap_edges = self.edges.len();
+        cp.bootstrap_attempts += 1;
+        cp.measured_bootstrap = Some(stats);
+        Ok(())
+    }
+
     fn rate(&self) -> f64 {
         f64::from(self.search.policy.output_sample_rate_hz)
     }
@@ -139,9 +340,30 @@ impl Refiner<'_> {
     }
     fn sync_edges(&mut self) -> Result<bool> {
         let before = self.edges.len();
-        for edge in self.search.graph.iter().flatten() {
-            if self.edge_keys.insert(route_key(&edge.plan)?) {
-                self.edges.push(edge.clone());
+        let n = self.search.pool.len();
+        for (pair, edges) in self.search.graph.iter().enumerate() {
+            if edges.is_empty() {
+                continue;
+            }
+            let (from, to) = (pair / n, pair % n);
+            if !self.search.schedules_transition(from, to) {
+                continue;
+            }
+            for edge in edges {
+                #[cfg(feature = "cp-search")]
+                if let Some(proof) = &self.search.capacity_proof {
+                    if self.search.window_cannot_fit(&edge.plan, proof, from, to) {
+                        continue;
+                    }
+                }
+                let key = measured_edge_key(edge)?;
+                if self.edge_keys.insert(key.clone()) {
+                    self.scheduler
+                        .identities
+                        .borrow_mut()
+                        .insert(self.edges.len(), key);
+                    self.edges.push(edge.clone());
+                }
             }
         }
         if before != self.edges.len() {
@@ -162,34 +384,83 @@ impl Refiner<'_> {
         };
         (index(&p[0].track_id), index(&p[1].track_id))
     }
-    fn block(&mut self, edges: &[usize]) -> Result<Option<Arc<Block>>> {
-        if let Some(cached) = self.blocks.get(edges) {
-            return Ok(cached.clone());
-        }
+    fn assemble_measured_chain(&self, edges: &[usize]) -> Result<Option<(Vec<usize>, MixPlan)>> {
+        Ok(self.assemble_measured_chain_diagnosed(edges)?.ok())
+    }
+
+    fn assemble_measured_chain_diagnosed(
+        &self,
+        edges: &[usize],
+    ) -> Result<std::result::Result<(Vec<usize>, MixPlan), AssemblyRejection>> {
+        self.assemble_measured(edges, true)
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn assemble_measured_for_closing(
+        &self,
+        edges: &[usize],
+    ) -> Result<std::result::Result<(Vec<usize>, MixPlan), AssemblyRejection>> {
+        self.assemble_measured(edges, false)
+    }
+
+    fn assemble_measured(
+        &self,
+        edges: &[usize],
+        use_preferred_opening: bool,
+    ) -> Result<std::result::Result<(Vec<usize>, MixPlan), AssemblyRejection>> {
+        let Some(&first) = edges.first() else {
+            return Ok(Err(AssemblyRejection::Unknown("empty_route".into())));
+        };
         let mut plan = None;
-        let mut tracks = vec![self.ends(edges[0]).0];
+        let mut tracks = vec![self.ends(first).0];
         let mut entry = 0;
-        for &id in edges {
+        for (i, &id) in edges.iter().enumerate() {
             let (from, to) = self.ends(id);
             if tracks.last() != Some(&from) || tracks.contains(&to) {
-                return Ok(None);
+                return Ok(Err(AssemblyRejection::Unknown(
+                    "disconnected_or_repeated_track".into(),
+                )));
             }
-            let next = self.search.composer.extend(
-                plan.as_ref(),
-                &self.edges[id],
-                from,
-                entry,
-                &self.search.pacing[from],
-            )?;
+            let mut rejection = None;
+            let edge = &self.edges[id];
+            let pacing = &self.search.pacing[from];
+            let next = if use_preferred_opening {
+                self.search.composer.extend_diagnosed(
+                    plan.as_ref(),
+                    edge,
+                    from,
+                    entry,
+                    pacing,
+                    &mut rejection,
+                )?
+            } else {
+                // An opening-specific development or duration failure cannot
+                // close this prefix for the other supported openings.
+                Context::append_measured(plan.as_ref(), edge, entry, pacing, &mut rejection)?
+            };
             if next.is_none() {
-                self.blocks.insert(edges.to_vec(), None);
-                return Ok(None);
+                return Ok(Err(match rejection {
+                    Some(reason) if reason != "invalid_evidence" => {
+                        AssemblyRejection::Prefix { len: i + 1, reason }
+                    }
+                    _ => AssemblyRejection::Unknown("invalid_evidence".into()),
+                }));
             }
             plan = next;
             entry = self.edges[id].entry_end;
             tracks.push(to);
         }
-        let p = plan.as_ref().unwrap();
+        Ok(Ok((tracks, plan.expect("nonempty measured chain"))))
+    }
+
+    fn block(&mut self, edges: &[usize]) -> Result<Option<Arc<Block>>> {
+        if let Some(cached) = self.blocks.get(edges) {
+            return Ok(cached.clone());
+        }
+        let Some((tracks, p)) = self.assemble_measured_chain(edges)? else {
+            self.blocks.insert(edges.to_vec(), None);
+            return Ok(None);
+        };
         let last = *tracks.last().unwrap();
         let map = &p.placements.last().unwrap().time_map;
         let anchor = &map.anchors[map.anchors.len() - 2];
@@ -207,7 +478,7 @@ impl Refiner<'_> {
             Arc::new(Block {
                 tracks,
                 edges: edges.to_vec(),
-                plan,
+                plan: Some(p),
                 minimum,
                 maximum,
             })
@@ -545,6 +816,13 @@ impl Refiner<'_> {
                 self.scheduler.branches_expanded,
                 self.scheduler.closing_attempts,
             );
+            #[cfg(feature = "cp-search")]
+            let closing_pending = self.close_cp_routes(
+                deadline.min(Instant::now() + std::time::Duration::from_millis(250)),
+                cancel,
+            )?;
+            #[cfg(not(feature = "cp-search"))]
+            let closing_pending = false;
             for _ in 0..4 {
                 self.branch_step(cancel, deadline)?;
             }
@@ -568,7 +846,7 @@ impl Refiner<'_> {
                 // alternative can benefit from the most recent measured edge.
                 self.regenerate(cancel)?;
                 rotations += 1;
-            } else if !worked && self.scheduler.branches.is_empty() {
+            } else if !worked && !closing_pending && self.scheduler.branches.is_empty() {
                 break;
             }
             if progress.elapsed().as_secs() >= 10 {
@@ -654,32 +932,138 @@ impl Refiner<'_> {
         )
     }
     fn checkpoint(&mut self, status: &str) -> Result<()> {
-        let best = self.best.as_ref().unwrap();
+        self.checkpoint_with_stop(status, None)
+    }
+
+    fn checkpoint_with_stop(&mut self, status: &str, stop: Option<StopReason>) -> Result<()> {
+        let checkpoint_started = Instant::now();
+        let draft = self
+            .best
+            .as_ref()
+            .map(|best| self.draft_value(best))
+            .transpose()?
+            .unwrap_or(Value::Null);
         self.draft_report
             .header
             .extensions
-            .insert("draft".into(), self.draft_value(best)?);
+            .insert("draft".into(), draft);
         self.draft_report.header.extensions.insert("search".into(),json!({"method":"complete-set-refinement/1","status":status,
             "prepared_tracks":self.search.pool.len(),"elapsed_seconds":self.search.started.elapsed().as_secs_f64(),
+            "cache_mode":self.search.cache.mode,
             "measured_windows":self.search.stats.measured_windows,"cached_windows":self.search.stats.cached_windows,
+            "selector_refresh_attempts":self.search.stats.selector_refresh_attempts,
+            "capacity_skipped_windows":self.search.stats.capacity_skipped_windows,
+            "in_flight_pcm_overrun_seconds":self.search.stats.in_flight_pcm_overrun_seconds,
             "known_good_choices":self.edges.len(),"complete_drafts_examined":self.seen.len(),"rounds":self.rounds,
+            "duplicate_measured_choices":self.search.stats.duplicate_measured_choices,
             "rejected_layouts":self.rejected_layouts,"history":self.history,
             "generated_layouts":self.scheduler.generation,"global_pair_cursor":self.scheduler.pool_cursor,"proposed_ordered_pairs":self.scheduler.proposed_pairs.len(),"measured_ordered_pairs":self.scheduler.measured_pairs.len(),"closing_attempts":self.scheduler.closing_attempts,"closing_diagnostics":self.scheduler.closing_diagnostics,"parked_candidates":self.scheduler.parked.len(),
             "bound_pruned":self.scheduler.bound_pruned,"fixed_order_branches":self.scheduler.branches.len(),"branches_expanded":self.scheduler.branches_expanded,"infeasible_committed_nil_branches":self.scheduler.impossible_branches,"optimistic_objective_bound":unrestricted_upper_bound(self.search.pool.len(),self.search.request),
-            "bound_scope":"Unrestricted replacements; at most 120 sustained quality-seconds per possible unique-song join, all future penalties relaxed. Loose until more choices are fixed.",
+            "bound_scope":"Unrestricted replacements under the per-join credit cap and disjoint overlap clock. Future penalties are relaxed.",
             "best_plan_id":self.search.incumbent.as_ref().map(|p|&p.plan_id)}));
-        self.search.store.report(&self.draft_report)?;
-        if self.scheduler.cache_loaded {
+        if let Some(stop) = stop {
+            let search = self
+                .draft_report
+                .header
+                .extensions
+                .get_mut("search")
+                .unwrap();
+            search["stop_reason"] = json!(stop);
+            search["termination"] = json!(match (stop, self.search.incumbent.is_some()) {
+                #[cfg(feature = "cp-search")]
+                (StopReason::DirectedDurationCapacity | StopReason::RequiredAdjacencyChain, _) =>
+                    "infeasible_within_domain",
+                (StopReason::GeneratedProbeScope, _) => "proposal_scope_exhausted",
+                (StopReason::Cancelled, true) => "cancelled_with_incumbent",
+                (StopReason::Cancelled, false) => "cancelled_without_incumbent",
+                (_, true) => "budget_with_incumbent",
+                (_, false) => "budget_without_incumbent",
+            });
+            search["best_verified_objective"] = json!(self
+                .search
+                .incumbent
+                .as_ref()
+                .map(crate::composition::score));
+            search["certified_global_upper_bound"] = Value::Null;
+            search["certified_absolute_gap"] = Value::Null;
+        }
+        #[cfg(feature = "cp-search")]
+        if let Some(cp) = &self.cp {
+            let coverage = self.search.score_coverage();
+            let search = self
+                .draft_report
+                .header
+                .extensions
+                .get_mut("search")
+                .unwrap();
+            search["certified_global_upper_bound"] = coverage["global_upper"].clone();
+            search["certified_absolute_gap"] = coverage["absolute_gap_upper"].clone();
+            match stop {
+                Some(StopReason::DirectedDurationCapacity) => {
+                    search["infeasibility_proof"] =
+                        json!(self.search.duration_infeasibility_evidence());
+                }
+                Some(StopReason::RequiredAdjacencyChain) => {
+                    let chain = self
+                        .search
+                        .blocked_required_chain()
+                        .expect("required chain proof");
+                    search["infeasibility_proof"] =
+                        self.search.required_chain_infeasibility_evidence(&chain);
+                }
+                _ => {}
+            }
+            let mut cp_evidence = cp.evidence();
+            cp_evidence["objective_bound"] = coverage["global_upper"].clone();
+            cp_evidence["score_coverage"] = coverage;
+            if let Some(frontier) = &self.search.continuations {
+                cp_evidence["continuation_frontier"] =
+                    frontier.evidence(&self.search.measured_keys);
+            }
+            cp_evidence["window_oracle"] = self.search.oracle.evidence();
+            cp_evidence["archive_revalidation"] = json!(self.scheduler.archive_revalidation);
+            search["cp_search"] = cp_evidence;
+            if self.search.budget_open() {
+                cp.save_cue_frontiers(&self.search)?;
+            }
+            if self.search.budget_open() {
+                cp.save_conflicts(self)?;
+            }
+        }
+        if self.scheduler.cache_loaded && self.search.budget_open() {
             self.save_best()?;
-            if self
-                .scheduler
-                .frontier_saved
-                .is_none_or(|at| at.elapsed().as_secs() >= 60)
+            if self.search.budget_open()
+                && self
+                    .scheduler
+                    .frontier_saved
+                    .is_none_or(|at| at.elapsed().as_secs() >= 60)
             {
                 self.save_frontier()?;
                 self.scheduler.frontier_saved = Some(Instant::now());
             }
         }
+        let search = self
+            .draft_report
+            .header
+            .extensions
+            .get_mut("search")
+            .unwrap();
+        search["elapsed_seconds"] = json!(self.search.started.elapsed().as_secs_f64());
+        search["checkpoint_seconds"] = json!(checkpoint_started.elapsed().as_secs_f64());
+        search["checkpoint_deadline_reached"] = json!(!self.search.budget_open());
+        self.search.store.report(&self.draft_report)?;
+        self.log_progress(status);
+        Ok(())
+    }
+
+    fn log_progress(&self, status: &str) {
+        let Some(best) = &self.best else {
+            eprintln!(
+                "set refinement: {status} | no full draft | {:.1}s",
+                self.search.started.elapsed().as_secs_f64()
+            );
+            return;
+        };
         let approved = self.search.incumbent.as_ref().map_or_else(
             || "not yet approved".to_owned(),
             |plan| {
@@ -695,8 +1079,42 @@ impl Refiner<'_> {
         eprintln!("set refinement: {status} | {approved} | full {:.2} min draft | {} nil / {} measured draft joins | draft score {:.4} | {} fresh / {} cached windows | {:.1}s",
             best.lengths.iter().sum::<u64>() as f64/self.rate()/60.,best.nil(),best.edges().len(),best.score,
             self.search.stats.measured_windows,self.search.stats.cached_windows,self.search.started.elapsed().as_secs_f64());
+    }
+    fn try_close(
+        &mut self,
+        edges: &[usize],
+        plan: &MixPlan,
+        origin: &str,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        if !self.search.required.satisfied(plan) {
+            return Ok(());
+        }
+        #[cfg(feature = "cp-search")]
+        if self.cp.is_some() {
+            let keys = self.closing_route_keys(edges)?;
+            let closing = &mut self.cp.as_mut().unwrap().closing;
+            closing.queue(edges, keys)?;
+            closing.checkpoint_routes(&self.search)?;
+            return Ok(());
+        }
+        if !self.search.budget_open() {
+            return Ok(());
+        }
+        if self.attempted_final.insert(edges.to_vec()) {
+            self.scheduler.closing_attempts += 1;
+            let (finished, diagnostics) =
+                self.search
+                    .composer
+                    .close_with_diagnostics(&self.search.snapshot, plan, cancel)?;
+            self.scheduler.closing_diagnostics.merge(&diagnostics);
+            if let Some(finished) = finished {
+                self.search.save(finished, origin, cancel)?;
+            }
+        }
         Ok(())
     }
+
     fn admit(&mut self, draft: Draft, cancel: &Cancellation) -> Result<()> {
         if self.search.incumbent.as_ref().is_some_and(|p| {
             unrestricted_upper_bound(self.search.pool.len(), self.search.request)
@@ -715,31 +1133,21 @@ impl Refiner<'_> {
                 continue;
             }
             if let Some(plan) = &block.plan {
-                if self.search.required.satisfied(plan)
-                    && self.attempted_final.insert(block.edges.clone())
-                {
-                    self.scheduler.closing_attempts += 1;
-                    let (finished, diagnostics) = self.search.composer.close_with_diagnostics(
-                        &self.search.snapshot,
-                        plan,
-                        cancel,
-                    )?;
-                    self.scheduler.closing_diagnostics.merge(&diagnostics);
-                    if let Some(finished) = finished {
-                        self.search.save(finished, "whole_set_refinement", cancel)?;
-                    }
-                }
+                self.try_close(&block.edges, plan, "whole_set_refinement", cancel)?;
             }
         }
         if self.best.as_ref().is_none_or(|old| draft.better(old)) {
             self.best = Some(draft.clone());
             self.history.push(json!({"nil_joins":draft.nil(),"resolved_joins":draft.edges().len(),"score":draft.score,
                 "elapsed_seconds":self.search.started.elapsed().as_secs_f64(),"track_ids":draft.tracks().iter().map(|&i| &self.search.pool[i].track_id).collect::<Vec<_>>()}));
-            self.checkpoint(if self.history.len() == 1 {
-                "FULL_DRAFT_FOUND"
+            if self.history.len() == 1 {
+                self.checkpoint("FULL_DRAFT_FOUND")?;
             } else {
-                "BETTER_DRAFT_FOUND"
-            })?;
+                if self.scheduler.cache_loaded && self.search.budget_open() {
+                    self.save_best()?;
+                }
+                self.log_progress("BETTER_DRAFT_FOUND");
+            }
         }
         self.seed_branch(&draft)?;
         self.population.push(draft);
@@ -864,11 +1272,16 @@ impl Refiner<'_> {
         }
         Ok(())
     }
+    #[cfg(feature = "cp-search")]
+    fn closing_route_keys(&self, edges: &[usize]) -> Result<Vec<String>> {
+        edges.iter().map(|&i| self.persistent_key(i)).collect()
+    }
+
     fn persistent_key(&self, index: usize) -> Result<String> {
         if let Some(key) = self.scheduler.identities.borrow().get(&index) {
             return Ok(key.clone());
         }
-        let key = route_key(&self.edges[index].plan)?;
+        let key = measured_edge_key(&self.edges[index])?;
         self.scheduler
             .identities
             .borrow_mut()
@@ -881,14 +1294,33 @@ impl Refiner<'_> {
             let choices=self.assignments(d).into_iter().map(|i|i.map(|i|self.persistent_key(i)).transpose()).collect::<Result<Vec<_>>>()?;
             Ok(json!({"choices":choices,"tracks":d.tracks().iter().map(|&i|&self.search.pool[i].track_id).collect::<Vec<_>>() }))
         }).collect::<Result<Vec<_>>>()?;
-        let parts = frontier_parts(&self.search.cache, self.search.store, seeds)?;
+        let Some(parts) = frontier_parts(
+            &self.search.cache,
+            self.search.store,
+            seeds,
+            self.search.deadline,
+        )?
+        else {
+            return Ok(());
+        };
         // Persist fixed-order work separately. Rebuild/rescore every restored
         // completion; no stale draft admission is trusted.
         let branches=self.scheduler.branches.iter().map(|b| {
             let choices=b.choices.iter().map(|i|i.map(|i|self.persistent_key(i)).transpose()).collect::<Result<Vec<_>>>()?;
             Ok(json!({"choices":choices,"tracks":b.order.iter().map(|&i|&self.search.pool[i].track_id).collect::<Vec<_>>(),"locked":b.locked}))
         }).collect::<Result<Vec<_>>>()?;
-        let branch_parts = frontier_parts(&self.search.cache, self.search.store, branches)?;
+        let Some(branch_parts) = frontier_parts(
+            &self.search.cache,
+            self.search.store,
+            branches,
+            self.search.deadline,
+        )?
+        else {
+            return Ok(());
+        };
+        if !self.search.budget_open() {
+            return Ok(());
+        }
         self.search.cache.write(self.search.store,"refinement-frontiers",&key,&json!({
             "version":2,"sources":self.search.cache.sources,"generation":self.scheduler.generation,"pool_cursor":self.scheduler.pool_cursor,"parts":parts,"branch_parts":branch_parts}))
     }
@@ -931,17 +1363,12 @@ impl Refiner<'_> {
             self.search.cache.invalid += 1;
             return Ok(());
         }
-        let mut lookup = self
+        let lookup = self
             .edges
             .iter()
             .enumerate()
-            .map(|(i, e)| Ok((route_key(&e.plan)?, i)))
+            .map(|(i, _)| Ok((self.persistent_key(i)?, i)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        for (legacy, key) in &self.search.edge_aliases {
-            if let Some(&index) = lookup.get(key) {
-                lookup.insert(legacy.clone(), index);
-            }
-        }
         let Some(order) = seed["tracks"].as_array().and_then(|v| {
             v.iter()
                 .map(|id| {
@@ -980,7 +1407,7 @@ impl Refiner<'_> {
         }
         Ok(())
     }
-    fn restore_state(&mut self, cancel: &Cancellation) -> Result<()> {
+    fn restore_incumbent(&mut self, cancel: &Cancellation) -> Result<()> {
         // Rebuilding frontier candidates may immediately close and save a set.
         // Install the durable incumbent first so those completions compete with
         // it instead of overwriting the saved winner while incumbent is empty.
@@ -993,7 +1420,7 @@ impl Refiner<'_> {
                 self.search.save(plan, "cached_complete_set", cancel)?;
             }
         }
-        self.restore_frontier(cancel)
+        Ok(())
     }
     fn restore_frontier(&mut self, cancel: &Cancellation) -> Result<()> {
         let key = Cache::set_key(self.search.policy)?;
@@ -1014,17 +1441,12 @@ impl Refiner<'_> {
             if valid {
                 self.scheduler.generation = saved["generation"].as_u64().unwrap_or(0) as usize;
                 self.scheduler.pool_cursor = saved["pool_cursor"].as_u64().unwrap_or(0) as usize;
-                let mut lookup = self
+                let lookup = self
                     .edges
                     .iter()
                     .enumerate()
-                    .map(|(i, e)| Ok((route_key(&e.plan)?, i)))
+                    .map(|(i, _)| Ok((self.persistent_key(i)?, i)))
                     .collect::<Result<BTreeMap<_, _>>>()?;
-                for (legacy, key) in &self.search.edge_aliases {
-                    if let Some(&index) = lookup.get(key) {
-                        lookup.insert(legacy.clone(), index);
-                    }
-                }
                 let mut restored = 0usize;
                 for kind in ["parts", "branch_parts"] {
                     let mut parts = saved[kind]
@@ -1048,6 +1470,9 @@ impl Refiner<'_> {
                     }
                     for part in parts {
                         cancel.check()?;
+                        if !self.search.budget_open() {
+                            return Ok(());
+                        }
                         let Some(seeds) = self.search.cache.read::<Vec<Value>>(
                             self.search.store,
                             "refinement-frontier-parts",
@@ -1057,6 +1482,9 @@ impl Refiner<'_> {
                             continue;
                         };
                         for seed in seeds {
+                            if !self.search.budget_open() {
+                                return Ok(());
+                            }
                             let Some(order) = seed["tracks"].as_array().and_then(|v| {
                                 v.iter()
                                     .map(|id| {
@@ -1101,6 +1529,9 @@ impl Refiner<'_> {
             } else {
                 self.search.cache.invalid += 1;
             }
+        }
+        if !self.search.budget_open() {
+            return Ok(());
         }
         self.restore_best(cancel)?;
         self.scheduler.cache_loaded = true;
@@ -1192,6 +1623,14 @@ impl Refiner<'_> {
     fn demands(&self) -> Vec<Probe> {
         let mut output = vec![];
         let mut seen = BTreeSet::new();
+        #[cfg(feature = "cp-search")]
+        if let Some(cp) = &self.cp {
+            for &probe in cp.demands() {
+                if seen.insert(probe) {
+                    output.push(probe);
+                }
+            }
+        }
         let drafts = self.best.iter().chain(self.population.iter().take(12));
         for draft in drafts {
             // Direct unresolved boundaries first, then alternatives that reorder
@@ -1209,6 +1648,9 @@ impl Refiner<'_> {
             for (a, b) in pairs {
                 let from = *draft.blocks[a].tracks.last().unwrap();
                 let to = draft.blocks[b].tracks[0];
+                if !self.search.schedules_transition(from, to) {
+                    continue;
+                }
                 let entry = draft.blocks[a]
                     .edges
                     .last()
@@ -1249,40 +1691,17 @@ pub(super) fn run(
     store: &Store,
     policy: &MixingConfig,
     context: usize,
-    pool: Vec<Track>,
+    pool: Option<Vec<Track>>,
     request: Request,
+    started: Instant,
     cancel: &Cancellation,
 ) -> Result<Value> {
-    let search = new_search(store, policy, context, pool, request, cancel)?;
-    let mut r = Refiner {
-        search,
-        edges: vec![],
-        edge_keys: BTreeSet::new(),
-        blocks: BTreeMap::new(),
-        population: vec![],
-        best: None,
-        seen: BTreeSet::new(),
-        attempted_repairs: BTreeSet::new(),
-        attempted_final: BTreeSet::new(),
-        draft_report: Report::new("complete_set_refinement"),
-        history: vec![],
-        rounds: 0,
-        rejected_layouts: 0,
-        scheduler: Scheduler::default(),
-    };
-    r.search.snapshot.verify_read_snapshot(cancel)?;
-    for salt in 0..8 {
-        if let Some(d) = r.candidate(&[], salt)? {
-            r.admit(d, cancel)?;
-        }
-    }
-    require(
-        r.best.is_some(),
-        "SET_DRAFT_CAPACITY",
-        "cannot fit a full draft from available source capacity and required adjacencies",
-    )?;
-    // Baseline exists before cache loading or new PCM work. The budget now bounds
-    // the entire refinement phase, even when no approved full set can be found.
+    let search = new_search(store, policy, context, pool, request, started, cancel)?;
+    run_prepared(Refiner::new(search), cancel)
+}
+
+fn run_prepared(mut r: Refiner<'_>, cancel: &Cancellation) -> Result<Value> {
+    let policy = r.search.policy;
     let option = |key: &str, default: u64| {
         policy
             .header
@@ -1291,16 +1710,139 @@ pub(super) fn run(
             .and_then(Value::as_u64)
             .unwrap_or(default)
     };
-    let deadline =
-        Instant::now() + std::time::Duration::from_secs(option("lazy_search_seconds", 1200));
+    let budget_seconds = option("lazy_search_seconds", 1200);
+    let deadline = r
+        .search
+        .started
+        .checked_add(std::time::Duration::from_secs(budget_seconds))
+        .ok_or_else(|| {
+            Error::new(
+                "SET_SEARCH_BUDGET",
+                "search deadline is outside the supported clock range",
+            )
+        })?;
+    r.search.deadline = Some(deadline);
     let measurement_limit = option("lazy_measurement_budget", 1536) as usize;
+    r.search.snapshot.verify_read_snapshot(cancel)?;
+    #[cfg(feature = "cp-search")]
+    if let Some(cp) = &mut r.cp {
+        r.search.capacity_proof = r.search.directed_capacity();
+        cp.bind_manifest(&r.search)?;
+    }
+    #[cfg(feature = "cp-search")]
+    if let Some(proof) = r
+        .search
+        .structural_infeasibility()
+        .filter(|_| r.cp.is_some())
+    {
+        let reason = match proof {
+            StructuralInfeasibility::DirectedCapacity => StopReason::DirectedDurationCapacity,
+            StructuralInfeasibility::RequiredChain => StopReason::RequiredAdjacencyChain,
+        };
+        let preparation_seconds = r.search.started.elapsed().as_secs_f64();
+        return publish_result(
+            r,
+            "infeasible",
+            reason,
+            budget_seconds,
+            measurement_limit,
+            preparation_seconds,
+            cancel,
+        );
+    }
+    let cp_enabled = cfg!(feature = "cp-search")
+        && policy
+            .header
+            .extensions
+            .get(crate::set_config::ENGINE_KEY)
+            .and_then(Value::as_str)
+            == Some("cp");
+    for salt in 0..8 {
+        if (cp_enabled || r.best.is_some())
+            && (cancel.check().is_err() || (salt > 0 && !r.search.budget_open()))
+        {
+            break;
+        }
+        if let Some(d) = r.candidate(&[], salt)? {
+            r.admit(d, cancel)?;
+        }
+    }
+    require(
+        r.best.is_some() || cp_enabled,
+        "SET_DRAFT_CAPACITY",
+        "cannot fit a full draft from available source capacity and required adjacencies",
+    )?;
+    let mut preparation_seconds = r.search.started.elapsed().as_secs_f64();
+    let outcome = r.restore_incumbent(cancel).and_then(|()| {
+        refine(
+            &mut r,
+            deadline,
+            measurement_limit,
+            &mut preparation_seconds,
+            cancel,
+        )
+    });
+    let (status, stop) = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) if error.code == "CANCELLED" => ("cancelled", StopReason::Cancelled),
+        Err(error) => return Err(error),
+    };
+    publish_result(
+        r,
+        status,
+        stop,
+        budget_seconds,
+        measurement_limit,
+        preparation_seconds,
+        cancel,
+    )
+}
+
+fn refine(
+    r: &mut Refiner<'_>,
+    deadline: Instant,
+    measurement_limit: usize,
+    preparation_seconds: &mut f64,
+    cancel: &Cancellation,
+) -> Result<(&'static str, StopReason)> {
+    *preparation_seconds = r.search.started.elapsed().as_secs_f64();
     r.search.load_known(cancel)?;
     r.sync_edges()?;
-    r.restore_state(cancel)?;
+    #[cfg(feature = "cp-search")]
+    if let Some(mut cp) = r.cp.take() {
+        let restored: Result<()> = (|| {
+            if r.search.budget_open() {
+                cp.restore_cue_frontiers(&mut r.search, cancel)?;
+            }
+            if r.search.budget_open() {
+                cp.closing.restore(&mut r.search, &r.edges, cancel)?;
+            }
+            if r.search.budget_open() {
+                cp.restore_conflicts(r, cancel)?;
+            }
+            Ok(())
+        })();
+        r.cp = Some(cp);
+        restored?;
+    }
+    #[cfg(feature = "cp-search")]
+    if r.search.budget_open() {
+        r.scheduler.archive_revalidation =
+            cp_archive::recover(r, measurement_limit, deadline, cancel)?;
+    }
+    if r.search.budget_open() {
+        r.restore_frontier(cancel)?;
+    }
+    #[cfg(feature = "cp-search")]
+    r.bootstrap_measured_incumbent(
+        deadline.min(Instant::now() + std::time::Duration::from_secs(12)),
+        cancel,
+    )?;
     r.repair(
         cancel,
         deadline.min(Instant::now() + std::time::Duration::from_secs(1)),
     )?;
+    let policy = r.search.policy;
     let mut discovery = Schedule::new(r.scheduler.pool_cursor);
     let frames = r
         .search
@@ -1314,10 +1856,11 @@ pub(super) fn run(
     let mut measured = BTreeSet::new();
     let mut pending = VecDeque::new();
     let mut exploration = VecDeque::from(crate::historical_seeds::load(
-        store,
+        r.search.store,
         policy,
         &r.search.pool,
         &r.search.cache,
+        deadline,
         cancel,
     )?);
     let mut progress = Instant::now();
@@ -1331,24 +1874,82 @@ pub(super) fn run(
             r.checkpoint("refining")?;
             progress = Instant::now();
         }
+        if !r.search.budget_open() {
+            break;
+        }
         turns += 1;
+        #[cfg(feature = "cp-search")]
+        if turns % 4 == 1 {
+            r.propose_cp_route(deadline, cancel)?;
+        }
+        #[cfg(feature = "cp-search")]
+        r.close_cp_routes(
+            deadline.min(Instant::now() + std::time::Duration::from_millis(250)),
+            cancel,
+        )?;
         r.branch_step(cancel, deadline)?;
+        if !r.search.budget_open() {
+            break;
+        }
         if turns % 4 == 0 && r.scheduler.generation - generation_start < generation_limit {
             r.regenerate(cancel)?;
         }
         let mut batch = vec![];
-        let mut probes = 0;
-        while batch.len() < 4.min(measurement_limit - r.search.stats.measured_windows)
-            && Instant::now() < deadline
+        let batch_limit = 4.min(measurement_limit - r.search.stats.measured_windows);
+        // Give a rejected closing arrival one fresh measurement slot on
+        // alternating turns, even when SCIP never returns a mixed route.
+        // The other turns and remaining slots retain their usual schedules.
+        #[cfg(feature = "cp-search")]
+        if turns % 2 == 1 && Instant::now() < deadline {
+            batch.extend(r.schedule_closing_window(
+                &mut discovery,
+                &frames,
+                &minimum,
+                &mut measured,
+                &mut exploration,
+                cancel,
+            )?);
+        }
+        // Keep a bounded lane for unranked cue coverage alongside the existing
+        // musical proposals. The cursor stays put until the window is durable.
+        #[cfg(feature = "cp-search")]
+        let cue_page = if let Some(cp) =
+            r.cp.as_mut()
+                .filter(|_| r.search.budget_open() && batch.len() < batch_limit)
         {
-            // Reserve one of every four measurements for event/dynamic and
-            // historical proposals. Baseline coverage keeps three lanes.
-            let seed = if batch.len() == 3 && !exploration.is_empty() {
-                exploration.pop_front()
+            cp.schedule_cue_page(&mut r.search, turns, &mut measured, &mut batch, cancel)?
+        } else {
+            None
+        };
+        let improving_cp = policy
+            .header
+            .extensions
+            .get(crate::set_config::ENGINE_KEY)
+            .and_then(Value::as_str)
+            == Some("cp")
+            && r.search.incumbent.is_some();
+        let mut probes = 0;
+        while batch.len() < batch_limit && Instant::now() < deadline {
+            // Feasibility prioritizes baseline coverage. With an approved
+            // incumbent the CP engine alternates baseline and quality probes,
+            // including when the remaining measurement allowance is one.
+            let quality_turn = if improving_cp {
+                (turns + batch.len()) % 2 == 0
+            } else {
+                batch.len() == 3
+            };
+            let seed = if quality_turn {
+                r.search
+                    .take_quality_seed(&mut exploration, &measured)
+                    .or_else(|| pending.pop_front())
             } else {
                 pending.pop_front()
             };
             if let Some(seed) = seed {
+                if !r.search.schedules_plan(&seed) {
+                    r.search.stats.capacity_skipped_windows += 1;
+                    continue;
+                }
                 let key = window_key(&r.search.cache, &seed)?;
                 if measured.insert(key) {
                     batch.push(seed);
@@ -1356,8 +1957,13 @@ pub(super) fn run(
                 continue;
             }
             let targets = r.demands();
-            let Some(probe) = discovery.next(&targets, &frames, &minimum) else {
-                if let Some(seed) = exploration.pop_front() {
+            let probe = if improving_cp {
+                discovery.next_for_improvement(&targets, &frames, &minimum)
+            } else {
+                discovery.next(&targets, &frames, &minimum)
+            };
+            let Some(probe) = probe else {
+                if let Some(seed) = r.search.take_quality_seed(&mut exploration, &measured) {
                     pending.push_back(seed);
                     continue;
                 }
@@ -1365,6 +1971,13 @@ pub(super) fn run(
                 break;
             };
             r.scheduler.pool_cursor = discovery.pool_cursor;
+            if !r.search.schedules_transition(probe.from, probe.to) {
+                continue;
+            }
+            #[cfg(feature = "cp-search")]
+            if let Some(cp) = &mut r.cp {
+                cp.note_probe(probe);
+            }
             r.scheduler.proposed_pairs.insert((probe.from, probe.to));
             let proposals =
                 r.search
@@ -1381,9 +1994,17 @@ pub(super) fn run(
         }
         if batch.is_empty() {
             if status == "generated_probe_scope_exhausted" {
+                #[cfg(feature = "cp-search")]
+                if r.cp.as_ref().is_some_and(cp_search::CpSearch::has_cue_work) {
+                    status = "refinement_budget";
+                    continue;
+                }
                 break;
             }
             continue;
+        }
+        if status == "generated_probe_scope_exhausted" {
+            status = "refinement_budget";
         }
         for seed in &batch {
             let from = r
@@ -1401,9 +2022,27 @@ pub(super) fn run(
             r.scheduler.measured_pairs.insert((from, to));
         }
         for result in r.search.measure_batch(&batch, cancel)? {
-            exploration.extend(result.continuations);
+            if r.search.continuations.is_some() {
+                r.search.queue_continuations(
+                    &result.sources,
+                    result.continuations,
+                    false,
+                    false,
+                )?;
+            } else {
+                exploration.extend(result.continuations);
+            }
+        }
+        #[cfg(feature = "cp-search")]
+        if let Some(page) = cue_page {
+            r.cp.as_mut().unwrap().commit_cue_page(&r.search, page)?;
         }
         r.sync_edges()?;
+        #[cfg(feature = "cp-search")]
+        r.bootstrap_measured_incumbent(
+            deadline.min(Instant::now() + std::time::Duration::from_secs(4)),
+            cancel,
+        )?;
         // A small fair mutation slice after every batch prevents both cached
         // permutations and high-ranked early edges from starving new bridges.
         r.repair(
@@ -1411,35 +2050,389 @@ pub(super) fn run(
             deadline.min(Instant::now() + std::time::Duration::from_millis(400)),
         )?;
     }
+    // Reconsider the final measured variants even after the PCM quota closes.
+    #[cfg(feature = "cp-search")]
+    r.propose_cp_route(deadline, cancel)?;
     r.drain_pending(
         cancel,
         deadline,
         generation_limit.saturating_sub(r.scheduler.generation - generation_start),
     )?;
-    r.search.snapshot.verify_read_snapshot(cancel)?;
+    #[cfg(feature = "cp-search")]
+    while Instant::now() < deadline && r.close_cp_routes(deadline, cancel)? {}
+    let stop = if !r.search.budget_open() {
+        StopReason::WallClock
+    } else if status == "generated_probe_scope_exhausted" {
+        StopReason::GeneratedProbeScope
+    } else {
+        StopReason::MeasurementWindows
+    };
+    Ok((status, stop))
+}
+
+fn publish_result(
+    mut r: Refiner<'_>,
+    status: &str,
+    stop: StopReason,
+    budget_seconds: u64,
+    measurement_limit: usize,
+    preparation_seconds: f64,
+    cancel: &Cancellation,
+) -> Result<Value> {
+    let finalization = Instant::now();
+    if matches!(stop, StopReason::Cancelled) {
+        r.search.deadline = Some(finalization);
+    }
+    let verification = cancel
+        .check()
+        .and_then(|()| r.search.snapshot.verify_read_snapshot(cancel));
+    let (status, stop) = match verification {
+        Err(error) if error.code == "CANCELLED" => {
+            // Revalidate before publishing any retained result. No further
+            // search work is scheduled after this boundary.
+            r.search.deadline = Some(finalization);
+            r.search
+                .snapshot
+                .verify_read_snapshot(&Cancellation::default())?;
+            ("cancelled", StopReason::Cancelled)
+        }
+        result => {
+            result?;
+            (status, stop)
+        }
+    };
+    let store = r.search.store;
     r.scheduler.frontier_saved = None;
-    r.checkpoint(status)?;
+    r.draft_report.header.extensions.insert(
+        "budget".into(),
+        json!({
+            "configured_seconds": budget_seconds,
+            "pool_seconds": r.search.stats.pool_seconds,
+            "preparation_seconds": preparation_seconds,
+            "search_stopped_seconds": finalization.duration_since(r.search.started).as_secs_f64(),
+            "measurement_limit_reached": r.search.stats.measured_windows >= measurement_limit,
+        }),
+    );
+    r.checkpoint_with_stop(status, Some(stop))?;
     let path = store.path(&format!("reports/{}.json", r.draft_report.report_id))?;
     let draft = r.draft_report.header.extensions["draft"].clone();
-    let search = r.draft_report.header.extensions["search"].clone();
+    let mut search = r.draft_report.header.extensions["search"].clone();
+    search["budget"] = r.draft_report.header.extensions["budget"].clone();
     if let Some(plan) = &mut r.search.incumbent {
         plan.header
             .extensions
             .insert("set_refinement".into(), search.clone());
         store.write(&format!("plans/{}.json", plan.plan_id), plan)?;
     }
-    Ok(
-        json!({"status":if r.search.incumbent.is_some(){"ready"}else{"draft"},"plan":r.search.incumbent,
+    search["elapsed_seconds"] = json!(r.search.started.elapsed().as_secs_f64());
+    search["finalization_seconds"] = json!(finalization.elapsed().as_secs_f64());
+    let result_status = if r.search.incumbent.is_some() {
+        "ready"
+    } else if search["termination"] == "infeasible_within_domain" {
+        "infeasible"
+    } else if draft.is_null() {
+        "pending"
+    } else {
+        "draft"
+    };
+    Ok(json!({"status":result_status,"plan":r.search.incumbent,
         "draft":draft,"draft_path":path,"search":search,
-        "export_gate":"An approved plan is returned only after every nil join is replaced and musical bookends, duration, pacing and required pairs pass."}),
-    )
+        "export_gate":"An approved plan is returned only after every nil join is replaced and musical bookends, duration, pacing and required pairs pass."}))
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn fixture<'a>(store: &'a Store, policy: &'a MixingConfig, durations: &[u64]) -> Refiner<'a> {
+    #[test]
+    fn a_window_execution_failure_does_not_discard_other_worker_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 3]);
+        r.search.continuations = Some(continuation::Frontier::default());
+        let failed = canonical_hash(&"failed window").unwrap().digest;
+        let reviewed = canonical_hash(&"reviewed window").unwrap().digest;
+        let cancelled = canonical_hash(&"cancelled window").unwrap().digest;
+        let unknown = canonical_hash(&"unknown window").unwrap().digest;
+        let outcomes = vec![
+            (
+                0,
+                failed.clone(),
+                WindowMeasurement::Original,
+                Err(Error::new("IO", "fixture read failure")),
+            ),
+            (
+                1,
+                reviewed.clone(),
+                WindowMeasurement::Original,
+                Ok(Measurement {
+                    evidence: vec![json!({"ranked": [], "rejected": []})],
+                    ..Measurement::default()
+                }),
+            ),
+            (
+                2,
+                cancelled.clone(),
+                WindowMeasurement::Original,
+                Err(Error::new("CANCELLED", "fixture cancellation")),
+            ),
+            (
+                3,
+                unknown.clone(),
+                WindowMeasurement::Original,
+                Ok(Measurement {
+                    rejected: BTreeMap::from([("TACTIC_FACTS".into(), 1)]),
+                    ..Measurement::default()
+                }),
+            ),
+        ];
+        let mut batch = vec![Measurement::default(); outcomes.len()];
+        assert_eq!(
+            r.search
+                .commit_batch_results(outcomes, &mut batch)
+                .unwrap_err()
+                .code,
+            "CANCELLED"
+        );
+        assert_eq!(
+            r.search.measured_keys,
+            BTreeSet::from([reviewed.clone(), unknown.clone()])
+        );
+        assert_eq!(
+            r.search.negative_windows,
+            BTreeSet::from([reviewed.clone()])
+        );
+        assert_eq!(r.search.oracle.evidence()["execution_failures"]["IO"], 1);
+        r.search.measured_keys.clear();
+        r.search.negative_windows.clear();
+        r.search.oracle = oracle::Ledger::default();
+        r.search.load_known(&Cancellation::default()).unwrap();
+        assert!(r.search.measured_keys.contains(&reviewed));
+        assert!(r.search.oracle.is_unknown(&unknown));
+        assert!(!r.search.measured_keys.contains(&failed));
+        assert!(!r.search.measured_keys.contains(&cancelled));
+        assert!(!r.search.negative_windows.contains(&unknown));
+    }
+
+    #[test]
+    fn selector_refresh_retains_old_admission_and_retries_only_execution_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 3]);
+        let search = &mut r.search;
+        search.continuations = Some(continuation::Frontier::default());
+        let mut plan = super::super::tests::tactic_plan();
+        for (track, placement) in search.pool.iter_mut().zip(&mut plan.placements) {
+            track.active_analysis = Some(placement.analysis.clone());
+            placement.track_id = track.track_id.clone();
+            placement.audio_hash = track.audio_hash.clone();
+        }
+        plan.transitions[0].from_track_id = plan.placements[0].track_id.clone();
+        plan.transitions[0].to_track_id = plan.placements[1].track_id.clone();
+        search.cache = Cache::open(&policy, &search.pool).unwrap();
+        let key = window_key(&search.cache, &plan).unwrap();
+        let sources: BTreeMap<_, _> = plan
+            .placements
+            .iter()
+            .map(|p| {
+                (
+                    p.track_id.clone(),
+                    search.cache.sources[&p.track_id].clone(),
+                )
+            })
+            .collect();
+        let old = Measurement {
+            sources: sources.clone(),
+            edges: vec![MeasuredEdge {
+                plan,
+                exit: 0,
+                entry_end: 0,
+                score: 5.,
+                last_resort: false,
+                dense_quality_seconds: 0.,
+                handoff_quality_seconds: 0.,
+            }],
+            evidence: vec![json!({"ranked": [{}], "rejected": []})],
+            ..Default::default()
+        };
+        search.cache.write(&store, "windows", &key, &old).unwrap();
+        let cancel = Cancellation::default();
+        search.load_known(&cancel).unwrap();
+        assert!(search.oracle.needs_selector_refresh(&key));
+        assert_eq!(search.stats.known_good_choices, 1);
+
+        let mut results = [Measurement::default()];
+        let kind = WindowMeasurement::SelectorRefresh;
+        search
+            .commit_batch_results(
+                vec![(0, key.clone(), kind, Err(Error::new("IO", "read failed")))],
+                &mut results,
+            )
+            .unwrap();
+        assert!(search.oracle.needs_selector_refresh(&key));
+        assert!(search
+            .cache
+            .keys(&store, kind.cache_kind())
+            .unwrap()
+            .is_empty());
+        assert_eq!(search.oracle.evidence()["execution_failures"]["IO"], 1);
+
+        let missing = Measurement {
+            sources,
+            rejected: BTreeMap::from([("TACTIC_FACTS".into(), 1)]),
+            ..Default::default()
+        };
+        search
+            .commit_batch_results(vec![(0, key.clone(), kind, Ok(missing))], &mut results)
+            .unwrap();
+        assert_eq!(search.stats.selector_refresh_attempts, 2);
+        assert_eq!(search.stats.measured_windows, 2);
+        assert!(search.oracle.is_unknown(&key));
+        assert!(!search.oracle.needs_selector_refresh(&key));
+        assert_eq!(search.oracle.evidence()["windows_with_verified_choices"], 1);
+        assert_eq!(search.oracle.evidence()["execution_failures"], json!({}));
+
+        search.oracle = oracle::Ledger::default();
+        search.measured_keys.clear();
+        search.load_known(&cancel).unwrap();
+        assert!(search.oracle.is_unknown(&key));
+        assert!(!search.oracle.needs_selector_refresh(&key));
+        assert_eq!(search.stats.known_good_choices, 1);
+        assert_eq!(
+            search.oracle.evidence()["selector_realizations"]["refreshed_without_partition"],
+            1
+        );
+        search.observe_window(&key, &old, WindowMeasurement::Original);
+        assert!(search.oracle.is_unknown(&key));
+    }
+
+    #[test]
+    fn measured_parent_restores_unmeasured_children_with_current_pins() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 3]);
+        let search = &mut r.search;
+        search.continuations = Some(continuation::Frontier::default());
+        let mut plan: MixPlan =
+            serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
+        plan.placements.truncate(2);
+        plan.transitions.truncate(1);
+        plan.total_output_frames = plan.placements[1]
+            .time_map
+            .anchors
+            .last()
+            .unwrap()
+            .output_frame;
+        for (track, placement) in search.pool.iter_mut().zip(&mut plan.placements) {
+            track.active_analysis = Some(placement.analysis.clone());
+            placement.track_id = track.track_id.clone();
+            placement.audio_hash = track.audio_hash.clone();
+        }
+        plan.transitions[0].from_track_id = plan.placements[0].track_id.clone();
+        plan.transitions[0].to_track_id = plan.placements[1].track_id.clone();
+        crate::search_cache::rebind(&mut plan, &policy).unwrap();
+        search.cache = Cache::open(&policy, &search.pool).unwrap();
+        let variant = |seconds| {
+            let mut next = plan.clone();
+            next.plan_id = id();
+            next.header.extensions.insert(
+                "tactic_cue_candidate".into(),
+                json!({"fixture_endpoint": seconds}),
+            );
+            next
+        };
+        let child = variant(12);
+        let other = variant(16);
+        let resolved = variant(8);
+        let mut stale = variant(20);
+        stale.placements[0].override_revision += 1;
+        let child_key = window_key(&search.cache, &child).unwrap();
+        let resolved_key = window_key(&search.cache, &resolved).unwrap();
+        for (name, children) in [
+            (
+                "first parent",
+                vec![child.clone(), other.clone(), resolved, stale],
+            ),
+            ("duplicate parent", vec![variant(12)]),
+        ] {
+            let parent_key = canonical_hash(&name).unwrap().digest;
+            search
+                .cache
+                .write(
+                    &store,
+                    "windows",
+                    &parent_key,
+                    &Measurement {
+                        sources: search.cache.sources.clone(),
+                        continuations: children,
+                        ..Measurement::default()
+                    },
+                )
+                .unwrap();
+        }
+        search
+            .cache
+            .write(&store, "windows", &resolved_key, &Measurement::default())
+            .unwrap();
+        let cancel = Cancellation::default();
+        search.load_known(&cancel).unwrap();
+        let evidence = search
+            .continuations
+            .as_ref()
+            .unwrap()
+            .evidence(&search.measured_keys);
+        assert_eq!(evidence["restored"], 2);
+        assert_eq!(evidence["stale_or_invalid"], 1);
+        assert_eq!(search.stats.measured_windows, 0);
+
+        let mut ranked = VecDeque::from([variant(10)]);
+        let scheduled = BTreeSet::new();
+        let first = search.take_quality_seed(&mut ranked, &scheduled).unwrap();
+        assert_ne!(window_key(&search.cache, &first).unwrap(), resolved_key);
+        assert_eq!(
+            search
+                .take_quality_seed(&mut ranked, &scheduled)
+                .unwrap()
+                .header
+                .extensions["tactic_cue_candidate"]["fixture_endpoint"],
+            10
+        );
+        let second = search.take_quality_seed(&mut ranked, &scheduled).unwrap();
+        let recovered: BTreeSet<_> = [first, second]
+            .iter()
+            .map(|p| window_key(&search.cache, p).unwrap())
+            .collect();
+        assert_eq!(
+            recovered,
+            BTreeSet::from([
+                child_key.clone(),
+                window_key(&search.cache, &other).unwrap()
+            ])
+        );
+
+        // Only one of the two jobs was committed before shutdown.
+        search
+            .cache
+            .write(&store, "windows", &child_key, &Measurement::default())
+            .unwrap();
+        search.continuations = Some(continuation::Frontier::default());
+        search.load_known(&cancel).unwrap();
+        let pending = search.take_quality_seed(&mut ranked, &scheduled).unwrap();
+        assert_eq!(
+            window_key(&search.cache, &pending).unwrap(),
+            window_key(&search.cache, &other).unwrap()
+        );
+        assert!(search.take_quality_seed(&mut ranked, &scheduled).is_none());
+    }
+
+    pub(super) fn fixture<'a>(
+        store: &'a Store,
+        policy: &'a MixingConfig,
+        durations: &[u64],
+    ) -> Refiner<'a> {
         let root = store.path("fixture-sources").unwrap();
         std::fs::create_dir_all(&root).unwrap();
         let root_id = id();
@@ -1504,6 +2497,9 @@ mod tests {
             request,
             composer: Context::fixture(&pool, request),
             required: required_pairs::RequiredPairs::default(),
+            excluded_transitions: BTreeSet::new(),
+            #[cfg(feature = "cp-search")]
+            capacity_proof: None,
             pacing: pool.iter().map(|_| TrackPacing::unknown(48000)).collect(),
             cache: Cache::open(policy, &pool).unwrap(),
             facts: CandidateEvidenceCache::new(),
@@ -1511,14 +2507,16 @@ mod tests {
             baseline_cues: BaselineCueIndex::new(12),
             worker_facts: vec![],
             measured_keys: BTreeSet::new(),
+            oracle: oracle::Ledger::default(),
+            continuations: None,
             stats: Stats::default(),
             started: Instant::now(),
+            deadline: None,
             progress: Report::new("test_search"),
             history: vec![],
             incumbent: None,
             graph: vec![vec![]; pool.len() * pool.len()],
             known: BTreeSet::new(),
-            edge_aliases: BTreeMap::new(),
             negative_windows: BTreeSet::new(),
             pool,
         };
@@ -1537,10 +2535,12 @@ mod tests {
             rounds: 0,
             rejected_layouts: 0,
             scheduler: Scheduler::default(),
+            #[cfg(feature = "cp-search")]
+            cp: None,
         }
     }
 
-    fn edge(r: &mut Refiner<'_>, a: usize, b: usize, score: f64, dense: f64) -> usize {
+    pub(super) fn edge(r: &mut Refiner<'_>, a: usize, b: usize, score: f64, dense: f64) -> usize {
         let mut plan: MixPlan =
             serde_json::from_str(include_str!("../../../examples/mix-plan.json")).unwrap();
         plan.placements.truncate(2);
@@ -1557,6 +2557,126 @@ mod tests {
             handoff_quality_seconds: 0.,
         }));
         index
+    }
+
+    #[test]
+    fn exact_measured_choices_preserve_pacing_and_score_variants() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[1200; 3]);
+        let index = edge(&mut r, 0, 1, 35., 0.);
+        let original = (*r.edges.remove(index)).clone();
+        let mut duplicate = original.clone();
+        duplicate.plan.plan_id = id();
+        duplicate.plan.placements[0].time_map.map_id = id();
+        duplicate
+            .plan
+            .header
+            .extensions
+            .insert("set_config".into(), json!({"name": "another recipe"}));
+        let mut scored = original.clone();
+        scored.score += 1.;
+        let mut paced = original.clone();
+        paced.entry_end += 1;
+        let mut departed = original.clone();
+        departed.exit += 1;
+        for choice in [&original, &duplicate, &scored, &paced, &departed] {
+            r.search.register(choice).unwrap();
+        }
+        assert_eq!(r.search.stats.duplicate_measured_choices, 1);
+        assert_eq!(r.search.stats.known_good_choices, 4);
+        assert!(r.sync_edges().unwrap());
+        assert!(!r.sync_edges().unwrap());
+        let keys = (0..r.edges.len())
+            .map(|i| r.persistent_key(i).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys.len(), 4);
+        #[cfg(feature = "cp-search")]
+        {
+            let mut cp = cp_search::CpSearch::default();
+            for i in [0, 0, 1, 2, 3] {
+                cp.closing
+                    .queue(&[i], r.closing_route_keys(&[i]).unwrap())
+                    .unwrap();
+            }
+            assert_eq!(cp.closing.owned_routes().count(), 4);
+            assert_eq!(cp.closing.evidence()["pending_jobs"], 4);
+            assert_eq!(cp.closing.evidence()["duplicate_route_requests"], 1);
+        }
+    }
+
+    #[test]
+    fn measured_credit_cannot_exceed_its_overlap_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[1200; 3]);
+        let edge_id = edge(&mut r, 0, 1, 35., 0.);
+        let mut record = (*r.edges[edge_id]).clone();
+        let join = &record.plan.transitions[0];
+        let span = (join.end_output_frame - join.start_output_frame) as f64
+            / f64::from(record.plan.output.sample_rate_hz);
+        record.dense_quality_seconds = span + 1.;
+        record.plan.header.extensions.insert(
+            "dense_quality_seconds".into(),
+            json!(record.dense_quality_seconds),
+        );
+        assert_eq!(r.search.register(&record).unwrap_err().code, "LAZY_BOUND");
+        assert_eq!(r.search.stats.known_good_choices, 0);
+
+        record.dense_quality_seconds = span;
+        record
+            .plan
+            .header
+            .extensions
+            .insert("dense_quality_seconds".into(), json!(span));
+        r.search.register(&record).unwrap();
+        assert_eq!(r.search.stats.known_good_choices, 1);
+    }
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn cp_route_keeps_unmeasured_bridges_and_requests_audio_for_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[1800; 3]);
+        let hold = edge(&mut r, 0, 1, 60., 40.);
+        r.blocks.insert(
+            vec![hold],
+            Some(Arc::new(Block {
+                tracks: vec![0, 1],
+                edges: vec![hold],
+                plan: None,
+                minimum: 180 * 48000,
+                maximum: 3500 * 48000,
+            })),
+        );
+        let mut cp = cp_search::CpSearch::default();
+        cp.restore_cue_frontiers(&mut r.search, &Cancellation::default())
+            .unwrap();
+        let draft = cp
+            .step(
+                &mut r,
+                Instant::now() + std::time::Duration::from_secs(3),
+                &Cancellation::default(),
+            )
+            .unwrap()
+            .unwrap();
+        r.admit(draft, &Cancellation::default()).unwrap();
+        let draft = r.best.as_ref().unwrap();
+        assert_eq!(draft.edges(), vec![hold]);
+        assert_eq!(draft.nil(), 1);
+        assert!(cp.demands().iter().any(|p| p.tier == 0));
+        assert!(cp.demands().iter().all(|p| (p.from, p.to) != (0, 1)));
+        cp.save_cue_frontiers(&r.search).unwrap();
+        let mut resumed = cp_search::CpSearch::default();
+        resumed
+            .restore_cue_frontiers(&mut r.search, &Cancellation::default())
+            .unwrap();
+        assert_eq!(resumed.evidence()["bar_cue_domain"]["queued_bar_scans"], 1);
+        assert!(r.search.incumbent.is_none());
     }
 
     #[test]
@@ -1894,7 +3014,7 @@ mod tests {
         let before = r.best.clone().unwrap();
         assert_eq!(before.edges(), vec![0]);
         assert!(before.score > 0.);
-        let old_edge_key = route_key(&r.edges[0].plan).unwrap();
+        let old_edge_key = measured_edge_key(&r.edges[0]).unwrap();
         r.save_frontier().unwrap();
 
         let mut rebound = (*r.edges[0]).clone();
@@ -1904,7 +3024,7 @@ mod tests {
         for placement in &mut rebound.plan.placements {
             placement.time_map.map_id = id();
         }
-        assert_eq!(route_key(&rebound.plan).unwrap(), old_edge_key);
+        assert_eq!(measured_edge_key(&rebound).unwrap(), old_edge_key);
         r.edges[0] = Arc::new(rebound);
         r.population.clear();
         r.scheduler = Scheduler::default();
@@ -2002,21 +3122,78 @@ mod tests {
         assert!(r.attempted_repairs.is_empty());
         assert_eq!(r.scheduler.generation, 0);
     }
+
+    #[test]
+    fn elapsed_budget_skips_new_measurement_and_keeps_the_previous_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 12]);
+        let initial = r.candidate(&[], 0).unwrap().unwrap();
+        let cancel = Cancellation::default();
+        r.admit(initial, &cancel).unwrap();
+        r.save_frontier().unwrap();
+        r.scheduler.generation = 7;
+        r.search.deadline = Some(Instant::now());
+        let seed = super::super::tests::tactic_plan();
+        let windows = r.search.measure_batch(&[seed], &cancel).unwrap();
+        assert!(windows[0].edges.is_empty());
+        assert!(r.search.worker_facts.is_empty());
+        assert_eq!(r.search.stats.measured_windows, 0);
+
+        r.save_frontier().unwrap();
+        let key = Cache::set_key(&policy).unwrap();
+        let saved = r
+            .search
+            .cache
+            .read::<Value>(&store, "refinement-frontiers", &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["generation"], 0);
+        assert_eq!(r.scheduler.generation, 7);
+        r.checkpoint_with_stop("refinement_budget", Some(StopReason::WallClock))
+            .unwrap();
+        let search = &r.draft_report.header.extensions["search"];
+        assert_eq!(search["stop_reason"], "wall_clock");
+        assert_eq!(search["checkpoint_deadline_reached"], true);
+    }
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn cp_queues_a_draft_route_without_running_legacy_closing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[1200; 3]);
+        r.cp = Some(cp_search::CpSearch::default());
+        let join = edge(&mut r, 0, 1, 25., 0.);
+        let plan = r.edges[join].plan.clone();
+        let cancel = Cancellation::default();
+        r.try_close(&[join], &plan, "fixture", &cancel).unwrap();
+        r.try_close(&[join], &plan, "fixture", &cancel).unwrap();
+        assert_eq!(r.scheduler.closing_attempts, 0);
+        assert!(r.attempted_final.is_empty());
+        assert_eq!(r.cp.unwrap().closing.evidence()["pending_jobs"], 1);
+    }
     #[test]
     fn stable_frontier_chunks_survive_reordering_and_localize_membership_changes() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::init_legacy(directory.path()).unwrap();
         let cache = Cache::open(&MixingConfig::default(), &[]).unwrap();
         let mut rows = (0..24).map(|i| json!({"candidate":i})).collect::<Vec<_>>();
-        let before = frontier_parts(&cache, &store, rows.clone()).unwrap();
+        let before = frontier_parts(&cache, &store, rows.clone(), None)
+            .unwrap()
+            .unwrap();
         rows.reverse();
         assert_eq!(
-            frontier_parts(&cache, &store, rows.clone()).unwrap(),
+            frontier_parts(&cache, &store, rows.clone(), None)
+                .unwrap()
+                .unwrap(),
             before
         );
         rows.remove(0);
         rows.insert(0, json!({"candidate":"new best"}));
-        let after = frontier_parts(&cache, &store, rows).unwrap();
+        let after = frontier_parts(&cache, &store, rows, None).unwrap().unwrap();
         let reused = before.iter().filter(|key| after.contains(key)).count();
         assert!(
             reused >= before.len().saturating_sub(2),
@@ -2188,7 +3365,8 @@ mod tests {
             .unwrap());
         let previous_score = crate::composition::score(r.search.incumbent.as_ref().unwrap());
         r.search.incumbent = None;
-        r.restore_state(&Cancellation::default()).unwrap();
+        r.restore_incumbent(&Cancellation::default()).unwrap();
+        r.restore_frontier(&Cancellation::default()).unwrap();
         let resumed = r.search.incumbent.as_ref().unwrap();
         let resumed_id = resumed.plan_id.clone();
         assert_eq!(crate::composition::score(resumed), previous_score);
@@ -2202,6 +3380,170 @@ mod tests {
         assert_eq!(
             cached.plan_id, resumed_id,
             "the durable winner must also remain monotone"
+        );
+
+        let draft = r.candidate(&[], 0).unwrap().unwrap();
+        r.admit(draft, &Cancellation::default()).unwrap();
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let output = publish_result(
+            r,
+            "refinement_budget",
+            StopReason::WallClock,
+            30,
+            12,
+            0.,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(output["search"]["termination"], "cancelled_with_incumbent");
+        assert_eq!(output["plan"]["plan_id"], resumed_id);
+        let published: MixPlan = store.read(&format!("plans/{resumed_id}.json")).unwrap();
+        assert_eq!(
+            published.header.extensions["set_refinement"]["stop_reason"],
+            "cancelled"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cp-search")]
+    fn cp_stop_distinguishes_directed_infeasibility_from_no_draft_at_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let mut policy = MixingConfig::default();
+        policy
+            .header
+            .extensions
+            .insert(crate::set_config::ENGINE_KEY.into(), json!("cp"));
+        policy
+            .header
+            .extensions
+            .insert("lazy_search_seconds".into(), json!(0));
+        let cancel = Cancellation::default();
+        for (seconds, fork, reason) in [
+            ([1200; 3], true, "directed_duration_capacity"),
+            ([100; 3], false, "directed_duration_capacity"),
+            // Replay or tempo changes could reach the floor. An all-nil
+            // layout fits only original material at its native speed.
+            ([1100; 3], false, "wall_clock"),
+        ] {
+            let mut r = fixture(&store, &policy, &seconds);
+            r.cp = Some(cp_search::CpSearch::default());
+            if fork {
+                r.search
+                    .excluded_transitions
+                    .extend([(1, 0), (1, 2), (2, 0), (2, 1)]);
+            }
+            let output = run_prepared(r, &cancel).unwrap();
+            assert_eq!(output["search"]["stop_reason"], reason, "{output}");
+            let proved = reason == "directed_duration_capacity";
+            assert_eq!(
+                output["status"],
+                if proved { "infeasible" } else { "pending" }
+            );
+            assert_eq!(
+                output["search"]["termination"],
+                if proved {
+                    "infeasible_within_domain"
+                } else {
+                    "budget_without_incumbent"
+                }
+            );
+            assert_eq!(output["search"]["measured_windows"], 0);
+            assert!(output["plan"].is_null() && output["draft"].is_null());
+            let cp = &output["search"]["cp_search"];
+            assert_eq!(cp["attempts"], 0);
+            assert!(cp["domain_manifest"]["id"].is_string());
+            assert_eq!(output["search"]["infeasibility_proof"].is_object(), proved);
+            assert_eq!(
+                cp["score_coverage"]["routes_with_unmeasured_joins_empty"],
+                proved
+            );
+            assert_eq!(
+                output["search"]["certified_global_upper_bound"].is_null(),
+                proved
+            );
+            let saved: Report = serde_json::from_slice(
+                &std::fs::read(output["draft_path"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                saved.header.extensions["search"]["termination"],
+                output["search"]["termination"]
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cp-search")]
+    fn cp_rejects_required_chain_with_no_common_direction() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let mut policy = MixingConfig::default();
+        policy
+            .header
+            .extensions
+            .insert(crate::set_config::ENGINE_KEY.into(), json!("cp"));
+        let mut r = fixture(&store, &policy, &[1200; 3]);
+        r.cp = Some(cp_search::CpSearch::default());
+        let ids = [0, 1, 2].map(|i| r.search.pool[i].track_id.clone());
+        r.search.required = required_pairs::RequiredPairs::new(
+            required_pairs::Mode::Either,
+            [[0, 1], [1, 2]]
+                .map(|indices| required_pairs::Pair {
+                    indices,
+                    spotify_ids: indices.map(|i| format!("spotify-{i}")),
+                    track_ids: indices.map(|i| ids[i].clone()),
+                })
+                .to_vec(),
+            3,
+        )
+        .unwrap();
+        // Each pair has a permitted direction, but both require track 1
+        // as the destination. Routes in the relaxed graph can still use
+        // all tracks by visiting 0 and 2 consecutively.
+        r.search.excluded_transitions.extend([(1, 0), (1, 2)]);
+        assert!(r.search.permits_transition(0, 1) && r.search.permits_transition(2, 1));
+        assert_ne!(r.search.directed_capacity().unwrap().viable_tracks, 0);
+        let result = run_prepared(r, &Cancellation::default()).unwrap();
+        let search = &result["search"];
+        assert_eq!(result["status"], "infeasible");
+        assert_eq!(search["termination"], "infeasible_within_domain");
+        assert_eq!(search["stop_reason"], "required_adjacency_chain");
+        assert_eq!(search["measured_windows"], 0);
+        assert_eq!(search["cp_search"]["attempts"], 0);
+        assert!(search["certified_global_upper_bound"].is_null());
+        let proof = &search["infeasibility_proof"];
+        assert_eq!(proof["chain_track_ids"], json!(ids));
+        assert_eq!(proof["forward_blockers"][0]["to"], ids[2]);
+        assert_eq!(proof["reverse_blockers"][0]["to"], ids[0]);
+    }
+
+    #[test]
+    fn cancelled_draft_is_published_without_an_approved_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = fixture(&store, &policy, &[360; 12]);
+        let cancel = Cancellation::default();
+        let draft = r.candidate(&[], 0).unwrap().unwrap();
+        r.admit(draft, &cancel).unwrap();
+        cancel.cancel();
+        let output =
+            publish_result(r, "cancelled", StopReason::Cancelled, 30, 12, 0., &cancel).unwrap();
+        assert_eq!(
+            output["search"]["termination"],
+            "cancelled_without_incumbent"
+        );
+        assert_eq!(output["search"]["measured_windows"], 0);
+        assert!(output["plan"].is_null());
+        assert_eq!(output["draft"]["exportable"], false);
+        let saved: Report =
+            serde_json::from_slice(&std::fs::read(output["draft_path"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved.header.extensions["search"]["stop_reason"],
+            "cancelled"
         );
     }
 }

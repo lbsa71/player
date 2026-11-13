@@ -67,18 +67,19 @@ import SpotifyKit
     }
     func signIn() {
         guard !signingIn else { return }
+        guard !recordingEnabled else { error = "Stop recording before reconnecting Spotify."; return }
         if clientID != UserDefaults.standard.string(forKey: "spotifyClientID") { configure() }
+        pollTask?.cancel()
         signingIn = true; error = ""
         let current = generation
         loginTask = Task {
-            defer { signingIn = false }
+            defer { signingIn = false; if connected { beginPolling() } }
             do {
                 try await auth.signIn { url in Task { @MainActor in NSWorkspace.shared.open(url) } }
                 guard current == generation else { return }
                 connected = true
                 event("Spotify connected; refresh credential saved to Keychain")
                 await refreshDevices()
-                beginPolling()
             } catch {
                 guard current == generation else { return }
                 handle(error)
@@ -117,6 +118,10 @@ import SpotifyKit
             event("Spotify device list refreshed")
         } catch { handle(error) }
     }
+    func playlistItems(_ uri: String) async throws -> [SpotifyPlaylistTrack?] {
+        try await client.playlistItems(uri)
+    }
+
     func refreshPlayback(force: Bool = false) async {
         // A command must not reuse a read that began before it was accepted.
         // Let an in-flight poll finish, then issue a distinct forced observation.

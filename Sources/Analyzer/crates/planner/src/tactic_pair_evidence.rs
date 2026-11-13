@@ -674,7 +674,7 @@ fn profile_with_hold(
         .iter()
         .take_while(|&&at| at < t.hold_end_frame)
         .count();
-    Some(PairProfile{method:METHOD.into(),evidence:vec![format!("source analysis {} / {}; actual {:?} lane curves, edit captures and bounded FX; harmony is added incompatible pitch-class interval mass over within-passage baselines plus baseline-weighted spectral disagreement; stability uses separate sustained-lane source RMS before intentional fades; summaries are measured heuristics, summed peak is an upper bound, RMS combination assumes uncorrelated layers",records[0].tactic_analysis_id,records[1].tactic_analysis_id,t.tactic_id)],harmonic_distance:Some(harmonic),lead_conflict:Some(conflict.clamp(0.,1.)),complementarity:Some((1.-collision).clamp(0.,1.)),predicted_peak_dbfs:Some(db(peak)),selected_composite_density:Some(densities),retained_bed_density:Some(beds),outgoing_layer_stability:measure_stability.then(||layer_stability(&held_levels[0], held_bars)),incoming_layer_stability:measure_stability.then(||layer_stability(&held_levels[1], held_bars))})
+    Some(PairProfile{method:METHOD.into(),evidence:vec![format!("source analysis {} / {}; actual {:?} lane curves, edit captures and bounded FX; harmony is added incompatible pitch-class interval mass over within-passage baselines plus baseline-weighted spectral disagreement; stability uses separate sustained-lane source RMS before intentional fades; summaries are measured heuristics, summed peak is an upper bound, RMS combination assumes uncorrelated layers",records[0].tactic_analysis_id,records[1].tactic_analysis_id,t.tactic_id)],preflight_rejection:None,harmonic_distance:Some(harmonic),lead_conflict:Some(conflict.clamp(0.,1.)),complementarity:Some((1.-collision).clamp(0.,1.)),predicted_peak_dbfs:Some(db(peak)),selected_composite_density:Some(densities),retained_bed_density:Some(beds),outgoing_layer_stability:measure_stability.then(||layer_stability(&held_levels[0], held_bars)),incoming_layer_stability:measure_stability.then(||layer_stability(&held_levels[1], held_bars))})
 }
 
 #[derive(Clone, Debug)]
@@ -1212,16 +1212,7 @@ pub(crate) fn refine_rhythmic_hold(
     };
     let mut active = facts.clone();
     active.phrase_exit = Some(exit.clone());
-    let policy = TacticPolicy {
-        normal_speed_deviation: placements
-            .iter()
-            .map(|p| {
-                (1. - p.time_map.speed_ratio_limits[0]).max(p.time_map.speed_ratio_limits[1] - 1.)
-            })
-            .fold(0.06, f64::max)
-            .min(0.2),
-        ..TacticPolicy::default()
-    };
+    let policy = pair_policy(placements);
     let Ok(t) = candidate_tactic_schedule(TacticId::M01, &active, &policy) else {
         return Ok(());
     };
@@ -1255,6 +1246,19 @@ pub(crate) fn refine_rhythmic_hold(
     Ok(())
 }
 
+fn pair_policy(placements: [&Placement; 2]) -> TacticPolicy {
+    TacticPolicy {
+        normal_speed_deviation: placements
+            .iter()
+            .map(|p| {
+                (1. - p.time_map.speed_ratio_limits[0]).max(p.time_map.speed_ratio_limits[1] - 1.)
+            })
+            .fold(0.06, f64::max)
+            .min(0.2),
+        ..TacticPolicy::default()
+    }
+}
+
 /// Enrich only from identity-checked persisted source evidence. This function
 /// performs no model inference, file access, user communication or metadata writes.
 pub(crate) fn enrich_pair_evidence(
@@ -1283,22 +1287,19 @@ pub(crate) fn enrich_pair_evidence(
         )?;
     }
     pulse_relation(records, placements, facts);
+    facts.validate()?;
     facts.pair.semantic_relation = semantic_relation(records, placements, facts);
     shared_motif(records, placements, facts);
     version_identity(records, facts);
-    let normal = placements
-        .iter()
-        .map(|p| (1. - p.time_map.speed_ratio_limits[0]).max(p.time_map.speed_ratio_limits[1] - 1.))
-        .fold(0.06, f64::max)
-        .min(0.2);
-    let policy = TacticPolicy {
-        normal_speed_deviation: normal,
-        ..TacticPolicy::default()
-    };
+    let policy = pair_policy(placements);
     for id in TacticId::ALL
         .into_iter()
         .filter(|id| !id.is_modifier() && id.permission() != TacticPermission::EmergencyOnly)
     {
+        if let Some(rejection) = geometry_profile_rejection(id, facts) {
+            facts.pair.profiles.insert(id, rejection);
+            continue;
+        }
         let (measured, reason) = match crate::tactics::candidate_tactic_schedule(id, facts, &policy)
         {
             Ok(t) => (
@@ -1319,23 +1320,82 @@ pub(crate) fn enrich_pair_evidence(
     if facts.a.phrase_exit.is_some() {
         let mut swift = facts.clone();
         swift.phrase_exit = facts.a.phrase_exit.clone();
-        for id in TacticId::ALL.into_iter().filter(|id| sustained_tactic(*id)) {
-            let measured = candidate_tactic_schedule(id, &swift, &policy).and_then(|t| {
-                profile(&t, records, placements, &swift).ok_or_else(|| {
+        facts.pair.swift_profiles = swift_profiles(records, placements, &swift, &policy);
+    }
+    enrich_rhythmic_exit(records, placements, facts);
+    Ok(())
+}
+
+fn geometry_profile_rejection(id: TacticId, facts: &CandidateFacts) -> Option<PairProfile> {
+    let decision = window_geometry_rejection(id, facts)?;
+    Some(PairProfile {
+        method: METHOD.into(),
+        preflight_rejection: Some(decision),
+        ..PairProfile::default()
+    })
+}
+
+fn swift_profiles(
+    records: [&TacticTrackAnalysis; 2],
+    placements: [&Placement; 2],
+    swift: &CandidateFacts,
+    policy: &TacticPolicy,
+) -> BTreeMap<TacticId, PairProfile> {
+    TacticId::ALL
+        .into_iter()
+        .filter(|id| sustained_tactic(*id))
+        .map(|id| {
+            if let Some(rejection) = geometry_profile_rejection(id, swift) {
+                return (id, rejection);
+            }
+            let measured = candidate_tactic_schedule(id, swift, policy).and_then(|plan| {
+                profile(&plan, records, placements, swift).ok_or_else(|| {
                     Error::new("TACTIC_PAIR", "source coverage unknown for swift exit")
                 })
             });
-            facts.pair.swift_profiles.insert(
+            (
                 id,
-                measured.unwrap_or_else(|e| PairProfile {
+                measured.unwrap_or_else(|error| PairProfile {
                     method: METHOD.into(),
-                    evidence: vec![format!("swift exit: {}: {}", e.code, e.message)],
+                    evidence: vec![format!("swift exit: {}: {}", error.code, error.message)],
                     ..PairProfile::default()
                 }),
-            );
-        }
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn enrich_later_swift_exits(
+    records: [&TacticTrackAnalysis; 2],
+    placements: [&Placement; 2],
+    facts: &mut CandidateFacts,
+    cancel: &Cancellation,
+) -> Result<()> {
+    if facts.a.later_phrase_exits.is_empty() {
+        return Ok(());
     }
+    let policy = pair_policy(placements);
+    let mut active = facts.clone();
+    active.a.later_phrase_exits.clear();
+    for exit in &facts.a.later_phrase_exits {
+        cancel.check()?;
+        active.a.phrase_exit = Some(exit.clone());
+        active.phrase_exit = Some(exit.clone());
+        facts.pair.later_swift_profiles.insert(
+            exit.start_frame,
+            swift_profiles(records, placements, &active, &policy),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn enrich_rhythmic_exit(
+    records: [&TacticTrackAnalysis; 2],
+    placements: [&Placement; 2],
+    facts: &mut CandidateFacts,
+) {
     if facts.pair.rhythmic_exit.is_some() {
+        let policy = pair_policy(placements);
         let mut rhythmic = facts.clone();
         rhythmic.phrase_exit = facts.pair.rhythmic_exit.clone();
         let measured = candidate_tactic_schedule(TacticId::M01, &rhythmic, &policy).and_then(|t| {
@@ -1355,7 +1415,6 @@ pub(crate) fn enrich_pair_evidence(
             }),
         );
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1538,7 +1597,7 @@ mod tests {
         }
         enrich_pair_evidence(&a, &b, [&pa, &pb], &mut f).unwrap();
         let drum_handoff = &f.pair.profiles[&TacticId::M01];
-        let stereo_fade = &f.pair.profiles[&TacticId::S02];
+        let stereo_fade = &f.pair.profiles[&TacticId::S13];
         assert!(drum_handoff.complementarity.unwrap() > stereo_fade.complementarity.unwrap());
         assert_eq!(
             drum_handoff
@@ -1549,7 +1608,7 @@ mod tests {
             8
         );
         f.pair.profiles.insert(
-            TacticId::S02,
+            TacticId::S13,
             PairProfile {
                 method: METHOD.into(),
                 ..Default::default()
@@ -1559,7 +1618,7 @@ mod tests {
         assert!(decision
             .rejected
             .iter()
-            .any(|r| r.tactic_id == TacticId::S02
+            .any(|r| r.tactic_id == TacticId::S13
                 && r.reasons.iter().any(|r| r.contains("headroom"))));
         b.audio_hash = a.audio_hash.clone();
         assert_eq!(
@@ -1568,6 +1627,44 @@ mod tests {
                 .code,
             "TACTIC_PAIR_IDENTITY"
         );
+    }
+
+    #[test]
+    fn preflight_preserves_viable_profiles_and_skips_impossible_schedules() {
+        use RealizationDecision::*;
+        use TacticId::*;
+        let mut f = crate::tactics::tests::facts(8);
+        let (a, pa) = fixture(0, &f);
+        let (b, pb) = fixture(1, &f);
+        let placements = [&pa, &pb];
+        let records = [&a, &b];
+        let policy = pair_policy(placements);
+        let measured_before = [M01, S13].map(|id| {
+            let plan = candidate_tactic_schedule(id, &f, &policy).unwrap();
+            serde_json::to_value(profile(&plan, records, placements, &f).unwrap()).unwrap()
+        });
+        // The profiling shape for a two-bar fade can be built at eight bars.
+        // The selector must never admit it there, even with complete evidence.
+        let plan = candidate_tactic_schedule(S02, &f, &policy).unwrap();
+        assert!(profile(&plan, records, placements, &f).is_some());
+        enrich_pair_evidence(&a, &b, placements, &mut f).unwrap();
+        let skipped = &f.pair.profiles[&S02];
+        assert_eq!(skipped.preflight_rejection, Some(IncompatibleBarCount));
+        assert!(skipped.predicted_peak_dbfs.is_none());
+        for (id, before) in [M01, S13].into_iter().zip(measured_before) {
+            assert_eq!(serde_json::to_value(&f.pair.profiles[&id]).unwrap(), before);
+        }
+
+        f.timing_basis = TacticTimingBasis::Structural;
+        f.bar_frames = vec![0, 8 * BAR];
+        f.a.bars.clear();
+        f.b.bars.clear();
+        enrich_pair_evidence(&a, &b, placements, &mut f).unwrap();
+        assert_eq!(
+            f.pair.profiles[&S13].preflight_rejection,
+            Some(IncompatibleTimingBasis)
+        );
+        assert_eq!(f.pair.profiles[&S07].preflight_rejection, None);
     }
 
     #[test]

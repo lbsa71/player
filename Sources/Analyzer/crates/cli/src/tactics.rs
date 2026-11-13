@@ -1,6 +1,8 @@
 //! The application adapter for measured candidate selection and saved execution.
 use super::*;
-use mixlib_planner::{RenderCapability, TacticPolicy};
+use mixlib_planner::{
+    RenderCapability, TacticPolicy, TacticRealization, SELECTOR_REALIZATION_PROFILE,
+};
 
 pub(super) struct PairSelection {
     pub selected: Option<MixPlan>,
@@ -17,6 +19,74 @@ pub(super) struct MeasuredEdge {
     pub last_resort: bool,
     pub dense_quality_seconds: f64,
     pub handoff_quality_seconds: f64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct SelectorReview {
+    pub profile: String,
+    #[serde(default)]
+    pub rhythmic_exit_frames: Vec<u64>,
+    pub swift_exit_frames: Vec<u64>,
+    pub rhythmic_scan_complete: bool,
+    pub swift_scan_complete: bool,
+    pub variants: Vec<ReviewedVariant>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct ReviewedVariant {
+    #[serde(flatten)]
+    pub realization: TacticRealization,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_hash: Option<String>,
+}
+
+impl SelectorReview {
+    fn from_selection(
+        selection: &mixlib_planner::TacticSelection,
+        facts: &mixlib_planner::CandidateFacts,
+    ) -> Result<Self> {
+        let scheduled = selection
+            .candidates
+            .iter()
+            .map(|ranked| {
+                Ok((
+                    (
+                        ranked.plan.tactic_id,
+                        ranked.variant,
+                        ranked
+                            .plan
+                            .phrase_exit
+                            .as_ref()
+                            .filter(|_| ranked.variant != mixlib_planner::SelectorVariant::Standard)
+                            .map(|exit| exit.start_frame),
+                    ),
+                    canonical_hash(&ranked.plan)?.digest,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        Ok(Self {
+            profile: SELECTOR_REALIZATION_PROFILE.into(),
+            rhythmic_exit_frames: facts.pair.rhythmic_exit_frames().collect(),
+            swift_exit_frames: facts.swift_exit_frames().collect(),
+            rhythmic_scan_complete: facts
+                .exit_scan_complete(mixlib_planner::SelectorVariant::Rhythmic),
+            swift_scan_complete: facts.exit_scan_complete(mixlib_planner::SelectorVariant::Swift),
+            variants: selection
+                .realizations
+                .iter()
+                .map(|&realization| ReviewedVariant {
+                    schedule_hash: scheduled
+                        .get(&(
+                            realization.tactic_id,
+                            realization.variant,
+                            realization.exit_start_frame,
+                        ))
+                        .cloned(),
+                    realization,
+                })
+                .collect(),
+        })
+    }
 }
 
 pub(super) struct CandidateQueue {
@@ -141,6 +211,7 @@ fn window_diagnostic(
 ) -> serde_json::Value {
     serde_json::json!({"cue":candidate.header.extensions.get("tactic_cue_candidate"),
         "bars":facts.bar_frames.len()-1,"filter_crowding":mixlib_planner::filter_crowding(facts),
+        "cut_band_pcm_checks":facts.pair.cut_band_pcm_checks,
         "accepted":selection.candidates.iter().map(|c|c.plan.tactic_id).collect::<Vec<_>>(),
         "ranked":selection.candidates.iter().map(|c|serde_json::json!({"tactic":c.plan.tactic_id,"score":c.score,"dense_quality_seconds":c.dense_quality_seconds,"handoff_quality_seconds":c.handoff_quality_seconds,"phrase_exit":c.plan.phrase_exit})).collect::<Vec<_>>(),
         "profiles":facts.pair.profiles,"swift_profiles":facts.pair.swift_profiles,"rhythmic_profiles":facts.pair.rhythmic_profiles,"rhythmic_exit":facts.pair.rhythmic_exit,"a_roles":facts.a.roles,"b_roles":facts.b.roles,
@@ -241,7 +312,10 @@ pub(super) fn measure_window(
         Err(error) => return Err(error),
     };
     let selection = mixlib_planner::select_tactics(&facts, admission)?;
-    details.push(window_diagnostic(candidate, &facts, &selection));
+    let mut diagnostic = window_diagnostic(candidate, &facts, &selection);
+    diagnostic["selector_review"] =
+        serde_json::to_value(SelectorReview::from_selection(&selection, &facts)?)?;
+    details.push(diagnostic);
     extend_cues(
         store, request, mixing, candidate, &selection, &facts, queue, cancel,
     )?;

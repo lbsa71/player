@@ -2,14 +2,21 @@
 //! physical input bytes before using the result, then returns to a fresh Store
 //! for publication and source-WAV verification.
 use crate::*;
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(crate) struct ReadSnapshot {
     files: Mutex<BTreeMap<PathBuf, Arc<Vec<u8>>>>,
     records: Mutex<BTreeMap<String, Arc<Vec<u8>>>>,
-    bundles: Mutex<BTreeMap<PathBuf, Arc<SidecarBundle>>>,
+    sidecar_index: Mutex<Option<Arc<SidecarIndex>>>,
+    sidecars: Mutex<BTreeMap<PathBuf, Arc<SnapshotSidecar>>>,
     validated_analyses: Mutex<std::collections::BTreeSet<String>>,
+}
+
+struct SnapshotSidecar {
+    bundle: SidecarBundle,
+    recording: Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,11 +81,46 @@ impl Store {
                 Ok(ReadSnapshotStats {
                     physical_files: lock(&cache.files)?.len(),
                     logical_records: lock(&cache.records)?.len(),
-                    sidecar_bundles: lock(&cache.bundles)?.len(),
+                    sidecar_bundles: lock(&cache.sidecars)?.len(),
                     validated_analyses: lock(&cache.validated_analyses)?.len(),
                 })
             })
             .transpose()
+    }
+
+    pub(crate) fn snapshot_sidecar_index(&self) -> Result<Arc<SidecarIndex>> {
+        let cache = self.read_cache.as_ref().unwrap();
+        let mut index = lock(&cache.sidecar_index)?;
+        if let Some(index) = index.as_ref() {
+            return Ok(index.clone());
+        }
+        let loaded = Arc::new(self.load_sidecar_index()?);
+        *index = Some(loaded.clone());
+        Ok(loaded)
+    }
+
+    fn snapshot_sidecar(&self, path: &Path) -> Result<Arc<SnapshotSidecar>> {
+        let cache = self.read_cache.as_ref().unwrap();
+        if let Some(sidecar) = lock(&cache.sidecars)?.get(path).cloned() {
+            return Ok(sidecar);
+        }
+        let physical = self.snapshot_physical(path, sidecars::MAX_SIDECAR)?;
+        let mut recording: serde_json::Map<String, Value> = serde_json::from_slice(&physical)?;
+        let value = recording
+            .remove("analyzer")
+            .ok_or_else(|| Error::new("SIDECAR_MISSING", path.display().to_string()))?;
+        let sidecar = Arc::new(SnapshotSidecar {
+            bundle: validate_value(&value)?,
+            recording: Value::Object(recording),
+        });
+        Ok(lock(&cache.sidecars)?
+            .entry(path.into())
+            .or_insert(sidecar)
+            .clone())
+    }
+
+    pub(crate) fn snapshot_recording_metadata(&self, path: &Path) -> Result<Value> {
+        Ok(self.snapshot_sidecar(path)?.recording.clone())
     }
 
     /// Successful validation belongs only to this immutable operation and the
@@ -117,19 +159,8 @@ impl Store {
             .unwrap_or(false);
         let bytes = if let Some(owner) = owner.filter(|_| sidecar_layout) {
             let path = self.sidecar_for_track(&owner)?;
-            let cached = lock(&cache.bundles)?.get(&path).cloned();
-            let bundle = if let Some(bundle) = cached {
-                bundle
-            } else {
-                let physical = self.snapshot_physical(&path, sidecars::MAX_SIDECAR)?;
-                let document: serde_json::Value = serde_json::from_slice(&physical)?;
-                let value = document
-                    .get("analyzer")
-                    .ok_or_else(|| Error::new("SIDECAR_MISSING", &owner))?;
-                let bundle = Arc::new(validate_value::<SidecarBundle>(value)?);
-                lock(&cache.bundles)?.insert(path, bundle.clone());
-                bundle
-            };
+            let sidecar = self.snapshot_sidecar(&path)?;
+            let bundle = &sidecar.bundle;
             require(
                 bundle.track_id == owner
                     && bundle.library_id == self.read::<Library>("library.json")?.library_id
@@ -169,8 +200,14 @@ impl Store {
             return Ok(bytes);
         }
         let bytes = Arc::new(read_physical(path, limit)?);
-        lock(&cache.files)?.insert(path.into(), bytes.clone());
-        Ok(bytes)
+        let mut files = lock(&cache.files)?;
+        let pinned = files.entry(path.into()).or_insert(bytes);
+        require(
+            pinned.len() as u64 <= limit,
+            "JSON_TOO_LARGE",
+            path.display().to_string(),
+        )?;
+        Ok(pinned.clone())
     }
 }
 

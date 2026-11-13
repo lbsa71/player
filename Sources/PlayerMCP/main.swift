@@ -8,7 +8,7 @@ let toolDefinitions: [[String: Any]] = ([
     ["name": "player_start", "description": "Connect Spotify-only audio to Audio Bridge independently of the Mac default output. May trigger system audio permission. Poll sourceReady/phase in player_status; physical listening remains optional."],
     ["name": "player_stop", "description": "Stop capture and restore ordinary Spotify output. Returns accepted, then poll status."],
     ["name": "player_record_start", "description": "Start per-track Float32 WAV recording of Player's rendered output in its configured debug folder. Requires active routing and fresh local track metadata. Track boundaries are approximate. Poll player_status.recording."],
-    ["name":"player_record_resume","description":"Resume ordered playlist WAV recording from the beginning, automatically skipping tracks with complete local capture evidence. Poll player_status.playlistRecovery. Does not change the driver.",
+    ["name":"player_record_resume","description":"Read the selected playlist and record only unfinished tracks in playlist order. Counts verified WAVs in the active folder and cleanup archive. Poll player_status.playlistRecovery.",
      "inputSchema":["type":"object","properties":["playlist":["type":"string"]],"additionalProperties":false]],
     ["name":"player_recordings","description":"List a bounded page of Player's cached recording sidecars and completeness assessments. refresh=true requests an asynchronous rescan; inspect scanning/updatedAt. WAV sample payloads are never read.",
      "inputSchema":["type":"object","properties":["offset":["type":"integer","minimum":0],"limit":["type":"integer","minimum":1,"maximum":20],"refresh":["type":"boolean"]],"additionalProperties":false]],

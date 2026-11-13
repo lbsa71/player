@@ -13,29 +13,41 @@ struct Bin {
     rms: [f64; 2],
     peak: [f64; 2],
 }
-fn detect(bins: &[Bin], last_bar: u64, end: u64, rate: u32) -> Option<PhraseExit> {
-    let reference: Vec<_> = bins.iter().filter(|b| b.end <= last_bar).collect();
+
+#[derive(Default)]
+pub(crate) struct ExitScan {
+    pub exits: Vec<PhraseExit>,
+    pub complete: bool,
+}
+
+fn detect(bins: &[Bin], last_bar: u64, end: u64, rate: u32, earliest: u64) -> ExitScan {
+    let reference = &bins[..bins.partition_point(|b| b.end <= last_bar)];
     if reference.len() < 10 {
-        return None;
+        return ExitScan::default();
     }
     let baseline = [0, 1].map(|lane| {
         (reference.iter().map(|b| b.rms[lane].powi(2)).sum::<f64>() / reference.len() as f64).sqrt()
     });
     // A permanently empty bed is not a phrase-ending pause.
     if baseline.iter().all(|v| *v < 0.003) {
-        return None;
+        return ExitScan {
+            exits: vec![],
+            complete: true,
+        };
     }
     let half = last_bar + (end - last_bar) / 2;
     let fade = u64::from(rate) * 80 / 1000;
     let guard = u64::from(rate) * 20 / 1000;
     let energy = |b: &Bin| b.rms.iter().map(|v| v.powi(2)).sum::<f64>().sqrt();
+    let mut exits = Vec::new();
     for (i, first) in bins.iter().enumerate() {
-        if first.start < half || first.start + guard + fade > end {
+        if first.start < half || first.start + guard < earliest || first.start + guard + fade > end
+        {
             continue;
         }
         let finish = first.start + guard + fade;
-        let tail: Vec<_> = bins[i..].iter().take_while(|b| b.start < finish).collect();
-        if tail.last()?.end < finish {
+        let tail = &bins[i..i + bins[i..].partition_point(|b| b.start < finish)];
+        if tail.last().is_none_or(|bin| bin.end < finish) {
             continue;
         }
         let pause = tail.iter().all(|b| {
@@ -49,9 +61,10 @@ fn detect(bins: &[Bin], last_bar: u64, end: u64, rate: u32) -> Option<PhraseExit
         // final fill alone cannot authorize cutting off the crescendo.
         let slice = u64::from(rate) / 10;
         let mean = |a: u64, z: u64| -> Option<f64> {
-            let rows: Vec<_> = bins.iter().filter(|b| b.start >= a && b.end <= z).collect();
-            (rows.len() >= 3)
-                .then(|| rows.iter().map(|b| energy(b)).sum::<f64>() / rows.len() as f64)
+            let lo = bins.partition_point(|b| b.start < a);
+            let hi = bins.partition_point(|b| b.end <= z);
+            let rows = bins.get(lo..hi)?;
+            (rows.len() >= 3).then(|| rows.iter().map(energy).sum::<f64>() / rows.len() as f64)
         };
         let levels: Option<Vec<_>> = (0..3)
             .map(|n| {
@@ -69,7 +82,7 @@ fn detect(bins: &[Bin], last_bar: u64, end: u64, rate: u32) -> Option<PhraseExit
                 && tail.iter().all(|b| energy(b) <= v[2] * 0.50)
         });
         if pause || release {
-            return Some(PhraseExit {
+            exits.push(PhraseExit {
                 start_frame: first.start + guard,
                 end_frame: finish,
                 kind: if pause { PhraseExitKind::AccompanimentPause } else { PhraseExitKind::CrescendoRelease },
@@ -77,7 +90,10 @@ fn detect(bins: &[Bin], last_bar: u64, end: u64, rate: u32) -> Option<PhraseExit
             });
         }
     }
-    None
+    ExitScan {
+        exits,
+        complete: true,
+    }
 }
 
 pub(crate) fn measure(
@@ -87,16 +103,16 @@ pub(crate) fn measure(
     anchors: &[u64],
     facts: &PassageFacts,
     cancel: &Cancellation,
-) -> Result<Option<PhraseExit>> {
+) -> Result<ExitScan> {
     if anchors.len() < 5 || facts.stems.is_none() {
-        return Ok(None);
+        return Ok(ExitScan::default());
     }
     let Some(assets) = [StemLane::Bass, StemLane::Other]
         .map(|l| record.stems.get(&l))
         .into_iter()
         .collect::<Option<Vec<_>>>()
     else {
-        return Ok(None);
+        return Ok(ExitScan::default());
     };
     let map = &placement.time_map;
     let last_bar = anchors[anchors.len() - 2];
@@ -148,7 +164,7 @@ pub(crate) fn measure(
                     output_at(map, at as f64),
                     output_at(map, (at + block) as f64),
                 ) else {
-                    return Ok(None);
+                    return Ok(ExitScan::default());
                 };
                 bins.push(Bin {
                     start: start.ceil() as u64,
@@ -163,43 +179,43 @@ pub(crate) fn measure(
             at += block;
         }
     }
-    Ok(
-        detect(&bins, last_bar, end, map.output_sample_rate_hz).filter(|exit| {
-            facts
-                .build_release_frame
-                .is_none_or(|at| at <= exit.start_frame)
-        }),
-    )
+    Ok(detect(
+        &bins,
+        last_bar,
+        end,
+        map.output_sample_rate_hz,
+        facts.build_release_frame.unwrap_or(0),
+    ))
 }
 
 /// A rhythm-led end to a dense mashup need not become quiet. Propose an
 /// on-grid incoming drum accent in the final half-bar; actual extended-hold
 /// density, harmony, isolation and vocals are admitted separately afterward.
-pub(crate) fn rhythmic_exit(
+pub(crate) fn rhythmic_exits(
     store: &Store,
     record: &TacticTrackAnalysis,
     placement: &Placement,
     facts: &crate::tactics::CandidateFacts,
     cancel: &Cancellation,
-) -> Result<Option<PhraseExit>> {
+) -> Result<ExitScan> {
     if facts.timing_basis != TacticTimingBasis::Bars
         || facts.bar_frames.len() < 9
         || facts.a.endpoint_reasons.is_empty() && facts.b.endpoint_reasons.is_empty()
     {
-        return Ok(None);
+        return Ok(ExitScan::default());
     }
     let Some(asset) = record.stems.get(&StemLane::Drums) else {
-        return Ok(None);
+        return Ok(ExitScan::default());
     };
     let map = &placement.time_map;
     let bars = &facts.bar_frames;
     let last = bars[bars.len() - 2];
     let end = *bars.last().unwrap();
     let Some(meter) = facts.a.bars.last().and_then(|b| b.beats_per_bar) else {
-        return Ok(None);
+        return Ok(ExitScan::default());
     };
     if meter < 2 {
-        return Ok(None);
+        return Ok(ExitScan::default());
     }
     let mut wav = WavReader::open(&store.path(&asset.path)?)?;
     require(
@@ -209,11 +225,15 @@ pub(crate) fn rhythmic_exit(
         "TACTIC_STEM_FORMAT",
         "rhythmic-exit drum timebase changed",
     )?;
+    let mut complete = true;
     let mut rms = |a: u64, b: u64| -> Result<f64> {
         cancel.check()?;
+        complete &=
+            a >= map.anchors[0].output_frame && b <= map.anchors.last().unwrap().output_frame;
         let lo = map.source_at(a as f64).ceil() as u64;
         let hi = map.source_at(b as f64).floor() as u64;
         if hi <= lo {
+            complete = false;
             return Ok(0.);
         }
         wav.seek_frame(lo)?;
@@ -245,21 +265,41 @@ pub(crate) fn rhythmic_exit(
     };
     let reference = rms(bars[bars.len() - 3], last)?;
     let rate = u64::from(facts.output_sample_rate_hz);
+    let exits = rhythmic_candidates(
+        [last, end],
+        meter,
+        rate,
+        facts.a.build_release_frame,
+        reference,
+        rms,
+    )?;
+    Ok(ExitScan { exits, complete })
+}
+
+fn rhythmic_candidates(
+    [last, end]: [u64; 2],
+    meter: u16,
+    rate: u64,
+    release: Option<u64>,
+    reference: f64,
+    mut rms: impl FnMut(u64, u64) -> Result<f64>,
+) -> Result<Vec<PhraseExit>> {
+    let mut exits = Vec::new();
     for pulse in meter.div_ceil(2)..meter {
         let at = last + (end - last) * u64::from(pulse) / u64::from(meter);
         let finish = at + rate * 80 / 1000;
-        if finish > end || facts.a.build_release_frame.is_some_and(|r| r > at) {
+        if finish > end || release.is_some_and(|r| r > at) {
             continue;
         }
         let before = rms(at.saturating_sub(rate / 10), at)?;
         let attack = rms(at, finish)?;
         if strong_accent(reference, before, attack) {
-            return Ok(Some(PhraseExit { start_frame: at, end_frame: finish,
+            exits.push(PhraseExit { start_frame: at, end_frame: finish,
                 kind: PhraseExitKind::RhythmicHandoff,
-                evidence: format!("incoming drum PCM accent on final-bar pulse {}/{} before a measured musical endpoint: 80ms RMS {:.3}x preceding-bar RMS and {:.3}x preceding 100ms; dense extended hold must pass independent pair admission; no accompaniment silence required", pulse+1,meter,attack/reference,attack/before.max(1e-9)) }));
+                evidence: format!("incoming drum PCM accent on final-bar pulse {}/{} before a measured musical endpoint: 80ms RMS {:.3}x preceding-bar RMS and {:.3}x preceding 100ms; dense extended hold must pass independent pair admission; no accompaniment silence required", pulse+1,meter,attack/reference,attack/before.max(1e-9)) });
         }
     }
-    Ok(None)
+    Ok(exits)
 }
 fn strong_accent(reference: f64, before: f64, attack: f64) -> bool {
     reference >= 0.003 && attack >= reference * 1.2 && attack >= before * 1.4
@@ -286,28 +326,72 @@ mod tests {
         assert!(!strong_accent(0.0001, 0.00001, 0.001));
     }
     #[test]
+    fn all_measured_final_half_pulses_survive_the_detector() {
+        let rms = |a, b| {
+            Ok(if matches!((a, b), (3500, 3580) | (3750, 3830)) {
+                0.08
+            } else {
+                0.02
+            })
+        };
+        let starts = |release| {
+            rhythmic_candidates([3000, 4000], 4, 1000, release, 0.04, rms)
+                .unwrap()
+                .into_iter()
+                .map(|exit| exit.start_frame)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(None), [3500, 3750]);
+        assert_eq!(starts(Some(3600)), [3750]);
+    }
+
+    #[test]
+    fn an_early_pause_before_release_does_not_hide_a_later_pause() {
+        let mut b = bins();
+        for v in &mut b[160..167] {
+            v.rms = [0.001; 2];
+            v.peak = [0.002; 2];
+        }
+        for v in &mut b[185..192] {
+            v.rms = [0.001; 2];
+            v.peak = [0.002; 2];
+        }
+        let starts = |release| {
+            detect(&b, 2000, 4000, 1000, release)
+                .exits
+                .into_iter()
+                .map(|exit| exit.start_frame)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(0), [3220, 3240, 3260, 3720, 3740, 3760]);
+        assert_eq!(starts(3500), [3720, 3740, 3760]);
+    }
+    #[test]
     fn pause_requires_both_retained_lanes_and_final_half_bar() {
         let mut b = bins();
-        assert!(detect(&b, 2000, 4000, 1000).is_none());
+        let empty = detect(&b, 2000, 4000, 1000, 0);
+        assert!(empty.exits.is_empty() && empty.complete);
+        let missing = detect(&b[..8], 2000, 4000, 1000, 0);
+        assert!(missing.exits.is_empty() && !missing.complete);
         for v in &mut b[160..170] {
             v.rms[0] = 0.001;
             v.peak[0] = 0.002;
         }
-        assert!(detect(&b, 2000, 4000, 1000).is_none());
+        assert!(detect(&b, 2000, 4000, 1000, 0).exits.is_empty());
         for v in &mut b[160..170] {
             v.rms[1] = 0.001;
             v.peak[1] = 0.002;
         }
-        let e = detect(&b, 2000, 4000, 1000).unwrap();
+        let e = &detect(&b, 2000, 4000, 1000, 0).exits[0];
         assert_eq!((e.start_frame, e.end_frame), (3220, 3300));
         assert_eq!(e.kind, PhraseExitKind::AccompanimentPause);
-        assert!(detect(&b[..162], 2000, 4000, 1000).is_none());
+        assert!(detect(&b[..162], 2000, 4000, 1000, 0).exits.is_empty());
         let mut early = bins();
         for v in &mut early[110..120] {
             v.rms = [0.001; 2];
             v.peak = [0.002; 2];
         }
-        assert!(detect(&early, 2000, 4000, 1000).is_none());
+        assert!(detect(&early, 2000, 4000, 1000, 0).exits.is_empty());
     }
     #[test]
     fn crescendo_must_release_before_exchange() {
@@ -322,12 +406,12 @@ mod tests {
             v.rms = [0.24; 2];
             v.peak = [0.48; 2];
         }
-        assert!(detect(&b, 2000, 4000, 1000).is_none());
+        assert!(detect(&b, 2000, 4000, 1000, 0).exits.is_empty());
         for v in &mut b[175..] {
             v.rms = [0.08; 2];
             v.peak = [0.16; 2];
         }
-        let e = detect(&b, 2000, 4000, 1000).unwrap();
+        let e = &detect(&b, 2000, 4000, 1000, 0).exits[0];
         assert_eq!(e.kind, PhraseExitKind::CrescendoRelease);
         assert!(e.start_frame > 3500);
     }

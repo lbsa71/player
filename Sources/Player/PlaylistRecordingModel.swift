@@ -13,6 +13,8 @@ import SpotifyKit
     @Published private(set) var completeCount = 0
     @Published private(set) var unverifiedCount = 0
     @Published private(set) var skipped = 0
+    @Published private(set) var plannedTracks = 0
+    @Published private(set) var unavailableTracks = 0
     @Published private(set) var scanning = false
     var prepareSource: (() async throws -> Void)?
     @Published private(set) var sourceReady = false
@@ -20,6 +22,8 @@ import SpotifyKit
     private let bridge: AudioBridgeModel
     let directory: URL
     private var policy = PlaylistRecovery()
+    private var recordingPlaylistURI = ""
+    private var recordingPlan: PlaylistRecordingPlan?
     private var entries: [[String:Any]] = []
     private var completeIDs: Set<String> = []
     private var latestTrack: RecordingTrack?
@@ -40,6 +44,7 @@ import SpotifyKit
     var status: [String:Any] {
         ["active":active,"preparing":preparing,"detail":detail,"error":error,
          "completeTracks":completeCount,"unverifiedFiles":unverifiedCount,"skipped":skipped,
+         "plannedTracks":plannedTracks,"unavailableTracks":unavailableTracks,
          "directory":directory.path,"scanning":scanning,
          "catalogUpdatedAt":catalogDate.map { ISO8601DateFormatter().string(from:$0) } ?? ""]
     }
@@ -51,18 +56,14 @@ import SpotifyKit
         let task = Task { @MainActor in
             defer { scanning = false; catalogTask = nil }
             repeat {
-            catalogDirty = false
-            let result = try await Task.detached(priority:.utility) {
-                // Header/length checks read no sample payload. Missing folders
-                // are an empty library until the recorder creates them.
-                guard FileManager.default.fileExists(atPath:folder.path) else { return ["entries":[]] as [String:Any] }
-                return try RecordingCatalog.scan(directory:folder,verifyAudio:true)
-            }.value
-            entries = result["entries"] as? [[String:Any]] ?? []
-            completeIDs = Set(entries.filter { $0["status"] as? String == "complete" }.compactMap { $0["trackID"] as? String })
-            completeCount = completeIDs.count
-            unverifiedCount = entries.filter { $0["status"] as? String == "unverified" }.count
-            catalogDate = Date()
+                catalogDirty = false
+                entries = try await Task.detached(priority:.utility) {
+                    try RecordingCatalog.libraryEntries(directory:folder)
+                }.value
+                completeIDs = Set(entries.filter { $0["status"] as? String == "complete" }.compactMap { $0["trackID"] as? String })
+                completeCount = completeIDs.count
+                unverifiedCount = entries.filter { $0["status"] as? String == "unverified" }.count
+                catalogDate = Date()
             } while catalogDirty
         }
         catalogTask = task
@@ -119,13 +120,38 @@ import SpotifyKit
         do { uri = try SpotifyPlaylist.uri(input) }
         catch { self.error = error.localizedDescription; return }
         generation += 1; let current = generation
-        preparing = true; skipped = 0; error = ""; detail = "Checking saved recordings…"
+        preparing = true; skipped = 0; plannedTracks = 0; unavailableTracks = 0
+        error = ""; detail = "Checking saved recordings…"
         suppressCapture = true
         bridge.observe(nil,capture:false)
         operation = Task {
             do {
                 try await refreshCatalog()
                 try Task.checkCancellation()
+                detail = "Reading the playlist…"
+                let items = try await spotify.playlistItems(uri)
+                try Task.checkCancellation()
+                let signatures = Set(entries.compactMap { entry -> RecordingTrackSignature? in
+                    guard entry["status"] as? String == "complete",
+                          let metadata = entry["metadata"] as? [String:Any],
+                          let title = metadata["track"] as? String, let artist = metadata["artist"] as? String,
+                          let album = metadata["album"] as? String,
+                          let seconds = metadata["expectedDurationSeconds"] as? Double,
+                          seconds.isFinite, (0...86400).contains(seconds) else { return nil }
+                    return RecordingTrackSignature(title:title,artist:artist,album:album,durationMs:Int((seconds*1000).rounded()))
+                })
+                let plan = PlaylistRecordingPlan(items:items,completedTrackIDs:completeIDs,completedSignatures:signatures)
+                recordingPlan = plan
+                plannedTracks = plan.trackIDs.count
+                skipped = plan.skipped
+                unavailableTracks = plan.unavailable
+                UserDefaults.standard.set(uri,forKey:"lastRecordingPlaylist")
+                guard let first = plan.trackIDs.first, let firstPosition = plan.positions[first] else {
+                    detail = plan.unavailable == 0 ? "All playlist tracks have complete recordings." :
+                        "No playable tracks left to record. \(plan.unavailable) unavailable playlist items."
+                    preparing = false; operation = nil
+                    return
+                }
                 guard let prepareSource else { throw ControlError.message("Spotify's Audio Bridge route is unavailable.") }
                 detail = "Connecting Spotify to Audio Bridge…"
                 try await prepareSource()
@@ -133,21 +159,22 @@ import SpotifyKit
                 try await bridge.perform("bridge_record_start",["directory":directory.path,"leaseSeconds":10,"playing":false])
                 guard bridge.recordingEnabled else { throw ControlError.message("Audio Bridge did not arm the recorder.") }
                 try Task.checkCancellation()
-                detail = "Starting the playlist and skipping completed tracks…"
-                try await spotify.perform(.playlist(uri),name:"Resume playlist recording")
+                detail = "Starting \(plan.trackIDs.count) unfinished tracks…"
+                try await spotify.perform(.playlistAt(uri,position:firstPosition),name:"Resume playlist recording")
                 // Spotify applies play asynchronously. A fresh HTTP response may
                 // still describe the previous context; bootstrap waits boundedly.
                 for _ in 0..<20 {
-                    if startupConfirmed(uri) { break }
+                    if startupConfirmed(uri, firstTrackID:first) { break }
                     try await Task.sleep(for:.milliseconds(500))
                     await spotify.refreshPlayback(force:true)
                     guard !spotify.stale else { throw ControlError.message("Spotify playback metadata became stale during startup.") }
                 }
-                guard startupConfirmed(uri) else { throw ControlError.message("Spotify did not confirm the requested playlist within 10 seconds.") }
+                guard startupConfirmed(uri, firstTrackID:first) else { throw ControlError.message("Spotify did not confirm the first unfinished track within 10 seconds (expected \(first), observed \(spotify.playback?.item?.id ?? "none")).") }
                 try Task.checkCancellation()
                 guard generation == current else { return }
-                UserDefaults.standard.set(uri,forKey:"lastRecordingPlaylist")
-                policy.start(playlistURI:uri,deviceID:spotify.selectedDeviceID,now:ProcessInfo.processInfo.systemUptime)
+                recordingPlaylistURI = uri
+                policy.start(playlistURI:uri,deviceID:spotify.selectedDeviceID,now:ProcessInfo.processInfo.systemUptime,
+                             orderedTrackIDs:plan.trackIDs,savedTrackIDs:plan.savedTrackIDs)
                 preparing = false; active = true; operation = nil
                 playbackChanged(latestTrack)
             } catch {
@@ -157,21 +184,33 @@ import SpotifyKit
             }
         }
     }
-    private func startupConfirmed(_ uri: String) -> Bool {
+    private func startupConfirmed(_ uri: String, firstTrackID: String) -> Bool {
         guard !spotify.stale, spotify.isLocalPlayback, let playback = spotify.playback else { return false }
-        return playback.context?.uri == uri && playback.is_playing && playback.item?.id != nil &&
-            (playback.progress_ms.map { (0...2000).contains($0) } ?? false) &&
+        return playback.context?.uri == uri &&
+            playback.is_playing && plannedID(for:playback.item) == firstTrackID &&
             playback.currently_playing_type == "track" && playback.shuffle_state == false && playback.repeat_state == "off"
     }
+    private func plannedID(for item: SpotifyItem?) -> String? {
+        guard let item else { return nil }
+        return recordingPlan?.plannedID(for:item,verifiedRecording:item.id.map(completeIDs.contains) == true)
+    }
+
     func playbackChanged(_ track: RecordingTrack?) {
+        let previousTrack = latestTrack
         latestTrack = track
         if preparing { bridge.observe(track,capture:false); return }
         guard active else { bridge.observe(track,capture:!suppressCapture && sourceReady); return }
         // A transport operation owns observations until its final refresh. This
         // prevents a new skip from being lost behind an in-flight command.
         guard operation == nil else { bridge.observe(track,capture:false); return }
-        let action = policy.observe(.init(playback:spotify.playback,stale:spotify.stale),
-                                    completedTrackIDs:completeIDs,now:ProcessInfo.processInfo.systemUptime)
+        let item = spotify.playback?.item
+        let plannedID = plannedID(for:item)
+        var completed = completeIDs
+        if let plannedID, let actualID = item?.id, completed.contains(actualID) {
+            completed.insert(plannedID)
+        }
+        let action = policy.observe(.init(playback:spotify.playback,stale:spotify.stale,plannedTrackID:plannedID),
+                                    completedTrackIDs:completed,now:ProcessInfo.processInfo.systemUptime)
         switch action {
         case .capture:
             bridge.observe(track)
@@ -179,11 +218,30 @@ import SpotifyKit
         case .wait:
             bridge.observe(track,capture:false)
             detail = "Waiting for Spotify to confirm the track…"
-        case .skip, .restart:
-            bridge.observe(track,capture:false)
-            let isSkip = action == .skip
-            if isSkip { skipped += 1 }
-            detail = isSkip ? "Skipping a completed track…" : "Restarting the incomplete track…"
+        case .skip, .restart, .jump:
+            if case .jump = action, previousTrack?.id == track?.id { bridge.observe(nil,capture:false) }
+            else { bridge.observe(track,capture:false) }
+            let command: TransportCommand
+            let name: String
+            switch action {
+            case .jump(let id):
+                if let plannedID, let actualID = item?.id, plannedID != actualID, completeIDs.contains(actualID) {
+                    skipped += 1
+                }
+                guard let position = recordingPlan?.positions[id] else {
+                    stop(reason:"The next unfinished track has no playlist position.",failed:true); return
+                }
+                command = .playlistAt(recordingPlaylistURI,position:position)
+                name = "Jump to next unfinished track"
+            case .skip:
+                skipped += 1
+                command = .next
+                name = "Skip saved track"
+            default:
+                command = .seek(0)
+                name = "Restart missing track"
+            }
+            detail = name + "…"
             let current = generation
             operation = Task {
                 do {
@@ -191,7 +249,7 @@ import SpotifyKit
                     // processes observations serially and omits skipped WAVs.
                     try await bridge.pushObservation()
                     try Task.checkCancellation()
-                    try await spotify.perform(isSkip ? .next : .seek(0),name:isSkip ? "Skip saved track" : "Restart missing track")
+                    try await spotify.perform(command,name:name)
                     guard generation == current else { return }
                     operation = nil
                     playbackChanged(latestTrack)
@@ -201,6 +259,8 @@ import SpotifyKit
                     stop(reason:"Recovery stopped: \(error.localizedDescription)",failed:true)
                 }
             }
+        case .finish:
+            stop(reason:"Reached the end of the planned tracks.", endOfQueue:true)
         case .stop(let reason): stop(reason:reason)
         }
     }
@@ -221,18 +281,23 @@ import SpotifyKit
             stop(reason:"Recording or the Audio Bridge route stopped.",failed:true)
         }
     }
-    func stop(reason: String = "Recording stopped. Resume the playlist to retry unfinished tracks.", failed: Bool = false) {
+    func stop(reason: String = "Recording stopped. Resume the playlist to retry unfinished tracks.", failed: Bool = false, endOfQueue: Bool = false) {
         generation += 1
         _ = policy.cancel(reason:reason)
         active = false; manualRecording = false; preparing = true; detail = reason
         if failed { error = reason }
         let previous = operation
+        let endingTrackID = endOfQueue ? spotify.playback?.item?.id : nil
         previous?.cancel()
         suppressCapture = true
         bridge.observe(nil,capture:false)
         operation = Task {
             await previous?.value
             do {
+                if endOfQueue {
+                    // Let the recorder close on the observed boundary before stopping.
+                    try? await bridge.pushObservation()
+                }
                 try await bridge.perform("bridge_record_stop")
                 for _ in 0..<100 {
                     if !bridge.recordingEnabled && bridge.recording["finishing"] as? Bool != true { break }
@@ -243,6 +308,11 @@ import SpotifyKit
                     throw ControlError.message("Recording stop was not confirmed. Capture remains suppressed; try Stop recording again.")
                 }
             } catch { self.error = error.localizedDescription }
+            if let endingTrackID, spotify.isLocalPlayback, spotify.playback?.is_playing == true,
+               spotify.playback?.item?.id == endingTrackID {
+                do { try await spotify.perform(.pause,name:"End recording queue") }
+                catch { self.error = error.localizedDescription }
+            }
             operation = nil; preparing = false
             try? await refreshCatalog()
         }

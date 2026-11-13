@@ -130,6 +130,13 @@ impl Store {
 
     /// Index is disposable. Recover it by inspecting sidecars, without changing them.
     pub fn sidecar_index(&self) -> Result<SidecarIndex> {
+        if self.read_cache.is_some() {
+            return Ok((*self.snapshot_sidecar_index()?).clone());
+        }
+        self.load_sidecar_index()
+    }
+
+    pub(crate) fn load_sidecar_index(&self) -> Result<SidecarIndex> {
         let path = self.path(INDEX)?;
         if path.exists() {
             let index: SidecarIndex = self.read(INDEX)?;
@@ -215,7 +222,11 @@ impl Store {
     }
 
     pub fn sidecar_for_track(&self, track: &str) -> Result<PathBuf> {
-        let index = self.sidecar_index()?;
+        let index = if self.read_cache.is_some() {
+            self.snapshot_sidecar_index()?
+        } else {
+            std::sync::Arc::new(self.load_sidecar_index()?)
+        };
         let loc = index.tracks.get(track).ok_or_else(|| {
             Error::new(
                 "SIDECAR_MISSING",
@@ -353,7 +364,11 @@ impl Store {
 
     pub fn recording_metadata(&self, track: &Track) -> Result<Value> {
         let path = if self.uses_sidecars()? {
-            self.sidecar_for_track(&track.track_id)?
+            let path = self.sidecar_for_track(&track.track_id)?;
+            if self.read_cache.is_some() {
+                return self.snapshot_recording_metadata(&path);
+            }
+            path
         } else {
             sidecar_path(&self.source(track)?)
         };

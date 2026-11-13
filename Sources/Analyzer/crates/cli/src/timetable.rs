@@ -119,7 +119,7 @@ fn search_footer(plan: &MixPlan) -> String {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "unknown".into())
         };
-        return format!(
+        let mut markdown = format!(
             "\n## Set search evidence\n\nStopped at `{}` after {:.1} seconds: {} prepared tracks, {} newly measured windows, {} cached windows, and {} known good choices. The search examined {} complete drafts, measured {} ordered track pairs, attempted {} musical closings, and pruned {} branches by their objective bound. These are the finalized run statistics.\n",
             search["status"].as_str().unwrap_or("unknown"),
             search["elapsed_seconds"].as_f64().unwrap_or(0.),
@@ -127,6 +127,35 @@ fn search_footer(plan: &MixPlan) -> String {
             count("known_good_choices"), count("complete_drafts_examined"),
             count("measured_ordered_pairs"), count("closing_attempts"), count("bound_pruned")
         );
+        if let Some(termination) = search["termination"].as_str() {
+            markdown.push_str(&format!("\nTermination `{termination}`. "));
+            if let Some(reason) = search["stop_reason"].as_str() {
+                markdown.push_str(&format!("Stop reason `{reason}`. "));
+            }
+            if let Some(objective) = search["best_verified_objective"].as_f64() {
+                markdown.push_str(&format!("Best verified objective {objective:.4}. "));
+            }
+            if let Some(bound) = search["certified_global_upper_bound"].as_f64() {
+                markdown.push_str(&format!(
+                    "Certified global objective upper bound {bound:.4}.\n"
+                ));
+            } else {
+                markdown.push_str("The certified global objective bound is unknown.\n");
+            }
+        }
+        if let Some(closing) = search
+            .get("cp_search")
+            .and_then(|cp| cp.get("closing_search"))
+        {
+            if let (Some(finished), Some(unfinished), Some(unknown)) = (
+                closing["finished_measured_routes"].as_u64(),
+                closing["unfinished_measured_routes"].as_u64(),
+                closing["unknown_measured_routes"].as_u64(),
+            ) {
+                markdown.push_str(&format!("\nWithin the measured closing profile, {finished} routes finished, {unfinished} still have ending or replay work, and {unknown} have an unresolved outcome.\n"));
+            }
+        }
+        return markdown;
     }
     let mut markdown = String::new();
     if let Some(search) = plan.header.extensions.get("lazy_search") {
@@ -432,7 +461,11 @@ mod tests {
             "status":"refinement_budget","elapsed_seconds":480.,"prepared_tracks":73,
             "measured_windows":362,"cached_windows":130,"known_good_choices":883,
             "complete_drafts_examined":45678,"measured_ordered_pairs":188,
-            "closing_attempts":192,"bound_pruned":4
+            "closing_attempts":192,"bound_pruned":4,
+            "termination":"budget_with_incumbent","stop_reason":"wall_clock",
+            "best_verified_objective":-4.916,"certified_global_upper_bound":null,
+            "cp_search":{"closing_search":{"finished_measured_routes":4,
+                "unfinished_measured_routes":5,"unknown_measured_routes":0}}
         });
         plan.header
             .extensions
@@ -448,6 +481,10 @@ mod tests {
             "362 newly measured windows",
             "130 cached windows",
             "883 known good choices",
+            "budget_with_incumbent",
+            "Best verified objective -4.9160",
+            "The certified global objective bound is unknown",
+            "4 routes finished, 5 still have ending or replay work",
         ] {
             assert!(
                 footer.contains(expected),

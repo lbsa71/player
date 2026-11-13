@@ -166,14 +166,23 @@ final class FloatWAVFile {
             }
             guard lastURL != temporaryURL else { throw AudioFailure("Cannot assign a unique WAV filename; the partial file is retained.") }
         }
+        let duration = Double(frames) / Double(rate)
+        let tolerance = RecordingCatalog.boundaryToleranceSeconds
+        let reachedEnd = expectedDurationSeconds.map {
+            observedEndPositionSeconds > track.positionSeconds &&
+            observedEndPositionSeconds >= $0-tolerance &&
+            duration >= $0-tolerance && duration <= $0+tolerance
+        } ?? false
+        let verifiedBoundary = reason == "Observed track change" ||
+            (reason == "Paused or metadata unavailable" && reachedEnd)
         var manifest: [String: Any] = [
             "recordingSchemaVersion": 2, "completionPolicy": "observed-v1",
             "trackID": track.id, "album": track.album, "artist": track.artist, "track": track.name,
             "sampleRate": rate, "channels": 2, "encoding": captureDescription,
-            "frames": frames, "durationSeconds": Double(frames) / Double(rate),
+            "frames": frames, "durationSeconds": duration,
             "observedStartPositionSeconds": track.positionSeconds,
             "observedEndPositionSeconds": observedEndPositionSeconds,
-            "coverageContinuous": coverageContinuous && complete && reason == "Observed track change",
+            "coverageContinuous": coverageContinuous && complete && verifiedBoundary,
             "startedAt": ISO8601DateFormatter().string(from: startedAt),
             "finishedAt": ISO8601DateFormatter().string(from: Date()), "reason": reason,
             "segmentFinalized": complete,

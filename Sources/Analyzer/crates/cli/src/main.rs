@@ -21,7 +21,7 @@ use mixlib_catalog::*;
 use mixlib_types::*;
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Parser)]
@@ -310,6 +310,9 @@ fn main() {
                 println!("{}", serde_json::to_string(&value).unwrap());
             } else {
                 println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            }
+            if value["search"]["stop_reason"] == "cancelled" {
+                std::process::exit(130);
             }
             if value
                 .get("counts")
@@ -870,6 +873,7 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
             measurements,
             seconds,
         } => {
+            let started = Instant::now();
             let mut policy: MixingConfig = store.read("config/mixing.json")?;
             let count = if let Some((document, path)) = &set_document {
                 document.apply(&mut policy, path)?
@@ -911,10 +915,10 @@ fn run(args: &Args, cancel: &Cancellation) -> Result<serde_json::Value> {
                 required_pairs::configure(&mut policy, must_pair, must_pair_mode.as_deref())?;
                 usize::from(tracks.unwrap_or(8))
             };
-            let pool = measured_beam::prepared_pool(&store.read_snapshot())?;
             if let Some(request) = composition::Request::from_policy(&policy)? {
-                duration_search::refine_set(&store, &policy, 12, pool, request, cancel)?
+                duration_search::refine_set(&store, &policy, 12, None, request, started, cancel)?
             } else {
+                let pool = measured_beam::prepared_pool(&store.read_snapshot())?;
                 let plan = lazy_solver::choose(&store, &policy, 12, count, pool, cancel)?;
                 serde_json::json!({"plan":plan})
             }

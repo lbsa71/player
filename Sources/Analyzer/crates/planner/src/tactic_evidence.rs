@@ -232,6 +232,14 @@ fn candidate_facts_cached(
     let cached = [&source_evidence[0].tactic, &source_evidence[1].tactic];
     if let Some(record) = &cached[0] {
         apply_cached_tactic_facts(store, record, placements[0], &bar_frames, &mut a, cancel)?;
+        if timing_basis == TacticTimingBasis::Bars {
+            let scan =
+                crate::phrase_exit::measure(store, record, placements[0], &bar_frames, &a, cancel)?;
+            a.phrase_exit_scan_complete = scan.complete;
+            let mut exits = scan.exits.into_iter();
+            a.phrase_exit = exits.next();
+            a.later_phrase_exits = exits.collect();
+        }
     }
     if let Some(record) = &cached[1] {
         apply_cached_tactic_facts(store, record, placements[1], &bar_frames, &mut b, cancel)?;
@@ -327,9 +335,17 @@ fn candidate_facts_cached(
         pair,
     };
     if let (Some(a), Some(b)) = (&cached[0], &cached[1]) {
-        result.pair.rhythmic_exit =
-            crate::phrase_exit::rhythmic_exit(store, b, placements[1], &result, cancel)?;
+        let scan = crate::phrase_exit::rhythmic_exits(store, b, placements[1], &result, cancel)?;
+        result.pair.rhythmic_exit_scan_complete = scan.complete;
+        let mut exits = scan.exits.into_iter();
+        result.pair.rhythmic_exit = exits.next();
         crate::tactic_pair_evidence::enrich_pair_evidence(a, b, placements, &mut result)?;
+        crate::tactic_pair_evidence::enrich_later_swift_exits(
+            [a, b],
+            placements,
+            &mut result,
+            cancel,
+        )?;
         crate::tactic_pair_evidence::refine_rhythmic_hold(
             store,
             [a, b],
@@ -337,6 +353,25 @@ fn candidate_facts_cached(
             &mut result,
             cancel,
         )?;
+        let mut later = Vec::new();
+        for exit in exits {
+            let mut active = result.clone();
+            active.pair.rhythmic_exit = Some(exit.clone());
+            active.pair.rhythmic_profiles.clear();
+            crate::tactic_pair_evidence::enrich_rhythmic_exit([a, b], placements, &mut active);
+            crate::tactic_pair_evidence::refine_rhythmic_hold(
+                store,
+                [a, b],
+                placements,
+                &mut active,
+                cancel,
+            )?;
+            later.push(crate::tactics::ProfiledRhythmicExit {
+                exit,
+                profiles: active.pair.rhythmic_profiles,
+            });
+        }
+        result.pair.later_rhythmic_exits = later;
         // Assess continuity independently of nonoverlapping gains and bind it
         // to each tactic's actual landing. C01 can land on an earlier attack
         // than a build/drop cut, so one proof cannot promote both locations.
@@ -357,7 +392,13 @@ fn candidate_facts_cached(
             store.source(&snapshots[0].track)?,
             store.source(&snapshots[1].track)?,
         ];
-        for (id, landing) in landings {
+        for (id, landing) in landings.into_iter().filter(|(id, _)| {
+            result
+                .pair
+                .profiles
+                .get(id)
+                .is_some_and(|profile| profile.predicted_peak_dbfs.is_some())
+        }) {
             let landing = landing.clamp(start, end);
             let compatible = if let Some(value) = measured.get(&landing) {
                 *value
@@ -394,6 +435,7 @@ fn candidate_facts_cached(
                 result.pair.cut_band_matches.insert(id);
             }
         }
+        result.pair.cut_band_pcm_checks = measured.len();
         if result.timing_basis == TacticTimingBasis::Bars
             && result.bar_frames.len() <= 3
             && plan.drum_intro.is_none()
@@ -766,6 +808,8 @@ fn passage_facts(
         stem_leakage: None,
         endpoint_reasons: vec![],
         phrase_exit: None,
+        phrase_exit_scan_complete: false,
+        later_phrase_exits: vec![],
         stem_assets: vec![],
         loop_candidates: vec![],
         motif: None,

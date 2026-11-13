@@ -142,6 +142,10 @@ pub struct PassageFacts {
     pub endpoint_reasons: Vec<String>,
     #[serde(default)]
     pub phrase_exit: Option<PhraseExit>,
+    #[serde(default)]
+    pub phrase_exit_scan_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub later_phrase_exits: Vec<PhraseExit>,
     pub stem_assets: Vec<StemAsset>,
     pub loop_candidates: Vec<LoopEvidence>,
     pub motif: Option<MotifEvidence>,
@@ -169,6 +173,8 @@ pub struct SemanticRelation {
 pub struct PairProfile {
     pub method: String,
     pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_rejection: Option<RealizationDecision>,
     pub harmonic_distance: Option<f64>,
     pub lead_conflict: Option<f64>,
     pub complementarity: Option<f64>,
@@ -195,10 +201,16 @@ pub struct PairEvidence {
     pub profiles: BTreeMap<TacticId, PairProfile>,
     #[serde(default)]
     pub swift_profiles: BTreeMap<TacticId, PairProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub later_swift_profiles: BTreeMap<u64, BTreeMap<TacticId, PairProfile>>,
     #[serde(default)]
     pub rhythmic_exit: Option<PhraseExit>,
     #[serde(default)]
+    pub rhythmic_exit_scan_complete: bool,
+    #[serde(default)]
     pub rhythmic_profiles: BTreeMap<TacticId, PairProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub later_rhythmic_exits: Vec<ProfiledRhythmicExit>,
     pub beat_skew_ms: Option<f64>,
     pub harmonic_distance: Option<f64>,
     pub lead_conflict: Option<f64>,
@@ -216,11 +228,32 @@ pub struct PairEvidence {
     /// Absence of overlap or matching key/BPM alone cannot establish this.
     #[serde(default)]
     pub cut_band_matches: BTreeSet<TacticId>,
+    #[serde(default)]
+    pub cut_band_pcm_checks: usize,
     pub semantic_relation: Option<SemanticRelation>,
     pub shared_motif: Option<Vec<PitchNote>>,
     /// Output tempo at every bar anchor, validated against both actual time maps.
     pub shared_bar_bpm: Option<Vec<f64>>,
     pub tempo_maps_validated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfiledRhythmicExit {
+    pub exit: PhraseExit,
+    pub profiles: BTreeMap<TacticId, PairProfile>,
+}
+
+impl PairEvidence {
+    pub fn rhythmic_exit_frames(&self) -> impl Iterator<Item = u64> + '_ {
+        self.rhythmic_exit
+            .iter()
+            .map(|exit| exit.start_frame)
+            .chain(
+                self.later_rhythmic_exits
+                    .iter()
+                    .map(|candidate| candidate.exit.start_frame),
+            )
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateFacts {
@@ -329,11 +362,17 @@ impl TacticPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TacticRejection {
     pub tactic_id: TacticId,
+    #[serde(default)]
+    pub variant: SelectorVariant,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_start_frame: Option<u64>,
     pub reasons: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RankedTactic {
     pub plan: TacticPlan,
+    #[serde(default)]
+    pub variant: SelectorVariant,
     pub score: f64,
     #[serde(default)]
     pub last_resort: bool,
@@ -346,6 +385,125 @@ pub struct RankedTactic {
 pub struct TacticSelection {
     pub candidates: Vec<RankedTactic>,
     pub rejected: Vec<TacticRejection>,
+    #[serde(default)]
+    pub realizations: Vec<TacticRealization>,
+}
+
+pub const SELECTOR_REALIZATION_PROFILE: &str = "pinned-window-selector/7";
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectorVariant {
+    #[default]
+    Standard,
+    Swift,
+    Rhythmic,
+}
+
+impl CandidateFacts {
+    pub fn exit_scan_complete(&self, variant: SelectorVariant) -> bool {
+        match variant {
+            SelectorVariant::Standard => true,
+            SelectorVariant::Swift => self.a.phrase_exit_scan_complete,
+            SelectorVariant::Rhythmic => self.pair.rhythmic_exit_scan_complete,
+        }
+    }
+
+    fn detected_exits(
+        &self,
+        variant: SelectorVariant,
+    ) -> impl Iterator<Item = (&PhraseExit, Option<&BTreeMap<TacticId, PairProfile>>)> {
+        let first = match variant {
+            SelectorVariant::Standard => None,
+            SelectorVariant::Swift => self
+                .a
+                .phrase_exit
+                .as_ref()
+                .map(|exit| (exit, Some(&self.pair.swift_profiles))),
+            SelectorVariant::Rhythmic => self
+                .pair
+                .rhythmic_exit
+                .as_ref()
+                .map(|exit| (exit, Some(&self.pair.rhythmic_profiles))),
+        };
+        let swift = if variant == SelectorVariant::Swift {
+            self.a.later_phrase_exits.as_slice()
+        } else {
+            &[]
+        };
+        let rhythmic = if variant == SelectorVariant::Rhythmic {
+            self.pair.later_rhythmic_exits.as_slice()
+        } else {
+            &[]
+        };
+        first
+            .into_iter()
+            .chain(
+                swift
+                    .iter()
+                    .map(|exit| (exit, self.pair.later_swift_profiles.get(&exit.start_frame))),
+            )
+            .chain(rhythmic.iter().map(|row| (&row.exit, Some(&row.profiles))))
+    }
+
+    pub fn swift_exit_frames(&self) -> impl Iterator<Item = u64> + '_ {
+        self.detected_exits(SelectorVariant::Swift)
+            .map(|(exit, _)| exit.start_frame)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RealizationDecision {
+    Scheduled,
+    DisabledByPolicy,
+    MissingCapability,
+    IncompatibleTimingBasis,
+    IncompatibleBarCount,
+    IncompatibleFixedClock,
+    MeasuredPeakExceeded,
+    MeasuredGridMismatch,
+    MeasuredBuildInterrupted,
+    MeasuredIsolationFailed,
+    MeasuredTonalConflict,
+    MeasuredHoldIncompatible,
+    MeasuredFilterCrowdingInsufficient,
+    MeasuredLandingMismatch,
+    MeasuredBassInactive,
+    MeasuredVocalAbsent,
+    MissingExitEvidence,
+    NoDetectedExit,
+    EligibilityUnresolved,
+    ScheduleUnresolved,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TacticRealization {
+    pub tactic_id: TacticId,
+    pub variant: SelectorVariant,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_start_frame: Option<u64>,
+    pub decision: RealizationDecision,
+}
+
+pub fn selector_realization_domain() -> impl Iterator<Item = (TacticId, SelectorVariant)> {
+    TacticId::ALL
+        .into_iter()
+        .filter(|id| !id.is_modifier())
+        .flat_map(|id| {
+            [
+                SelectorVariant::Standard,
+                SelectorVariant::Swift,
+                SelectorVariant::Rhythmic,
+            ]
+            .into_iter()
+            .filter(move |variant| match variant {
+                SelectorVariant::Standard => true,
+                SelectorVariant::Swift => sustained_tactic(id),
+                SelectorVariant::Rhythmic => id == TacticId::M01,
+            })
+            .map(move |variant| (id, variant))
+        })
 }
 
 fn known(value: Option<f64>, test: impl FnOnce(f64) -> bool) -> bool {
@@ -389,6 +547,13 @@ fn stable_hold(p: &PassageFacts, bars: usize) -> bool {
         && p.bars[..bars]
             .iter()
             .all(|b| known(b.stability, |v| v >= 0.65))
+}
+
+fn measured_unstable_hold(p: &PassageFacts, bars: usize) -> bool {
+    p.bars
+        .iter()
+        .take(bars)
+        .any(|bar| known(bar.stability, |v| v < 0.65))
 }
 // Shared low-band dominance is a ranking risk, not a substitute for measuring
 // collisions in the scheduled band allocation.
@@ -759,15 +924,110 @@ impl CandidateFacts {
     }
 }
 
+fn timing_basis_supported(id: TacticId, timing: TacticTimingBasis) -> bool {
+    use TacticId::*;
+    timing == TacticTimingBasis::Bars
+        || timing == TacticTimingBasis::IndependentPulses && id == C14
+        || matches!(id, S07 | S11 | C04 | E01 | E02 | E03 | E04)
+}
+
+fn disabled_by_policy(id: TacticId, p: &TacticPolicy) -> bool {
+    match id.permission() {
+        TacticPermission::Normal => false,
+        TacticPermission::ExpressiveOptIn => !p.allow_expressive,
+        TacticPermission::EmergencyOnly => p.emergency.is_none(),
+    }
+}
+
+fn supported_bar_count(id: TacticId, bars: usize) -> bool {
+    use TacticId::*;
+    match id {
+        M01 => bars >= 8,
+        M02 => bars >= 5,
+        M03 | S01 | S05 | S06 => bars >= 4,
+        S04 => bars >= 3,
+        S09 => bars >= 2,
+        S02 => bars <= 2,
+        S13 => (4..=8).contains(&bars),
+        _ => true,
+    }
+}
+
+fn needs_steady_bar_clock(id: TacticId) -> bool {
+    matches!(
+        id,
+        TacticId::S12 | TacticId::C05 | TacticId::C06 | TacticId::C13
+    )
+}
+
+fn fixed_window_rejection(
+    id: TacticId,
+    f: &CandidateFacts,
+    p: &TacticPolicy,
+) -> Option<RealizationDecision> {
+    use RealizationDecision::*;
+    if disabled_by_policy(id, p) {
+        Some(DisabledByPolicy)
+    } else if !capabilities(id).is_subset(&p.capabilities) {
+        Some(MissingCapability)
+    } else {
+        window_geometry_rejection(id, f)
+    }
+}
+
+/// These constraints depend only on the pinned output clock and timing basis.
+/// They apply before measuring selected lanes and under any admission policy.
+pub(crate) fn window_geometry_rejection(
+    id: TacticId,
+    f: &CandidateFacts,
+) -> Option<RealizationDecision> {
+    use RealizationDecision::*;
+    if !timing_basis_supported(id, f.timing_basis) {
+        Some(IncompatibleTimingBasis)
+    } else if !supported_bar_count(id, f.bar_frames.len() - 1) {
+        Some(IncompatibleBarCount)
+    } else if needs_steady_bar_clock(id) && !steady_bar_clock(f) {
+        Some(IncompatibleFixedClock)
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct Eligibility {
+    reasons: Vec<String>,
+    proven: Option<RealizationDecision>,
+}
+
+impl Eligibility {
+    fn need(&mut self, ok: bool, why: &str) {
+        if !ok {
+            self.reasons.push(why.into());
+        }
+    }
+
+    fn measured(
+        &mut self,
+        ok: bool,
+        witnessed_failure: bool,
+        decision: RealizationDecision,
+        why: &str,
+    ) {
+        self.need(ok, why);
+        if !ok && witnessed_failure {
+            self.proven.get_or_insert(decision);
+        }
+    }
+}
+
 fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String> {
+    assess_eligibility(id, f, p).reasons
+}
+
+fn assess_eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Eligibility {
     use TacticId::*;
     use TacticRole as R;
-    let mut out = vec![];
-    let mut need = |ok: bool, why: &str| {
-        if !ok {
-            out.push(why.into());
-        }
-    };
+    let mut out = Eligibility::default();
     let start = f.bar_frames[0];
     let end = *f.bar_frames.last().unwrap();
     let bars = f.bar_frames.len() - 1;
@@ -784,49 +1044,58 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         f.b.arrival_frame.unwrap_or(start)
     };
     let cut = matches!(id, C01 | C02 | C03 | C04 | C08);
-    need(
+    out.need(
         id.permission() != TacticPermission::ExpressiveOptIn || p.allow_expressive,
         "expressive tactic is not enabled",
     );
-    need(
+    out.need(
         id.permission() != TacticPermission::EmergencyOnly || p.emergency.is_some(),
         "offline incompatibility is not an emergency",
     );
-    need(
+    out.need(
         capabilities(id).is_subset(&p.capabilities),
         "required renderer capability is unavailable",
     );
-    need(
+    out.measured(
         known(f.pair.predicted_peak_dbfs, |v| v <= p.max_peak_dbfs),
+        known(f.pair.predicted_peak_dbfs, |v| v > p.max_peak_dbfs),
+        RealizationDecision::MeasuredPeakExceeded,
         "composite headroom is unknown or insufficient",
     );
     let pulse_free = matches!(id, S07 | S11 | C04 | C14 | E01 | E02 | E03 | E04);
-    if matches!(id, S12 | C05 | C06 | C13) {
-        need(steady_bar_clock(f),
+    if needs_steady_bar_clock(id) {
+        out.need(steady_bar_clock(f),
             "fixed-period loop/gate schedule requires a steady output bar clock; D01 is unsupported");
     }
-    need(
-        f.timing_basis == TacticTimingBasis::Bars
-            || f.timing_basis == TacticTimingBasis::IndependentPulses && id == C14
-            || matches!(id, S07 | S11 | C04 | E01 | E02 | E03 | E04),
+    out.need(
+        timing_basis_supported(id, f.timing_basis),
         "unmetered structure cannot support this rhythmic tactic",
     );
     if !pulse_free {
-        need(
+        let grid_mismatch = [&f.a, &f.b]
+            .into_iter()
+            .flat_map(|deck| &deck.bars)
+            .any(|bar| {
+                known(bar.grid_score, |score| score < 0.5)
+                    || bar.beats_per_bar.is_some_and(|meter| meter < 2)
+            });
+        out.measured(
             grid(&f.a)
                 && grid(&f.b)
                 && known(f.pair.beat_skew_ms, |v| v >= 0. && v <= p.max_beat_skew_ms),
+            grid_mismatch || known(f.pair.beat_skew_ms, |v| v < 0. || v > p.max_beat_skew_ms),
+            RealizationDecision::MeasuredGridMismatch,
             "rhythmic overlap is not grid-locked",
         );
     }
     if matches!(id, M01 | M02 | M03 | M04 | M05 | M06 | S05) {
-        need(
+        out.need(
             boundary(&f.a, start, true, p),
             "mashup/drum entry must follow a supported complete outgoing phrase",
         );
     }
     if id.permission() != TacticPermission::EmergencyOnly {
-        need(
+        out.measured(
             f.a.build_release_frame.is_none_or(|release| {
                 release <= start
                     || sustained_tactic(id)
@@ -837,6 +1106,16 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                         && landing >= release
                         && release < end
             }),
+            f.a.build_release_frame.is_some_and(|release| {
+                release >= end
+                    || !matches!(id, C01 | C02 | C03 | C04 | C07)
+                    || if id == C01 {
+                        phrase_cut_landing(f).is_some()
+                    } else {
+                        f.b.arrival_frame.is_some()
+                    }
+            }),
+            RealizationDecision::MeasuredBuildInterrupted,
             "outgoing buildup must reach its measured release before the transfer starts",
         );
         let a_exit = if cut { landing } else { end };
@@ -844,7 +1123,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         let local_cut = id == C01
             && f.bar_frames.contains(&landing)
             && crate::vocal_audibility::quiet_landing(f, landing);
-        need(
+        out.need(
             id == S13
                 || local_cut
                 || boundary(&f.a, a_exit, false, p) && boundary(&f.b, b_entry, true, p),
@@ -852,8 +1131,22 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         );
     }
     if needs_stems(id) {
-        need(
-            stems(&f.a, p, &all_lanes()) && stems(&f.b, p, &all_lanes()),
+        let lanes = all_lanes();
+        let failed = [&f.a, &f.b].into_iter().any(|deck| {
+            deck.stems.as_ref().is_some_and(|s| {
+                (deck.stem_leakage.is_none()
+                    && known(Some(s.max_vocal_leakage_db), |v| v > p.max_vocal_leakage_db))
+                    || known(Some(s.reconstruction_error), |v| {
+                        v > p.max_reconstruction_error
+                    })
+                    || known(Some(s.artifact_score), |v| v > p.max_artifact_score)
+                    || lanes.iter().any(|lane| !s.available.contains(lane))
+            })
+        });
+        out.measured(
+            stems(&f.a, p, &lanes) && stems(&f.b, p, &lanes),
+            failed,
+            RealizationDecision::MeasuredIsolationFailed,
             "required stem isolation or leakage evidence failed",
         );
     }
@@ -878,8 +1171,11 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             | C07
             | C11
     ) {
-        need(
+        out.measured(
             tonal(f, p),
+            known(f.pair.harmonic_distance, |v| v > p.max_harmonic_distance)
+                || known(f.pair.lead_conflict, |v| v > p.max_lead_conflict),
+            RealizationDecision::MeasuredTonalConflict,
             "selected pitched layers have unknown or incompatible harmony/lead occupancy",
         );
     }
@@ -887,85 +1183,106 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
         .as_ref()
         .is_some_and(|e| e.kind == PhraseExitKind::RhythmicHandoff)
     {
-        need(
+        out.measured(
             id == M01
                 && known(f.pair.complementarity, |v| v >= 0.65)
                 && known(f.pair.harmonic_distance, |v| v <= 0.30)
                 && known(f.pair.lead_conflict, |v| v <= 0.20),
+            known(f.pair.complementarity, |v| v < 0.65)
+                || known(f.pair.harmonic_distance, |v| v > 0.30)
+                || known(f.pair.lead_conflict, |v| v > 0.20),
+            RealizationDecision::MeasuredHoldIncompatible,
             "rhythmic exit needs a high-quality dense combination through its extended hold",
         );
     }
     match id {
         M01 => {
-            need(
+            out.need(
                 !f.a.endpoint_reasons.is_empty() || !f.b.endpoint_reasons.is_empty(),
                 "dense mashup needs a measured musical endpoint; a seed duration is not an ending",
             );
-            need(
-                bars >= 8,
+            out.need(
+                supported_bar_count(id, bars),
                 "dense mashup needs at least six hold bars and a two-bar resolution",
             );
-            need(
+            out.need(
                 role(&f.a, &[R::SustainedTexture, R::VocalForeground, R::Mixed])
                     && role(&f.b, &[R::SteadyGroove]),
                 "dense mashup needs a retained bed and incoming groove",
             );
-            need(
-                stable_hold(&f.a, held_bars(id, f))
-                    && stable_hold(&f.b, held_bars(id, f))
-                    && complementary(f),
+            let held = held_bars(id, f);
+            let unstable = measured_unstable_hold(&f.a, held) || measured_unstable_hold(&f.b, held);
+            out.measured(
+                stable_hold(&f.a, held) && stable_hold(&f.b, held) && complementary(f),
+                unstable || known(f.pair.complementarity, |v| v < 0.65),
+                RealizationDecision::MeasuredHoldIncompatible,
                 "mashup layers do not remain complementary through the full window",
             );
-            need(
-                f.pair.selected_composite_density.as_ref().is_some_and(|v| {
+            let density = f
+                .pair
+                .selected_composite_density
+                .as_ref()
+                .filter(|v| {
                     v.len() == bars
                         && v.len() >= 6
                         && v.iter().all(|x| x.is_finite() && (0.0..=1.).contains(x))
-                        && v[..held_bars(id, f)].iter().all(|x| *x >= 0.62)
-                }),
+                })
+                .and_then(|v| v.get(..held));
+            out.measured(
+                density.is_some_and(|v| v.iter().all(|x| *x >= 0.62)),
+                density.is_some_and(|v| v.iter().any(|x| *x < 0.62)),
+                RealizationDecision::MeasuredHoldIncompatible,
                 "selected-layer density is unknown or not high through the hold",
             );
         }
         M02 => {
-            need(
-                bars >= 5,
+            out.need(
+                supported_bar_count(id, bars),
                 "brisk mashup needs at least four hold bars plus its exit",
             );
-            need(
+            out.need(
                 role(&f.a, &[R::SustainedTexture, R::LowPercussionBed])
                     && role(&f.b, &[R::SteadyGroove]),
                 "spacious mashup requires a texture and stable incoming drums",
             );
-            need(
-                stable_hold(&f.a, held_bars(id, f))
-                    && stable_hold(&f.b, held_bars(id, f))
-                    && complementary(f),
+            let held = held_bars(id, f);
+            out.measured(
+                stable_hold(&f.a, held) && stable_hold(&f.b, held) && complementary(f),
+                measured_unstable_hold(&f.a, held)
+                    || measured_unstable_hold(&f.b, held)
+                    || known(f.pair.complementarity, |v| v < 0.65),
+                RealizationDecision::MeasuredHoldIncompatible,
                 "mashup does not remain stable/complementary",
             );
-            need(
+            out.need(
                 f.pair.retained_bed_density.as_ref().is_some_and(|v| {
                     v.len() == bars && v.iter().all(|x| x.is_finite() && *x >= 0. && *x < 0.62)
                 }),
                 "sparse selected-layer evidence is missing",
             );
-            need(
+            out.measured(
                 f.b.arrival_frame
                     .is_some_and(|v| v >= f.bar_frames[bars - 1] && v <= end),
+                f.b.arrival_frame
+                    .is_some_and(|v| v < f.bar_frames[bars - 1] || v > end),
+                RealizationDecision::MeasuredLandingMismatch,
                 "brisk resolution needs a measured incoming arrival",
             );
         }
         M03 => {
-            need(
+            out.measured(
                 f.a.vocal_phrases.as_ref().is_some_and(|v| !v.is_empty()) && complementary(f),
+                f.a.vocal_phrases.as_ref().is_some_and(Vec::is_empty),
+                RealizationDecision::MeasuredVocalAbsent,
                 "acapella requires a complete vocal and complementary backing",
             );
-            need(
-                bars >= 4,
+            out.need(
+                supported_bar_count(id, bars),
                 "vocal carryover needs a complete four-bar minimum window",
             );
         }
         M04 => {
-            need(
+            out.need(
                 f.a.motif.as_ref().is_some_and(|m| {
                     matches!(m.lane, StemLane::Other | StemLane::Bass)
                         && m.isolation_score >= 0.8
@@ -975,23 +1292,36 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         M05 => {
-            need(
+            out.need(
                 role(&f.a, &[R::Drop, R::Chorus])
                     && role(&f.b, &[R::Drop, R::Chorus])
                     && complementary(f),
                 "double drop requires complementary measured arrivals",
             );
-            need(
+            out.measured(
                 f.a.arrival_frame == Some(start) && f.b.arrival_frame == Some(start),
+                [f.a.arrival_frame, f.b.arrival_frame]
+                    .into_iter()
+                    .flatten()
+                    .any(|frame| frame != start),
+                RealizationDecision::MeasuredLandingMismatch,
                 "drop arrivals must coincide at entry",
             );
         }
         M06 => {
-            need(f.pair.semantic_relation.as_ref().is_some_and(|s|s.confidence_margin>=0.25 && !s.evidence.is_empty() && !s.relation.is_empty()) && f.a.vocal_phrases.as_ref().is_some_and(|v|!v.is_empty()) && f.b.vocal_phrases.as_ref().is_some_and(|v|!v.is_empty()),"call-and-response needs complete answering phrases and verified semantic/musical relation");
+            let vocals = [&f.a.vocal_phrases, &f.b.vocal_phrases];
+            out.measured(
+                f.pair.semantic_relation.as_ref().is_some_and(|s| {
+                    s.confidence_margin >= 0.25 && !s.evidence.is_empty() && !s.relation.is_empty()
+                }) && vocals.iter().all(|v| v.as_ref().is_some_and(|v| !v.is_empty())),
+                vocals.iter().any(|v| v.as_ref().is_some_and(Vec::is_empty)),
+                RealizationDecision::MeasuredVocalAbsent,
+                "call-and-response needs complete answering phrases and verified semantic/musical relation",
+            );
         }
         S01 => {
-            need(
-                bars >= 4
+            out.need(
+                supported_bar_count(id, bars)
                     && role(&f.a, &[R::Outro, R::SustainedTexture])
                     && role(&f.b, &[R::Intro, R::LowPercussionBed])
                     && stable(&f.a)
@@ -1000,54 +1330,64 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         S02 => {
-            need(bars <= 2, "short crossfade is limited to one or two bars");
+            out.need(
+                supported_bar_count(id, bars),
+                "short crossfade is limited to one or two bars",
+            );
         }
         S03 => {
-            need(
-                f.a.bars
-                    .iter()
-                    .all(|b| known(b.low_occupancy, |v| v >= 0.4))
-                    && f.b
-                        .bars
-                        .iter()
-                        .all(|b| known(b.low_occupancy, |v| v >= 0.4)),
+            let mut levels = [&f.a, &f.b].into_iter().flat_map(|deck| &deck.bars);
+            out.measured(
+                levels.clone().all(|b| known(b.low_occupancy, |v| v >= 0.4)),
+                levels.any(|b| known(b.low_occupancy, |v| v < 0.4)),
+                RealizationDecision::MeasuredBassInactive,
                 "bass swap requires known active low-end on both sides",
             );
         }
         S04 => {
             let exchange = band_exchange_order(f);
-            need(
-                bars >= 3 && exchange.is_some(),
+            out.need(
+                supported_bar_count(id, bars) && exchange.is_some(),
                 "three-band exchange needs three measured bars and complete low/mid/high occupancy",
             );
-            need(
+            out.need(
                 complementary(f),
                 "band exchange requires compatible remaining upper layers",
             );
         }
         S05 => {
-            need(
-                bars >= 4
+            let held = held_bars(id, f);
+            out.measured(
+                supported_bar_count(id, bars)
                     && role(&f.a, &[R::LowPercussionBed, R::Breakdown])
                     && role(&f.b, &[R::SteadyGroove])
-                    && stable_hold(&f.b, held_bars(id, f)),
+                    && stable_hold(&f.b, held),
+                measured_unstable_hold(&f.b, held),
+                RealizationDecision::MeasuredHoldIncompatible,
                 "drum linger requires a quiet outgoing bed and stable incoming groove",
             );
         }
         S06 => {
-            need(
+            out.measured(
                 role(&f.a, &[R::DrumReturn])
                     && f.a.arrival_frame == Some(start)
                     && boundary(&f.a, start, true, p),
+                f.a.arrival_frame.is_some_and(|v| v != start),
+                RealizationDecision::MeasuredLandingMismatch,
                 "drum replacement must coincide with A's supported return",
             );
-            need(
-                bars >= 4 && role(&f.b, &[R::SteadyGroove]) && stable_hold(&f.b, held_bars(id, f)),
+            let held = held_bars(id, f);
+            out.measured(
+                supported_bar_count(id, bars)
+                    && role(&f.b, &[R::SteadyGroove])
+                    && stable_hold(&f.b, held),
+                measured_unstable_hold(&f.b, held),
+                RealizationDecision::MeasuredHoldIncompatible,
                 "drum replacement needs a stable B groove",
             );
         }
         S07 => {
-            need(
+            out.need(
                 role(&f.a, &[R::Breakdown, R::Outro, R::SustainedTexture])
                     && role(&f.b, &[R::Intro, R::Breakdown])
                     && (role(&f.a, &[R::LowPercussionBed, R::Rest])
@@ -1064,44 +1404,49 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                     a.min(b) >= 0.5
                 }
             });
-            need(
+            out.measured(
                 crowded,
+                a.is_some() && b.is_some(),
+                RealizationDecision::MeasuredFilterCrowdingInsufficient,
                 "filter transfer requires measured crowded frequency occupancy",
             );
         }
         S09 => {
-            need(
-                bars >= 2 && known(f.pair.lead_conflict, |v| v <= p.max_lead_conflict),
+            out.measured(
+                supported_bar_count(id, bars)
+                    && known(f.pair.lead_conflict, |v| v <= p.max_lead_conflict),
+                known(f.pair.lead_conflict, |v| v > p.max_lead_conflict),
+                RealizationDecision::MeasuredTonalConflict,
                 "echo requires a clean ending and room for its tail",
             );
         }
         S10 => {
-            need(
+            out.need(
                 loop_candidate(&f.a, p).is_some_and(|l| l.vocal_free) && complementary(f),
                 "freeze requires a safe nonvocal capture and space in B",
             );
         }
         S11 => {
-            need(
+            out.need(
                 role(&f.a, &[R::SustainedTexture, R::LowPercussionBed])
                     && role(&f.b, &[R::Intro, R::Breakdown, R::Rest]),
                 "reverb bridge requires an isolated texture and spacious B entry",
             );
         }
         S12 => {
-            need(
+            out.need(
                 loop_candidate(&f.a, p).is_some() || loop_candidate(&f.b, p).is_some(),
                 "no verified repeatable intro/outro span",
             );
         }
         S13 => {
-            need(
-                (4..=8).contains(&bars),
+            out.need(
+                supported_bar_count(id, bars),
                 "baseline gradual crossfade requires four to eight measured bars",
             );
         }
         D01 => {
-            need(
+            out.need(
                 f.pair.tempo_maps_validated
                     && f.pair.shared_bar_bpm.as_ref().is_some_and(|v| {
                         v.len() == f.bar_frames.len()
@@ -1112,7 +1457,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         D02 => {
-            need(
+            out.need(
                 known(f.pair.pulse_ratio, |r| {
                     (r - 2.).abs() < 0.02 || (r - 0.5).abs() < 0.01
                 }) && known(f.pair.groove_similarity, |v| v >= 0.8)
@@ -1121,13 +1466,13 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         C01 => {
-            need(
+            out.need(
                 phrase_cut_landing(f).is_some_and(|v| v >= start && v <= end),
                 "phrase cut needs a supported incoming attack",
             );
         }
         C02 => {
-            need(
+            out.need(
                 role(&f.a, &[R::Build, R::Drop])
                     && role(&f.b, &[R::Drop])
                     && f.b.arrival_frame.is_some(),
@@ -1135,7 +1480,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         C03 => {
-            need(
+            out.need(
                 role(&f.a, &[R::Build])
                     && role(&f.b, &[R::Drop])
                     && f.a.build_release_frame.is_some()
@@ -1145,28 +1490,32 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         C04 => {
-            need(
+            out.measured(
                 f.a.natural_end_frame == Some(landing)
                     && role(&f.b, &[R::Intro])
                     && f.b.arrival_frame.is_some(),
+                f.a.natural_end_frame
+                    .zip(f.b.arrival_frame)
+                    .is_some_and(|(end, arrival)| end != arrival),
+                RealizationDecision::MeasuredLandingMismatch,
                 "end-to-end requires a measured natural ending and intentional start",
             );
         }
         C05 => {
-            need(
+            out.need(
                 loop_candidate(&f.a, p).is_some_and(|l| l.vocal_free)
                     && f.b.arrival_frame.is_some_and(|v| v > start && v <= end),
                 "roll requires a clean rhythmic capture and later landing",
             );
         }
         C06 => {
-            need(
+            out.need(
                 complementary(f) && vocal_free(&f.a) && vocal_free(&f.b),
                 "transform cuts require complementary vocal-free rhythmic gaps",
             );
         }
         C07 => {
-            need(
+            out.need(
                 f.a.version_identity.is_some()
                     && f.a.version_identity == f.b.version_identity
                     && f.pair.shared_motif.is_some(),
@@ -1174,7 +1523,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         C08 => {
-            need(
+            out.need(
                 f.a.motif.as_ref().is_some_and(|m| {
                     m.isolation_score >= 0.9
                         && m.transcription_margin >= 0.35
@@ -1187,14 +1536,14 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         C09 => {
-            need(
+            out.need(
                 role(&f.a, &[R::Build, R::Rest])
                     && f.b.arrival_frame.is_some_and(|v| v > start && v <= end),
                 "riser requires a supported build/gap and measured landing",
             );
         }
         C10 => {
-            need(
+            out.need(
                 loop_candidate(&f.a, p).is_some_and(|l| l.vocal_free)
                     && known(f.pair.lead_conflict, |v| v <= p.max_lead_conflict)
                     && f.b.arrival_frame.is_some_and(|v| v > start && v <= end),
@@ -1202,7 +1551,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         C11 => {
-            need(
+            out.need(
                 f.b.motif.as_ref().is_some_and(|m| m.isolation_score >= 0.8)
                     && complementary(f)
                     && f.b.arrival_frame.is_some_and(|v| v > start && v <= end),
@@ -1210,21 +1559,21 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
             );
         }
         C12 => {
-            need(
+            out.need(
                 loop_candidate(&f.a, p).is_some_and(|l| l.vocal_free)
                     && f.b.arrival_frame.is_some_and(|v| v > start && v <= end),
                 "reverse flourish requires dispensable nonvocal capture and exact return",
             );
         }
         C13 => {
-            need(
+            out.need(
                 loop_candidate_for(&f.b, p, StemLane::Drums).is_some_and(|l| l.vocal_free)
                     && role(&f.a, &[R::SteadyGroove])
                     && stable(&f.a)
                     && complementary(f),
                 "polyrhythm needs clean incoming percussion and uncluttered steady A",
             );
-            need(
+            out.need(
                 f.a.bars
                     .iter()
                     .map(|b| b.beats_per_bar.unwrap_or(0) as usize)
@@ -1233,14 +1582,14 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                     == 0,
                 "polyrhythm window must end at its common pulse boundary",
             );
-            need(polyrhythm_period(f).is_some(),
+            out.need(polyrhythm_period(f).is_some(),
                 "fixed polyrhythm requires steady mapped pulses and whole output cycles at its landing");
         }
         C14 => {
-            need(grid(&f.a) && grid(&f.b) && loop_candidate_for(&f.a,p,StemLane::Drums).is_some_and(|l|l.vocal_free) && known(f.pair.target_tempo_ratio,|r|(0.25..=4.).contains(&r) && (r-1.).abs()>0.06) && f.b.arrival_frame.is_some_and(|v|v>start && v<=end),"percussion tempo bridge requires reliable separate pulses, bounded loop move and prepared arrival");
+            out.need(grid(&f.a) && grid(&f.b) && loop_candidate_for(&f.a,p,StemLane::Drums).is_some_and(|l|l.vocal_free) && known(f.pair.target_tempo_ratio,|r|(0.25..=4.).contains(&r) && (r-1.).abs()>0.06) && f.b.arrival_frame.is_some_and(|v|v>start && v<=end),"percussion tempo bridge requires reliable separate pulses, bounded loop move and prepared arrival");
         }
         E01 | E02 | E03 | E04 => {
-            need(
+            out.need(
                 p.emergency.as_ref().is_some_and(|e| {
                     e.next_source_verified
                         && !e.failed_condition.is_empty()
@@ -1249,7 +1598,7 @@ fn eligibility(id: TacticId, f: &CandidateFacts, p: &TacticPolicy) -> Vec<String
                 "recovery evidence or verified next source is missing",
             );
             if id != E04 {
-                need(
+                out.need(
                     f.a.ready_buffer_frames > 0
                         && p.emergency
                             .as_ref()
@@ -2883,68 +3232,65 @@ pub fn select_tactics(f: &CandidateFacts, p: &TacticPolicy) -> Result<TacticSele
     f.validate()?;
     let mut candidates = vec![];
     let mut rejected = vec![];
-    for id in TacticId::ALL {
-        if id.is_modifier() {
-            continue;
-        }
-        let mut variants = vec![f.clone()];
-        if sustained_tactic(id)
-            && f.a.phrase_exit.is_some()
-            && f.pair.swift_profiles.contains_key(&id)
-        {
-            let mut swift = f.clone();
-            swift.phrase_exit = f.a.phrase_exit.clone();
-            swift.pair.profiles = f.pair.swift_profiles.clone();
-            variants.push(swift);
-        }
-        if id == TacticId::M01
-            && f.pair.rhythmic_exit.is_some()
-            && f.pair.rhythmic_profiles.contains_key(&id)
-        {
-            let mut rhythmic = f.clone();
-            rhythmic.phrase_exit = f.pair.rhythmic_exit.clone();
-            rhythmic.pair.profiles = f.pair.rhythmic_profiles.clone();
-            variants.push(rhythmic);
-        }
-        for variant in &variants {
-            let f = variant;
-            let specialized = specialized_facts(id, f);
-            let mut reasons = eligibility(id, &specialized, p);
-            if f.phrase_exit.is_some() && !reasons.is_empty() {
-                reasons = reasons
-                    .into_iter()
-                    .map(|r| format!("swift exit: {r}"))
-                    .collect();
-                if let Some(profile) = f.pair.profiles.get(&id) {
-                    reasons.extend(
-                        profile
-                            .evidence
-                            .iter()
-                            .filter(|r| r.starts_with("swift exit:"))
-                            .cloned(),
-                    );
-                }
-            }
-            if !reasons.is_empty() {
-                rejected.push(TacticRejection {
-                    tactic_id: id,
-                    reasons,
-                });
+    let mut realizations = vec![];
+    for (id, variant) in selector_realization_domain() {
+        let fixed = fixed_window_rejection(id, f, p);
+        let mut exits = f.detected_exits(variant).peekable();
+        let no_exits = exits.peek().is_none();
+        let scan_complete = f.exit_scan_complete(variant);
+        if no_exits || !scan_complete {
+            let decision = if variant == SelectorVariant::Standard {
+                select_realization(id, variant, f, p, fixed, &mut candidates, &mut rejected)
+            } else {
+                fixed.unwrap_or(if scan_complete {
+                    RealizationDecision::NoDetectedExit
+                } else {
+                    RealizationDecision::MissingExitEvidence
+                })
+            };
+            realizations.push(TacticRealization {
+                tactic_id: id,
+                variant,
+                exit_start_frame: None,
+                decision,
+            });
+            if no_exits {
                 continue;
             }
-            match schedule_tactic(id, f, p) {
-                Ok(plan) => candidates.push(RankedTactic {
-                    plan,
-                    score: preference(id, &specialized, p),
-                    last_resort: last_resort(id, &specialized, p),
-                    dense_quality_seconds: dense_quality_seconds(id, &specialized),
-                    handoff_quality_seconds: handoff_quality_seconds(id, &specialized),
-                }),
-                Err(e) => rejected.push(TacticRejection {
-                    tactic_id: id,
-                    reasons: vec![format!("{}: {}", e.code, e.message)],
-                }),
-            }
+        }
+        let mut active = f.clone();
+        active.a.later_phrase_exits.clear();
+        active.pair.later_swift_profiles.clear();
+        active.pair.later_rhythmic_exits.clear();
+        for (exit, profiles) in exits {
+            let decision = if let Some(profiles) = profiles.filter(|rows| rows.contains_key(&id)) {
+                match variant {
+                    SelectorVariant::Swift => active.a.phrase_exit = Some(exit.clone()),
+                    SelectorVariant::Rhythmic => active.pair.rhythmic_exit = Some(exit.clone()),
+                    SelectorVariant::Standard => {
+                        unreachable!("ordinary resolution has no exit variant")
+                    }
+                }
+                active.phrase_exit = Some(exit.clone());
+                active.pair.profiles.clone_from(profiles);
+                select_realization(
+                    id,
+                    variant,
+                    &active,
+                    p,
+                    fixed,
+                    &mut candidates,
+                    &mut rejected,
+                )
+            } else {
+                fixed.unwrap_or(RealizationDecision::MissingExitEvidence)
+            };
+            realizations.push(TacticRealization {
+                tactic_id: id,
+                variant,
+                exit_start_frame: Some(exit.start_frame),
+                decision,
+            });
         }
     }
     candidates.sort_by(|a, b| {
@@ -2957,7 +3303,94 @@ pub fn select_tactics(f: &CandidateFacts, p: &TacticPolicy) -> Result<TacticSele
     Ok(TacticSelection {
         candidates,
         rejected,
+        realizations,
     })
+}
+
+fn select_realization(
+    id: TacticId,
+    variant: SelectorVariant,
+    f: &CandidateFacts,
+    p: &TacticPolicy,
+    fixed: Option<RealizationDecision>,
+    candidates: &mut Vec<RankedTactic>,
+    rejected: &mut Vec<TacticRejection>,
+) -> RealizationDecision {
+    let exit_start_frame = f
+        .phrase_exit
+        .as_ref()
+        .map(|exit| exit.start_frame)
+        .filter(|_| variant != SelectorVariant::Standard);
+    if let Some(decision) = fixed {
+        use RealizationDecision::*;
+        let reason = match decision {
+            DisabledByPolicy => "tactic is disabled by admission policy",
+            MissingCapability => "required renderer capability is unavailable",
+            IncompatibleTimingBasis => "window timing basis cannot support this tactic",
+            IncompatibleBarCount => "window bar count cannot support this tactic",
+            IncompatibleFixedClock => "fixed-period schedule requires a steady output clock",
+            _ => unreachable!("only fixed window rules can bypass eligibility"),
+        };
+        rejected.push(TacticRejection {
+            tactic_id: id,
+            variant,
+            exit_start_frame,
+            reasons: vec![reason.into()],
+        });
+        return decision;
+    }
+    let specialized = specialized_facts(id, f);
+    let Eligibility {
+        mut reasons,
+        proven,
+    } = assess_eligibility(id, &specialized, p);
+    if f.phrase_exit.is_some() && !reasons.is_empty() {
+        reasons = reasons
+            .into_iter()
+            .map(|r| format!("swift exit: {r}"))
+            .collect();
+        if let Some(profile) = f.pair.profiles.get(&id) {
+            reasons.extend(
+                profile
+                    .evidence
+                    .iter()
+                    .filter(|r| r.starts_with("swift exit:"))
+                    .cloned(),
+            );
+        }
+    }
+    if !reasons.is_empty() {
+        rejected.push(TacticRejection {
+            tactic_id: id,
+            variant,
+            exit_start_frame,
+            reasons,
+        });
+        proven.unwrap_or(RealizationDecision::EligibilityUnresolved)
+    } else {
+        match schedule_tactic(id, f, p) {
+            Ok(plan) => {
+                candidates.push(RankedTactic {
+                    plan,
+                    variant,
+                    score: preference(id, &specialized, p),
+                    last_resort: last_resort(id, &specialized, p),
+                    dense_quality_seconds: dense_quality_seconds(id, &specialized),
+                    handoff_quality_seconds: handoff_quality_seconds(id, &specialized),
+                });
+                RealizationDecision::Scheduled
+            }
+            Err(e) => {
+                rejected.push(TacticRejection {
+                    tactic_id: id,
+                    variant,
+                    exit_start_frame,
+                    reasons: vec![format!("{}: {}", e.code, e.message)],
+                });
+                RealizationDecision::ScheduleUnresolved
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2965,6 +3398,139 @@ pub(crate) mod tests {
     use super::*;
     const RATE: u32 = 48000;
     const BAR: u64 = 96000;
+
+    #[test]
+    fn selector_partition_separates_proven_blockers_from_missing_evidence() {
+        use RealizationDecision::*;
+        use SelectorVariant::*;
+        let mut f = facts(8);
+        let p = TacticPolicy {
+            allow_expressive: false,
+            ..policy()
+        };
+        let check = |facts: &CandidateFacts, tactic, variant| {
+            let result = select_tactics(facts, &p).unwrap();
+            assert_eq!(result.realizations.len(), 42);
+            result
+                .realizations
+                .iter()
+                .find(|row| row.tactic_id == tactic && row.variant == variant)
+                .unwrap()
+                .decision
+        };
+        f.pair.predicted_peak_dbfs = None;
+        assert_eq!(check(&f, TacticId::S13, Standard), EligibilityUnresolved);
+        assert_eq!(check(&f, TacticId::M01, Swift), MissingExitEvidence);
+        assert_eq!(check(&f, TacticId::M01, Rhythmic), MissingExitEvidence);
+        assert_eq!(check(&f, TacticId::C08, Standard), DisabledByPolicy);
+        assert_eq!(check(&facts(4), TacticId::M01, Swift), IncompatibleBarCount);
+        f.pair.predicted_peak_dbfs = Some(p.max_peak_dbfs + 1.);
+        assert_eq!(check(&f, TacticId::S13, Standard), MeasuredPeakExceeded);
+        f.a.phrase_exit_scan_complete = true;
+        f.pair.rhythmic_exit_scan_complete = true;
+        assert_eq!(check(&f, TacticId::M01, Swift), NoDetectedExit);
+        assert_eq!(check(&f, TacticId::M01, Rhythmic), NoDetectedExit);
+    }
+
+    #[test]
+    fn measured_gate_failures_preserve_the_distinction_from_unknown_facts() {
+        use RealizationDecision::*;
+        let p = policy();
+        let mut f = dense();
+        let proof = |id, f: &CandidateFacts| assess_eligibility(id, f, &p).proven;
+        f.pair.lead_conflict = None;
+        f.pair.harmonic_distance = Some(p.max_harmonic_distance + 0.1);
+        assert_eq!(proof(TacticId::M01, &f), Some(MeasuredTonalConflict));
+        f.pair.harmonic_distance = None;
+        assert_eq!(proof(TacticId::M01, &f), None);
+        f.a.bars[0].grid_score = Some(0.3);
+        assert_eq!(proof(TacticId::M01, &f), Some(MeasuredGridMismatch));
+        f.a.bars[0].grid_score = None;
+        assert_eq!(proof(TacticId::M01, &f), None);
+        f.b.bars[0].stability = Some(0.4);
+        assert_eq!(proof(TacticId::S05, &f), Some(MeasuredHoldIncompatible));
+        f.b.bars[0].stability = None;
+        assert_eq!(proof(TacticId::S05, &f), None);
+        f.b.stems.as_mut().unwrap().reconstruction_error = p.max_reconstruction_error + 0.01;
+        assert_eq!(proof(TacticId::M01, &f), Some(MeasuredIsolationFailed));
+        f.b.stems = None;
+        assert_eq!(proof(TacticId::M01, &f), None);
+
+        f.b.arrival_frame = None;
+        f.b.cut_attacks.clear();
+        f.a.build_release_frame = Some(BAR);
+        assert_eq!(proof(TacticId::M01, &f), Some(MeasuredBuildInterrupted));
+        assert_eq!(proof(TacticId::C01, &f), None);
+        f.a.build_release_frame = f.bar_frames.last().copied();
+        assert_eq!(proof(TacticId::C01, &f), Some(MeasuredBuildInterrupted));
+    }
+
+    #[test]
+    fn fixed_window_rules_resolve_even_when_pair_profiling_is_missing() {
+        use RealizationDecision::*;
+        use TacticId::*;
+        for (bars, excluded) in [
+            (1, vec![M01, M02, M03, S01, S04, S05, S06, S09, S13]),
+            (4, vec![M01, M02, S02]),
+            (16, vec![S02, S13]),
+        ] {
+            let mut f = facts(bars);
+            f.pair.predicted_peak_dbfs = None;
+            let selection = select_tactics(&f, &policy()).unwrap();
+            for row in selection.realizations {
+                assert_eq!(
+                    row.decision == IncompatibleBarCount,
+                    excluded.contains(&row.tactic_id),
+                    "{bars} bars, {:?} {:?}",
+                    row.tactic_id,
+                    row.variant,
+                );
+            }
+        }
+        let mut f = facts(4);
+        f.pair.predicted_peak_dbfs = None;
+        f.pair.shared_bar_bpm = Some(vec![120., 121., 122., 123., 124.]);
+        let selection = select_tactics(&f, &policy()).unwrap();
+        assert_eq!(
+            selection
+                .realizations
+                .into_iter()
+                .find(|row| row.tactic_id == S12)
+                .unwrap()
+                .decision,
+            IncompatibleFixedClock,
+        );
+    }
+
+    #[test]
+    fn measured_landing_bass_and_vocal_blockers_need_affirmative_evidence() {
+        use RealizationDecision::*;
+        use TacticId::*;
+        let p = policy();
+        let mut f = facts(8);
+        let proof = |id, f: &CandidateFacts| assess_eligibility(id, f, &p).proven;
+        f.a.natural_end_frame = Some(2 * BAR);
+        f.b.arrival_frame = Some(BAR);
+        assert_eq!(proof(C04, &f), Some(MeasuredLandingMismatch));
+        assert_eq!(proof(M02, &f), Some(MeasuredLandingMismatch));
+        f.b.arrival_frame = None;
+        assert_eq!(proof(C04, &f), None);
+        assert_eq!(proof(M02, &f), None);
+
+        f.a.bars[0].low_occupancy = None;
+        f.b.bars[0].low_occupancy = Some(0.39);
+        assert_eq!(proof(S03, &f), Some(MeasuredBassInactive));
+        f.b.bars[0].low_occupancy = Some(0.40);
+        assert_eq!(proof(S03, &f), None);
+
+        f.b.vocal_phrases = None;
+        assert_eq!(proof(M03, &f), Some(MeasuredVocalAbsent));
+        assert_eq!(proof(M06, &f), Some(MeasuredVocalAbsent));
+        f.a.vocal_phrases = None;
+        assert_eq!(proof(M03, &f), None);
+        assert_eq!(proof(M06, &f), None);
+    }
+
     pub(crate) fn facts(n: usize) -> CandidateFacts {
         let bar_frames: Vec<_> = (0..=n).map(|n| n as u64 * BAR).collect();
         let end = n as u64 * BAR;
@@ -3016,6 +3582,8 @@ pub(crate) mod tests {
             }),
             stem_leakage: None,
             phrase_exit: None,
+            phrase_exit_scan_complete: false,
+            later_phrase_exits: vec![],
             endpoint_reasons: vec!["fixture measured drum change".into()],
             stem_assets: all_lanes()
                 .iter()
@@ -3077,8 +3645,11 @@ pub(crate) mod tests {
             pair: PairEvidence {
                 profiles: BTreeMap::new(),
                 swift_profiles: BTreeMap::new(),
+                later_swift_profiles: BTreeMap::new(),
                 rhythmic_exit: None,
+                rhythmic_exit_scan_complete: false,
                 rhythmic_profiles: BTreeMap::new(),
+                later_rhythmic_exits: vec![],
                 beat_skew_ms: Some(1.),
                 harmonic_distance: Some(0.05),
                 lead_conflict: Some(0.05),
@@ -3091,6 +3662,7 @@ pub(crate) mod tests {
                 groove_similarity: Some(0.95),
                 short_fade_match: None,
                 cut_band_matches: BTreeSet::new(),
+                cut_band_pcm_checks: 0,
                 semantic_relation: Some(SemanticRelation {
                     relation: "answer".into(),
                     confidence_margin: 0.8,
@@ -3358,6 +3930,7 @@ pub(crate) mod tests {
             evidence: "measured test PCM pause".into(),
         };
         f.a.phrase_exit = Some(exit.clone());
+        f.a.phrase_exit_scan_complete = true;
         f.phrase_exit = Some(exit);
         f
     }
@@ -3378,6 +3951,82 @@ pub(crate) mod tests {
         assert!(schedule_tactic(TacticId::S06, &f, &policy()).is_err());
         f.pair.complementarity = Some(0.64);
         assert!(schedule_tactic(TacticId::M01, &f, &policy()).is_err());
+    }
+
+    #[test]
+    fn rejected_early_rhythmic_exit_keeps_the_later_measured_schedule() {
+        let mut f = dense();
+        let early = 7 * BAR + BAR / 2;
+        let late = 7 * BAR + BAR * 3 / 4;
+        let exit = |start_frame| PhraseExit {
+            start_frame,
+            end_frame: start_frame + 3840,
+            kind: PhraseExitKind::RhythmicHandoff,
+            evidence: "fixture incoming accent".into(),
+        };
+        let profile = PairProfile {
+            predicted_peak_dbfs: Some(-4.),
+            harmonic_distance: Some(0.1),
+            lead_conflict: Some(0.05),
+            complementarity: Some(0.9),
+            selected_composite_density: Some(vec![0.8; 8]),
+            outgoing_layer_stability: Some(vec![0.9; 8]),
+            incoming_layer_stability: Some(vec![0.9; 8]),
+            ..PairProfile::default()
+        };
+        f.pair.rhythmic_exit = Some(exit(early));
+        f.pair.rhythmic_profiles.insert(
+            TacticId::M01,
+            PairProfile {
+                predicted_peak_dbfs: Some(1.),
+                ..profile.clone()
+            },
+        );
+        f.pair.later_rhythmic_exits.push(ProfiledRhythmicExit {
+            exit: exit(late),
+            profiles: BTreeMap::from([(TacticId::M01, profile)]),
+        });
+        f.pair.rhythmic_exit_scan_complete = true;
+        let result = select_tactics(&f, &policy()).unwrap();
+        assert_eq!(
+            result
+                .realizations
+                .iter()
+                .filter(|row| row.variant == SelectorVariant::Rhythmic)
+                .map(|row| (row.exit_start_frame.unwrap(), row.decision))
+                .collect::<Vec<_>>(),
+            [
+                (early, RealizationDecision::MeasuredPeakExceeded),
+                (late, RealizationDecision::Scheduled)
+            ]
+        );
+        let admitted = result
+            .candidates
+            .iter()
+            .find(|row| row.variant == SelectorVariant::Rhythmic)
+            .unwrap();
+        assert_eq!(
+            admitted.plan.phrase_exit.as_ref().unwrap().start_frame,
+            late
+        );
+        validate_compiled(&admitted.plan, &f);
+        f.pair.rhythmic_exit_scan_complete = false;
+        let partial = select_tactics(&f, &policy()).unwrap();
+        assert!(partial
+            .realizations
+            .iter()
+            .any(|row| row.variant == SelectorVariant::Rhythmic
+                && row.exit_start_frame.is_none()
+                && row.decision == RealizationDecision::MissingExitEvidence));
+        assert!(partial
+            .candidates
+            .iter()
+            .any(|row| row.variant == SelectorVariant::Rhythmic
+                && row
+                    .plan
+                    .phrase_exit
+                    .as_ref()
+                    .is_some_and(|exit| exit.start_frame == late)));
     }
     #[test]
     fn long_stable_handoff_gets_credit_but_empty_or_unstable_beds_do_not() {
@@ -3464,6 +4113,84 @@ pub(crate) mod tests {
         }]);
         assert!(schedule_tactic(TacticId::M01, &vocal, &policy()).is_err());
     }
+    #[test]
+    fn later_accompaniment_exit_uses_its_own_profile_after_an_early_failure() {
+        let mut f = with_swift_exit(dense());
+        let early = f.phrase_exit.take().unwrap();
+        let late = PhraseExit {
+            start_frame: early.start_frame + BAR / 8,
+            end_frame: early.end_frame + BAR / 8,
+            ..early.clone()
+        };
+        f.pair
+            .swift_profiles
+            .insert(TacticId::M01, PairProfile::default());
+        f.a.later_phrase_exits.push(late.clone());
+        f.pair.later_swift_profiles.insert(
+            late.start_frame,
+            BTreeMap::from([(
+                TacticId::M01,
+                PairProfile {
+                    predicted_peak_dbfs: Some(-4.),
+                    harmonic_distance: Some(0.1),
+                    lead_conflict: Some(0.05),
+                    complementarity: Some(0.9),
+                    selected_composite_density: Some(vec![0.8; 8]),
+                    outgoing_layer_stability: Some(vec![0.9; 8]),
+                    incoming_layer_stability: Some(vec![0.9; 8]),
+                    ..PairProfile::default()
+                },
+            )]),
+        );
+        let result = select_tactics(&f, &policy()).unwrap();
+        let rows = result
+            .realizations
+            .iter()
+            .filter(|row| row.variant == SelectorVariant::Swift && row.tactic_id == TacticId::M01);
+        assert_eq!(
+            rows.map(|row| (row.exit_start_frame.unwrap(), row.decision))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    early.start_frame,
+                    RealizationDecision::EligibilityUnresolved
+                ),
+                (late.start_frame, RealizationDecision::Scheduled)
+            ]
+        );
+        let accepted = result
+            .candidates
+            .iter()
+            .find(|row| {
+                row.variant == SelectorVariant::Swift && row.plan.tactic_id == TacticId::M01
+            })
+            .unwrap();
+        assert_eq!(accepted.plan.phrase_exit.as_ref(), Some(&late));
+        validate_compiled(&accepted.plan, &f);
+
+        f.a.build_release_frame = Some(early.start_frame + 1);
+        let after_build = select_tactics(&f, &policy()).unwrap();
+        assert!(after_build
+            .realizations
+            .iter()
+            .any(|row| row.tactic_id == TacticId::M01
+                && row.variant == SelectorVariant::Swift
+                && row.exit_start_frame == Some(early.start_frame)
+                && row.decision == RealizationDecision::MeasuredBuildInterrupted));
+        assert!(after_build
+            .rejected
+            .iter()
+            .any(|row| row.tactic_id == TacticId::M01
+                && row.variant == SelectorVariant::Swift
+                && row.exit_start_frame == Some(early.start_frame)));
+        assert!(after_build
+            .candidates
+            .iter()
+            .any(|row| row.plan.tactic_id == TacticId::M01
+                && row.variant == SelectorVariant::Swift
+                && row.plan.phrase_exit.as_ref() == Some(&late)));
+    }
+
     #[test]
     fn failed_swift_variant_keeps_the_normal_mashup_candidate() {
         let mut f = with_swift_exit(dense());

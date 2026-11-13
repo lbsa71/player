@@ -142,7 +142,7 @@ import SpotifyKit
                   bridge.installed else {
                 return ["ok":false,"error":"Enable Audio Bridge, connect Spotify on this Mac, and stop any current recording first."]
             }
-            let input = arguments["playlist"] as? String ?? spotify.playback?.context?.uri ?? UserDefaults.standard.string(forKey:"lastRecordingPlaylist") ?? ""
+            let input = arguments["playlist"] as? String ?? UserDefaults.standard.string(forKey:"lastRecordingPlaylist") ?? spotify.playback?.context?.uri ?? ""
             guard let uri = try? SpotifyPlaylist.uri(input) else { return ["ok":false,"error":"Provide a Spotify playlist link or play a playlist first."] }
             playlistRecording.start(playlist:uri)
             return ["ok":true,"accepted":true,"message":"Recovery requested. Inspect player_status.playlistRecovery."]

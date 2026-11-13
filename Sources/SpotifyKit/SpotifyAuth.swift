@@ -103,7 +103,7 @@ public actor SpotifyAuth {
         var components = URLComponents(string: "https://accounts.spotify.com/authorize")!
         components.queryItems = [
             URLQueryItem(name: "client_id", value: clientID), URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "redirect_uri", value: Self.redirectURI), URLQueryItem(name: "scope", value: Self.scopes),
+            URLQueryItem(name: "redirect_uri", value: Self.redirectURI), URLQueryItem(name: "scope", value: Self.scopes + " playlist-read-private"),
             URLQueryItem(name: "state", value: state), URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "code_challenge", value: PKCE.challenge(verifier))
         ]

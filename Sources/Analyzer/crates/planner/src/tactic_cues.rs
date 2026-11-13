@@ -110,6 +110,10 @@ pub(crate) fn native_pair(
     let start = ((a0 - a_before) as f64 * overlap as f64 / (a1 - a0) as f64).round() as u64;
     let end = start + overlap;
     let total = end + ((b_after - b1) as f64 * overlap as f64 / (b1 - b0) as f64).round() as u64;
+    let fade = u64::from(rate) / 100;
+    if start <= fade || total - end <= fade {
+        return Ok(None);
+    }
     let make = |t: &Analyzed, points: [(u64, u64); 3]| TimeMap {
         header: Header::default(),
         map_id: id(),
@@ -142,14 +146,9 @@ pub(crate) fn native_pair(
     for (i, p) in placements.iter_mut().enumerate() {
         let g = gain(tracks[i]);
         let points = if i == 0 {
-            vec![(0, 0.), (u64::from(rate) / 100, g), (start, g), (end, 0.)]
+            vec![(0, 0.), (fade, g), (start, g), (end, 0.)]
         } else {
-            vec![
-                (start, 0.),
-                (end, g),
-                (total - u64::from(rate) / 100, g),
-                (total, 0.),
-            ]
+            vec![(start, 0.), (end, g), (total - fade, g), (total, 0.)]
         };
         p.automation = points
             .into_iter()
@@ -217,15 +216,18 @@ pub(crate) fn native_pair(
     Ok(Some(plan))
 }
 
-pub(crate) fn structural_candidates(
+pub(crate) type NativeWindow = [(u64, u64); 2];
+
+pub(crate) struct StructuralWindows {
+    pub tails: Vec<NativeWindow>,
+    pub sparse: [Vec<(u64, u64)>; 2],
+    pub complete: bool,
+}
+
+pub(crate) fn structural_windows(
     store: &Store,
-    request: &StitchRequest<'_>,
-    policy: &MixingConfig,
-    limit: usize,
-    cancel: &Cancellation,
-) -> Result<Vec<MixPlan>> {
-    let a = load_analyzed(store, store.track(request.from)?)?;
-    let b = load_analyzed(store, store.track(request.to)?)?;
+    [a, b]: [&Analyzed; 2],
+) -> Result<Option<StructuralWindows>> {
     let signals = |t: &Analyzed| -> Result<Option<TacticTrackAnalysis>> {
         t.analysis
             .artifacts
@@ -233,8 +235,8 @@ pub(crate) fn structural_candidates(
             .map(|r| store.read_ref(r))
             .transpose()
     };
-    let (Some(sa), Some(sb)) = (signals(&a)?, signals(&b)?) else {
-        return Ok(vec![]);
+    let (Some(sa), Some(sb)) = (signals(a)?, signals(b)?) else {
+        return Ok(None);
     };
     let events = |s: &TacticTrackAnalysis, kind: &str| -> Vec<u64> {
         s.signal_evidence
@@ -244,6 +246,7 @@ pub(crate) fn structural_candidates(
             .flatten()
             .filter(|e| e.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
             .filter_map(|e| e.get("frame").and_then(serde_json::Value::as_u64))
+            .filter(|&frame| frame <= s.source_frames)
             .collect()
     };
     let mut windows = Vec::new();
@@ -315,14 +318,45 @@ pub(crate) fn structural_candidates(
                     v.get("end_frame")?.as_u64()?,
                 ))
             })
+            .filter(|&(start, end)| start < end && end <= s.source_frames)
             .collect()
     };
+    let complete = [&sa, &sb].into_iter().all(|record| {
+        ["events", "segments", "unmetered_windows"]
+            .into_iter()
+            .all(|key| record.signal_evidence[key].is_array())
+    });
+    Ok(Some(StructuralWindows {
+        tails: windows.into_iter().map(|(a, b)| [a, b]).collect(),
+        sparse: [sparse(&sa), sparse(&sb)],
+        complete,
+    }))
+}
+
+pub(crate) fn structural_candidates(
+    store: &Store,
+    request: &StitchRequest<'_>,
+    policy: &MixingConfig,
+    limit: usize,
+    cancel: &Cancellation,
+) -> Result<Vec<MixPlan>> {
+    let a = load_analyzed(store, store.track(request.from)?)?;
+    let b = load_analyzed(store, store.track(request.to)?)?;
+    let Some(StructuralWindows {
+        tails,
+        sparse: [aa, bb],
+        ..
+    }) = structural_windows(store, [&a, &b])?
+    else {
+        return Ok(vec![]);
+    };
+    let mut windows: Vec<_> = tails.into_iter().map(|[a, b]| (a, b)).collect();
     let spread = |values: Vec<(u64, u64)>| -> Vec<_> {
         let step = values.len().div_ceil(64).max(1);
         values.into_iter().step_by(step).collect()
     };
-    let aa = spread(sparse(&sa));
-    let bb = spread(sparse(&sb));
+    let aa = spread(aa);
+    let bb = spread(bb);
     for aw in &aa {
         for bw in &bb {
             let da = (aw.1 - aw.0) as f64 / a.track.format.sample_rate_hz as f64;

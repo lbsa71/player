@@ -275,12 +275,23 @@ final class RecordingTests: XCTestCase {
     func testStoppedPausedAndFailedSegmentsCannotClaimContinuousCompletion() throws {
         for (reason, complete) in [("Stopped by user", true), ("Paused or metadata unavailable", true),
                                    ("Observed track change", false)] {
-            let file = try FloatWAVFile(directory: folder(), track: track("Track", duration: 1), sampleRate: 8000)
+            let file = try FloatWAVFile(directory: folder(), track: track("Track", duration: 10), sampleRate: 8000)
             try appendSecond(to: file)
-            file.observe(positionSeconds: 1, expectedDurationSeconds: 1)
+            file.observe(positionSeconds: 1, expectedDurationSeconds: 10)
             let metadata = try manifest(file.finish(reason: reason, complete: complete))
             XCTAssertEqual(metadata["coverageContinuous"] as? Bool, false, reason)
         }
+    }
+    func testEndOfQueueCanCompleteWithoutANextTrackObservation() throws {
+        let file = try FloatWAVFile(directory: folder(), track: track("Final", duration: 4), sampleRate: 8000)
+        for second in 1...4 {
+            try appendSecond(to: file)
+            file.observe(positionSeconds: Double(second), expectedDurationSeconds: 4)
+        }
+        let url = try file.finish(reason: "Paused or metadata unavailable", complete: true)
+        let catalog = try RecordingCatalog.scan(directory:url.deletingLastPathComponent(),verifyAudio:true)
+        let entries = try XCTUnwrap(catalog["entries"] as? [[String:Any]])
+        XCTAssertEqual(entries.first?["status"] as? String,"complete")
     }
     func testInvalidInitialAndLaterPlaybackMetadataCannotClaimCoverage() throws {
         for position in [-1.0, .infinity, .nan] {

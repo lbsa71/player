@@ -5,8 +5,206 @@ use super::*;
 use crate::{duration_search::Measurement, search_cache::Cache, tactics::MeasuredEdge};
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
 
 const MAX_SEEDS: usize = 256;
+
+#[cfg(feature = "cp-search")]
+pub(super) struct ArchivedSet {
+    pub plan: MixPlan,
+    pub windows: Vec<MixPlan>,
+}
+
+#[cfg(feature = "cp-search")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct JoinKey<'a> {
+    from: &'a str,
+    to: &'a str,
+    exit: u64,
+    entry: u64,
+    overlap: u64,
+}
+
+#[cfg(feature = "cp-search")]
+impl<'a> JoinKey<'a> {
+    fn saved(join: &'a serde_json::Value, transition: &Transition) -> Option<Self> {
+        Some(Self {
+            from: join["from"].as_str()?,
+            to: join["to"].as_str()?,
+            exit: join["outgoing_cue_frame"].as_u64()?,
+            entry: join["incoming_cue_frame"].as_u64()?,
+            overlap: transition
+                .end_output_frame
+                .checked_sub(transition.start_output_frame)?,
+        })
+    }
+
+    fn measured(edge: &'a serde_json::Value) -> Option<Self> {
+        if edge["last_resort"].as_bool()? {
+            return None;
+        }
+        let [a, b] = edge["plan"]["placements"].as_array()?.as_slice() else {
+            return None;
+        };
+        let [transition] = edge["plan"]["transitions"].as_array()?.as_slice() else {
+            return None;
+        };
+        Some(Self {
+            from: a["track_id"].as_str()?,
+            to: b["track_id"].as_str()?,
+            exit: edge["exit"].as_u64()?,
+            entry: b["source_start_frame"].as_u64()?,
+            overlap: transition["end_output_frame"]
+                .as_u64()?
+                .checked_sub(transition["start_output_frame"].as_u64()?)?,
+        })
+    }
+}
+
+fn checked_payload(report: &Report) -> Result<Option<&serde_json::Value>> {
+    let Some(payload) = report.header.extensions.get("payload") else {
+        return Ok(None);
+    };
+    Ok((report.kind == "set_search_cache"
+        && report.header.extensions.get("digest") == Some(&json!(canonical_hash(payload)?)))
+    .then_some(payload))
+}
+
+/// A previous winner supplies an ordered set of timing requests. Each
+/// returned window has stripped tactics and must pass current admission.
+#[cfg(feature = "cp-search")]
+pub(super) fn load_set(
+    store: &Store,
+    policy: &MixingConfig,
+    pool: &[Track],
+    cache: &Cache,
+    max_windows: usize,
+    deadline: Instant,
+    cancel: &Cancellation,
+) -> Result<Option<ArchivedSet>> {
+    let set_key = Cache::set_key(policy)?;
+    let roots = cache.previous_roots(store, usize::MAX)?;
+    let pool: BTreeMap<_, _> = pool.iter().map(|t| (t.track_id.as_str(), t)).collect();
+    for root in roots {
+        cancel.check()?;
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(report) = store.read::<Report>(&format!("{root}/sets/{set_key}.json")) else {
+            continue;
+        };
+        let Some(reference) = checked_payload(&report)? else {
+            continue;
+        };
+        let Some(plan_id) = reference["plan_id"]
+            .as_str()
+            .filter(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        else {
+            continue;
+        };
+        let Ok(plan) = store.read::<MixPlan>(&format!("plans/{plan_id}.json")) else {
+            continue;
+        };
+        if plan.transitions.is_empty() || plan.transitions.len() > max_windows || !plan.complete {
+            continue;
+        }
+        let Some(pins) = reference["sources"].as_object() else {
+            continue;
+        };
+        if !plan.placements.iter().all(|p| {
+            pins.get(&p.track_id).and_then(serde_json::Value::as_str)
+                == cache.sources.get(&p.track_id).map(String::as_str)
+                && cache.sources.contains_key(&p.track_id)
+        }) {
+            continue;
+        }
+        let Some(joins) = plan
+            .header
+            .extensions
+            .get("chain_joins")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        if joins.len() != plan.transitions.len() {
+            continue;
+        }
+        let Some(targets) = joins
+            .iter()
+            .zip(&plan.transitions)
+            .enumerate()
+            .map(|(i, (join, transition))| Some((JoinKey::saved(join, transition)?, i)))
+            .collect::<Option<BTreeMap<_, _>>>()
+        else {
+            continue;
+        };
+        if targets.len() != joins.len() {
+            continue;
+        }
+        let mut windows = vec![None; joins.len()];
+        for entry in std::fs::read_dir(store.path(&format!("{root}/windows"))?)? {
+            cancel.check()?;
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || entry.path().extension().is_none_or(|e| e != "json")
+            {
+                continue;
+            }
+            let Ok(report) = store.read::<Report>(&format!(
+                "{root}/windows/{}",
+                entry.file_name().to_string_lossy()
+            )) else {
+                continue;
+            };
+            // Check exact cue coordinates before hashing or decoding bulky
+            // unrelated tactic evidence from an older cache.
+            let Some(edges) = report
+                .header
+                .extensions
+                .get("payload")
+                .and_then(|v| v["edges"].as_array())
+            else {
+                continue;
+            };
+            let matches = edges
+                .iter()
+                .enumerate()
+                .filter_map(|(i, edge)| {
+                    let &slot = targets.get(&JoinKey::measured(edge)?)?;
+                    let score = edge["score"].as_f64()?;
+                    let saved_score = joins[slot]["score"].as_f64()?;
+                    (windows[slot].is_none() && (score - saved_score).abs() < 1e-8)
+                        .then_some((i, slot))
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() || checked_payload(&report)?.is_none() {
+                continue;
+            }
+            let Ok(sources) = serde_json::from_value::<BTreeMap<String, String>>(
+                report.header.extensions["payload"]["sources"].clone(),
+            ) else {
+                continue;
+            };
+            for (i, slot) in matches {
+                let Ok(edge) = serde_json::from_value::<MeasuredEdge>(edges[i].clone()) else {
+                    continue;
+                };
+                if let Some((_, seed)) = prepare(edge, &sources, policy, &pool, cache)? {
+                    windows[slot] = Some(seed.plan);
+                }
+            }
+            if windows.iter().all(Option::is_some) {
+                return Ok(Some(ArchivedSet {
+                    plan,
+                    windows: windows.into_iter().flatten().collect(),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
 
 struct Seed {
     plan: MixPlan,
@@ -142,15 +340,22 @@ pub(super) fn load(
     policy: &MixingConfig,
     pool: &[Track],
     cache: &Cache,
+    deadline: Instant,
     cancel: &Cancellation,
 ) -> Result<Vec<MixPlan>> {
+    if Instant::now() >= deadline {
+        return Ok(vec![]);
+    }
     let pool: BTreeMap<_, _> = pool.iter().map(|t| (t.track_id.as_str(), t)).collect();
     let roots = cache.previous_roots(store, 2)?;
     let mut seeds: BTreeMap<String, Seed> = BTreeMap::new();
     let mut records = 0;
-    for root in &roots {
+    'roots: for root in &roots {
         for entry in std::fs::read_dir(store.path(&format!("{root}/windows"))?)? {
             cancel.check()?;
+            if Instant::now() >= deadline {
+                break 'roots;
+            }
             let entry = entry?;
             if !entry.file_type()?.is_file() || entry.path().extension().is_none_or(|e| e != "json")
             {
@@ -160,14 +365,9 @@ pub(super) fn load(
             let Ok(report) = store.read::<Report>(&path) else {
                 continue;
             };
-            let Some(payload) = report.header.extensions.get("payload") else {
+            let Some(payload) = checked_payload(&report)? else {
                 continue;
             };
-            if report.kind != "set_search_cache"
-                || report.header.extensions.get("digest") != Some(&json!(canonical_hash(payload)?))
-            {
-                continue;
-            }
             let Ok(measurement) = serde_json::from_value::<Measurement>(payload.clone()) else {
                 continue;
             };
@@ -323,7 +523,15 @@ mod tests {
             ..Measurement::default()
         };
         save_old(&store, &cache, &measurement);
-        let loaded = load(&store, &policy, &pool, &cache, &Cancellation::default()).unwrap();
+        let loaded = load(
+            &store,
+            &policy,
+            &pool,
+            &cache,
+            Instant::now() + std::time::Duration::from_secs(5),
+            &Cancellation::default(),
+        )
+        .unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(read_tactics(&loaded[0]).unwrap().is_empty());
         assert!(!loaded[0]
@@ -395,10 +603,93 @@ mod tests {
         let mut report = store.read::<Report>(&path).unwrap();
         report.header.extensions.get_mut("payload").unwrap()["edges"][0]["score"] = json!(1000);
         store.write(&path, &report).unwrap();
-        assert!(
-            load(&store, &policy, &pool, &cache, &Cancellation::default())
-                .unwrap()
-                .is_empty()
+        assert!(load(
+            &store,
+            &policy,
+            &pool,
+            &cache,
+            Instant::now() + std::time::Duration::from_secs(5),
+            &Cancellation::default()
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn archived_set_requires_every_exact_join_and_current_source_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(dir.path()).unwrap();
+        let (mut plan, pool) = fixture();
+        let policy = plan.policy.clone();
+        let cache = Cache::open(&policy, &pool).unwrap();
+        let pair = plan.clone();
+        let a = &pair.placements[0];
+        let b = &pair.placements[1];
+        let mut measured_edge = edge(pair.clone());
+        measured_edge.exit = a
+            .time_map
+            .source_at(pair.transitions[0].start_output_frame as f64)
+            .round() as u64;
+        plan.header.extensions.insert(
+            "chain_joins".into(),
+            json!([{
+                "from": a.track_id, "to": b.track_id, "outgoing_cue_frame": measured_edge.exit,
+                "incoming_cue_frame": b.source_start_frame, "score": measured_edge.score,
+            }]),
         );
+        store
+            .write(&format!("plans/{}.json", plan.plan_id), &plan)
+            .unwrap();
+        let mut measurement = Measurement {
+            sources: cache.sources.clone(),
+            edges: vec![measured_edge],
+            ..Measurement::default()
+        };
+        let old = save_old(&store, &cache, &measurement);
+        let root = old.rsplit_once("/windows/").unwrap().0;
+        let payload = json!({"plan_id": plan.plan_id, "sources": cache.sources});
+        let mut reference = Report::new("set_search_cache");
+        reference
+            .header
+            .extensions
+            .insert("digest".into(), json!(canonical_hash(&payload).unwrap()));
+        reference
+            .header
+            .extensions
+            .insert("payload".into(), payload);
+        store
+            .write(
+                &format!("{root}/sets/{}.json", Cache::set_key(&policy).unwrap()),
+                &reference,
+            )
+            .unwrap();
+        let load = |cache: &Cache, allowance| {
+            load_set(
+                &store,
+                &policy,
+                &pool,
+                cache,
+                allowance,
+                Instant::now() + std::time::Duration::from_secs(2),
+                &Cancellation::default(),
+            )
+            .unwrap()
+        };
+        assert!(load(&cache, 0).is_none());
+        let recovered = load(&cache, 1).expect("exact archived timing request");
+        assert_eq!(recovered.plan.plan_id, plan.plan_id);
+        assert_eq!(recovered.windows.len(), 1);
+        assert!(read_tactics(&recovered.windows[0]).unwrap().is_empty());
+        measurement.edges[0].exit += 1;
+        save_old(&store, &cache, &measurement);
+        assert!(load(&cache, 1).is_none());
+        measurement.edges[0].exit -= 1;
+        save_old(&store, &cache, &measurement);
+        let mut changed = Cache::open(&policy, &pool).unwrap();
+        changed
+            .sources
+            .insert(a.track_id.clone(), "different generation".into());
+        assert!(load(&changed, 1).is_none());
     }
 }

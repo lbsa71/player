@@ -184,23 +184,16 @@ pub(super) fn stitch_chain(
             "tactic_search": choice.examined, "pacing":pacing,
         }));
     }
-    finish_chain(
-        store,
-        chain.expect("validated chain has joins"),
-        joins,
-        chain_tactics,
-        None,
-        cancel,
-    )
+    let plan = chain.expect("validated chain has joins");
+    let bookends = select_bookends(store, &plan, None, cancel)?;
+    finish_chain(plan, joins, chain_tactics, bookends)
 }
 
 fn finish_chain(
-    store: &Store,
     mut plan: MixPlan,
     joins: Vec<serde_json::Value>,
     chain_tactics: Vec<TacticPlan>,
-    closing_window: Option<mixlib_planner::ChainClosingWindow>,
-    cancel: &Cancellation,
+    bookends: mixlib_planner::ChainBookends,
 ) -> Result<MixPlan> {
     plan.objective = "stitch_chain".into();
     plan.planner_version = "beat-stitch-chain/1".into();
@@ -218,7 +211,7 @@ fn finish_chain(
     plan.header
         .extensions
         .insert("chain_joins".into(), serde_json::json!(joins));
-    let intro_shift = apply_bookends(store, &mut plan, closing_window, cancel)?;
+    let intro_shift = apply_bookends(&mut plan, bookends);
     if !chain_tactics.is_empty() {
         let translated = chain_tactics
             .iter()
@@ -300,9 +293,17 @@ pub(super) fn finish_measured(
 
 pub(super) fn finish_measured_in_window(
     store: &Store,
-    mut plan: MixPlan,
+    plan: MixPlan,
     closing_window: Option<mixlib_planner::ChainClosingWindow>,
     cancel: &Cancellation,
+) -> Result<MixPlan> {
+    let bookends = select_bookends(store, &plan, closing_window, cancel)?;
+    finish_measured_at_bookends(plan, bookends)
+}
+
+pub(super) fn finish_measured_at_bookends(
+    mut plan: MixPlan,
+    bookends: mixlib_planner::ChainBookends,
 ) -> Result<MixPlan> {
     let tactics = read_tactics(&plan)?;
     let joins = plan
@@ -312,7 +313,7 @@ pub(super) fn finish_measured_in_window(
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
     plan.plan_id = id();
-    finish_chain(store, plan, joins, tactics, closing_window, cancel)
+    finish_chain(plan, joins, tactics, bookends)
 }
 
 fn apply_opening(plan: &mut MixPlan, start: u64) -> u64 {
@@ -402,12 +403,12 @@ pub(super) fn open_measured(plan: &mut MixPlan, start: u64) -> Result<()> {
     plan.validate()
 }
 
-fn apply_bookends(
+fn select_bookends(
     store: &Store,
-    plan: &mut MixPlan,
+    plan: &MixPlan,
     closing_window: Option<mixlib_planner::ChainClosingWindow>,
     cancel: &Cancellation,
-) -> Result<u64> {
+) -> Result<mixlib_planner::ChainBookends> {
     let mut cues = mixlib_planner::choose_chain_bookends_in_window(
         store,
         &plan.placements[0],
@@ -424,6 +425,10 @@ fn apply_bookends(
     {
         cues.start = plan.placements[0].source_start_frame;
     }
+    Ok(cues)
+}
+
+fn apply_bookends(plan: &mut MixPlan, cues: mixlib_planner::ChainBookends) -> u64 {
     let intro_frames = apply_opening(plan, cues.start);
     let rate = u64::from(plan.output.sample_rate_hz);
     let last = plan.placements.last_mut().unwrap();
@@ -465,7 +470,7 @@ fn apply_bookends(
             "outro_fade_start_output_frame": end - fade, "ending": cues.ending,
         }),
     );
-    Ok(intro_frames)
+    intro_frames
 }
 
 pub(super) fn pick_chain(
@@ -612,17 +617,19 @@ pub(super) fn try_quiet_linger(
     Ok(gradual_fallback)
 }
 
-fn append_pair(chain: &mut MixPlan, mut pair: MixPlan) -> Result<u64> {
-    let transition = &mut pair.transitions[0];
-    let local_start = transition.start_output_frame;
-    let departing = &pair.placements[0];
-    let middle = chain.placements.last_mut().unwrap();
-    let map = &mut middle.time_map;
+pub(super) const JOINED_TEMPO_RAMP_INTERVALS: [u64; 2] = [8, 16];
+
+fn splice_time_map(
+    map: &mut TimeMap,
+    departing: &TimeMap,
+    local_start: u64,
+) -> Result<(u64, u64, u64)> {
     let incoming_speed = *map.slopes().last().unwrap();
-    let outgoing_speed = departing.time_map.slopes()[0];
+    let outgoing_speed = departing.slopes()[0];
     map.anchors.pop();
+    let bridge_start = map.anchors.len() - 1;
     let previous = map.anchors.last().unwrap().clone();
-    let next_source = departing.time_map.anchors[1].source_frame;
+    let next_source = departing.anchors[1].source_frame;
     let gap = next_source
         .checked_sub(previous.source_frame)
         .ok_or_else(|| Error::new("CHAIN_CUES", "middle track's exit is before its entry"))?;
@@ -657,19 +664,116 @@ fn append_pair(chain: &mut MixPlan, mut pair: MixPlan) -> Result<u64> {
         .checked_sub(local_start)
         .ok_or_else(|| Error::new("CHAIN_CUES", "invalid pair output offset"))?;
     map.anchors
-        .extend(departing.time_map.anchors.iter().skip(2).map(|a| Anchor {
+        .extend(departing.anchors.iter().skip(2).map(|a| Anchor {
             source_frame: a.source_frame,
             output_frame: a.output_frame + offset,
         }));
-    map.speed_ratio_limits[0] =
-        map.speed_ratio_limits[0].min(departing.time_map.speed_ratio_limits[0]);
-    map.speed_ratio_limits[1] =
-        map.speed_ratio_limits[1].max(departing.time_map.speed_ratio_limits[1]);
-    map.validate()?;
+    map.speed_ratio_limits[0] = map.speed_ratio_limits[0].min(departing.speed_ratio_limits[0]);
+    map.speed_ratio_limits[1] = map.speed_ratio_limits[1].max(departing.speed_ratio_limits[1]);
+    if let Err(error) = map.validate() {
+        if !matches!(
+            error.code.as_str(),
+            "TIME_MAP_SPEED" | "TIME_MAP_ACCELERATION"
+        ) || !smooth_joined_bridge(map, bridge_start, scale, incoming_speed, outgoing_speed)
+        {
+            return Err(error);
+        }
+    }
+    Ok((previous.output_frame, output, offset))
+}
+
+fn smooth_joined_bridge(
+    map: &mut TimeMap,
+    start: usize,
+    scale: f64,
+    incoming_speed: f64,
+    outgoing_speed: f64,
+) -> bool {
+    let first = map.anchors[start].clone();
+    let last = map.anchors[start + 3].clone();
+    let gap = last.source_frame - first.source_frame;
+    let duration = (last.output_frame - first.output_frame) as f64;
+    let swing = gap as f64 * scale * (outgoing_speed.recip() - incoming_speed.recip());
+    // Integrate a smoothstep in seconds per source frame. Subtract the
+    // endpoint's linear contribution to keep the original output duration.
+    // Only the solo interior moves. Overlap anchors and their clocks stay fixed.
+    for intervals in JOINED_TEMPO_RAMP_INTERVALS {
+        if gap < intervals || duration < intervals as f64 {
+            continue;
+        }
+        let interior = (1..intervals).map(|index| {
+            let source = gap * index / intervals;
+            let t = source as f64 / gap as f64;
+            let integrated = t * t * t * (1. - 0.5 * t);
+            let output = duration * t + swing * (integrated - 0.5 * t);
+            Anchor {
+                source_frame: first.source_frame + source,
+                output_frame: first.output_frame + output.round() as u64,
+            }
+        });
+        let mut candidate = map.clone();
+        candidate.anchors.splice(start + 1..start + 3, interior);
+        if candidate.validate().is_ok() {
+            *map = candidate;
+            return true;
+        }
+    }
+    false
+}
+
+/// Probe only the middle song's time-map derivatives. Translating every
+/// output anchor preserves interval lengths and leaves these checks invariant.
+#[cfg(feature = "cp-search")]
+pub(super) fn rules_out_joined_speed(arrival: &MixPlan, departure: &MixPlan) -> bool {
+    matches!(measured_bridge(arrival, departure), Err(error) if matches!(error.code.as_str(), "TIME_MAP_SPEED" | "TIME_MAP_ACCELERATION"))
+}
+
+#[cfg(feature = "cp-search")]
+pub(super) struct MeasuredBridge {
+    pub map: TimeMap,
+    pub solo_start: u64,
+    pub solo_end: u64,
+}
+
+#[cfg(feature = "cp-search")]
+pub(super) fn measured_bridge(
+    arrival: &MixPlan,
+    departure: &MixPlan,
+) -> Result<Option<MeasuredBridge>> {
+    let mut map = arrival.placements[1].time_map.clone();
+    let next = &departure.placements[0].time_map;
+    if map.source_sample_rate_hz != next.source_sample_rate_hz
+        || map.output_sample_rate_hz != next.output_sample_rate_hz
+    {
+        return Ok(None);
+    }
+    let local_start = departure.transitions[0].start_output_frame;
+    let origin = map.anchors[0].output_frame;
+    for anchor in &mut map.anchors {
+        let Some(frame) = (anchor.output_frame - origin).checked_add(local_start) else {
+            return Ok(None);
+        };
+        anchor.output_frame = frame;
+    }
+    let (solo_start, solo_end, _) = splice_time_map(&mut map, next, local_start)?;
+    Ok(Some(MeasuredBridge {
+        map,
+        solo_start,
+        solo_end,
+    }))
+}
+
+fn append_pair(chain: &mut MixPlan, mut pair: MixPlan) -> Result<u64> {
+    let transition = &mut pair.transitions[0];
+    let local_start = transition.start_output_frame;
+    let departing = &pair.placements[0];
+    let middle = chain.placements.last_mut().unwrap();
+    let (previous_output, output, offset) =
+        splice_time_map(&mut middle.time_map, &departing.time_map, local_start)?;
     middle.source_end_frame = departing.source_end_frame;
     middle
         .automation
-        .retain(|point| point.output_frame <= previous.output_frame);
+        .retain(|point| point.output_frame <= previous_output);
     let (gain_linear, bands_linear) = mixlib_audio::automation(&departing.automation, local_start);
     middle.automation.push(AutomationPoint {
         output_frame: output,

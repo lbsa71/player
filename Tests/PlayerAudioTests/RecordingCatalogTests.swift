@@ -26,6 +26,19 @@ final class RecordingCatalogTests: XCTestCase {
     private func entries(_ root:URL,verify:Bool = false) throws -> [[String:Any]] {
         try XCTUnwrap(RecordingCatalog.scan(directory:root,verifyAudio:verify)["entries"] as? [[String:Any]])
     }
+    func testLibraryIncludesVerifiedWAVsFromCleanupArchive() throws {
+        let parent = try folder()
+        let archive = parent.appendingPathComponent("Audio Archive/2026-11-11-cleanup/recordings")
+        try FileManager.default.createDirectory(at:archive,withIntermediateDirectories:true)
+        try write(archive,"Archived.wav",metadata:metadata("Archived.wav"))
+        let entries = try RecordingCatalog.libraryEntries(directory:parent.appendingPathComponent("Audio"))
+        let entry = try XCTUnwrap(entries.first)
+        let reported = URL(fileURLWithPath:try XCTUnwrap(entry["directory"] as? String))
+        XCTAssertEqual(reported.pathComponents.suffix(4),archive.pathComponents.suffix(4))
+        XCTAssertEqual(entry["status"] as? String,"complete")
+        XCTAssertEqual(entry["audioVerified"] as? Bool,true)
+    }
+
     func testMetadataFirstListingPreservesRawFieldsAndDoesNotReadWAVHeaders() throws {
         let root = try folder(), name = "Album - Artist - Track.wav"
         let m = metadata(name)

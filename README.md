@@ -184,30 +184,29 @@ are renamed after finalization. Forced termination or a write/overflow error
 leaves an explicitly partial file. A JSON sidecar maps each file to its Spotify
 track ID, observed start position, sample rate, frame count and stop reason.
 
-**Resume playlist recording** restarts the current playlist with shuffle/repeat
-off and skips tracks whose local sidecars prove complete observed coverage.
-Player reads the recording folder directly, matching the existing `trackID`;
-the HAL driver only moves samples, and AudioBridge only writes recordings and
-capture evidence. There is no catalog API in the driver or service.
+**Resume playlist recording** reads the selected playlist in order and compares its
+Spotify track IDs with verified recordings. Player checks the active folder and
+the `<folder> Archive/<cleanup>/recordings` folders beside it. Player starts at the
+first unfinished track and jumps past saved tracks to the next unfinished entry.
+Spotify can briefly begin a saved track at a natural boundary before Player jumps;
+capture is suppressed for that track.
+The HAL driver moves samples, and AudioBridge writes recordings and evidence.
 
 New sidecars use `recordingSchemaVersion: 2` and `completionPolicy: observed-v1`,
 adding expected duration, last observed position, and continuity evidence.
 Completion requires a finalized WAV, a start within two seconds of zero,
 continuous capture, and observed/recorded duration within the two-second
 boundary tolerance. Player checks WAV headers and file length without reading
-sample payloads. This is approximate playback coverage, not sample-accurate
-source verification. A pause, stop, seek, metadata gap, or error remains
-incomplete; the final track stopping without an observed next-track boundary is
-also conservatively incomplete. Legacy sidecars without this evidence remain
-unverified and will be recorded again. Existing files are never overwritten.
+sample payloads. This is approximate playback coverage within the stated tolerance.
+Interruptions leave a track incomplete unless its observations and recorded frames
+already establish full coverage. Legacy sidecars without coverage evidence remain
+unverified. Existing files are never overwritten.
 
-Recovery advances through Spotify's observed playlist; it does not download a
-playlist or need extra account scopes. Missing tracks begin at zero; completed
-tracks are skipped without creating another WAV. Playback/device/context changes,
-manual controls, stale metadata, or an unconfirmed command stop automatic recovery.
-Ambiguous next commands are never retried. A same-ID duplicate immediately after
-a skip can be indistinguishable from an unconfirmed command; recovery stops after
-ten seconds rather than guessing. Resume explicitly after an interruption.
+Reconnect Spotify once to grant playlist read access. Spotify limits this lookup
+to playlists you own or collaborate on. Player disables shuffle and repeat, then
+checks that the expected tracks play on the selected Mac. A device change, stale
+metadata or an unexpected track ends the run. Resume reads the playlist and
+recording folders again to rebuild the remaining queue.
 
 `player_record_resume` accepts an optional `playlist` link/URI and exposes progress
 under `player_status.playlistRecovery`. `player_recordings` lists paginated cached

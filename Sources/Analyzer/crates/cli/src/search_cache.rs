@@ -2,20 +2,24 @@
 //! Changed admission/rendering code starts a new namespace. Set scoring and
 //! scheduling retain measured decisions; completed sets are revalidated.
 use super::*;
+use crate::set_config::{CacheMode, CACHE_MODE_KEY};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub(super) struct Cache {
     root: String,
-    legacy_root: String,
+    compatible_roots: Vec<String>,
+    proposal_root: String,
+    state_root: String,
+    pub mode: CacheMode,
     pub sources: BTreeMap<String, String>,
     pub hits: usize,
     pub misses: usize,
     pub invalid: usize,
 }
 
-fn policy_key(policy: &MixingConfig) -> Result<String> {
+pub(super) fn policy_key(policy: &MixingConfig) -> Result<String> {
     let mut p = policy.clone();
     // Scheduling and composition do not change pair admission. Keep every
     // unknown extension, so a newly introduced musical rule invalidates reuse.
@@ -25,6 +29,8 @@ fn policy_key(policy: &MixingConfig) -> Result<String> {
         "set_structure",
         "lazy_measurement_budget",
         "lazy_search_seconds",
+        crate::set_config::ENGINE_KEY,
+        CACHE_MODE_KEY,
         "lazy_incumbent_plan",
         "required_spotify_pairs",
         "required_pair_mode",
@@ -44,9 +50,17 @@ fn source_key(track: &Track) -> Result<String> {
     )
 }
 impl Cache {
+    #[cfg(all(test, feature = "cp-search"))]
+    pub(super) fn include_audit_windows(&mut self, root: String) {
+        self.compatible_roots.push(root);
+    }
+
     /// Other code generations are proposal sources only, never admission
     /// evidence. Limit traversal to measured windows under this exact policy.
     pub fn previous_roots(&self, store: &Store, limit: usize) -> Result<Vec<String>> {
+        if self.mode != CacheMode::Resume {
+            return Ok(vec![]);
+        }
         let base = store.path("search-cache/v1")?;
         if !base.exists() {
             return Ok(vec![]);
@@ -66,7 +80,7 @@ impl Cache {
                 continue;
             }
             let root = format!("search-cache/v1/{namespace}/{policy}");
-            if root == self.root {
+            if root == self.root || self.compatible_roots.contains(&root) {
                 continue;
             }
             let windows = store.path(&format!("{root}/windows"))?;
@@ -83,49 +97,98 @@ impl Cache {
             .map(|(_, root)| root)
             .collect())
     }
-    /// Migrate the earlier, over-specific namespace only when it matches this
-    /// exact executable's musical sources. All payloads retain their checksums.
-    /// Future set scoring changes reuse pair evidence and rescore full plans.
-    pub fn migrate_legacy(&self, store: &Store) -> Result<()> {
-        let old = store.path(&self.legacy_root)?;
-        let new = store.path(&self.root)?;
-        if !new.exists() && old.exists() {
-            std::fs::create_dir_all(new.parent().unwrap())?;
-            store.path(&self.root)?;
-            std::fs::rename(old, new)?;
-            eprintln!("set search: migrated compatible measured decisions to the admission cache");
+    fn root_for(&self, kind: &str) -> &str {
+        match kind {
+            "windows" | "selector-refreshes" => &self.root,
+            "proposals" => &self.proposal_root,
+            "sets" if self.mode == CacheMode::Resume => &self.root,
+            _ => &self.state_root,
         }
-        Ok(())
     }
+
+    fn fallbacks_for(&self, kind: &str) -> impl Iterator<Item = &str> {
+        let roots: &[String] = match kind {
+            "windows" | "selector-refreshes" => &self.compatible_roots,
+            "sets" if self.mode == CacheMode::Resume => &self.compatible_roots,
+            _ => &[],
+        };
+        roots.iter().map(String::as_str)
+    }
+
     pub fn keys(&self, store: &Store, kind: &str) -> Result<Vec<String>> {
-        let path = store.path(&format!("{}/{kind}", self.root))?;
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-        let mut keys = vec![];
-        for entry in std::fs::read_dir(path)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                if let Some(key) = path.file_stem().and_then(|n| n.to_str()) {
-                    keys.push(key.to_owned());
+        let roots = std::iter::once(self.root_for(kind)).chain(self.fallbacks_for(kind));
+        let mut keys = std::collections::BTreeSet::new();
+        for root in roots {
+            let path = store.path(&format!("{root}/{kind}"))?;
+            if !path.exists() {
+                continue;
+            }
+            for entry in std::fs::read_dir(path)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    if let Some(key) = path.file_stem().and_then(|n| n.to_str()) {
+                        keys.insert(key.to_owned());
+                    }
                 }
             }
         }
-        keys.sort();
-        Ok(keys)
+        Ok(keys.into_iter().collect())
     }
+
     pub fn open(policy: &MixingConfig, pool: &[Track]) -> Result<Self> {
+        let mode = policy
+            .header
+            .extensions
+            .get(CACHE_MODE_KEY)
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let engine = if policy
+            .header
+            .extensions
+            .get(crate::set_config::ENGINE_KEY)
+            .and_then(Value::as_str)
+            == Some("cp")
+        {
+            "cp"
+        } else {
+            "legacy"
+        };
+        let policy = policy_key(policy)?;
+        let mut root = format!(
+            "search-cache/v1/{}/{policy}",
+            env!("MIXLIB_ADMISSION_RULES_HASH")
+        );
+        let mut proposal_root = format!(
+            "search-proposals/v1/{}/{policy}",
+            env!("MIXLIB_PROPOSAL_RULES_HASH")
+        );
+        let mut state_root = format!(
+            "search-state/v1/{}/{policy}/{engine}",
+            env!("MIXLIB_MUSICAL_RULES_HASH")
+        );
+        let mut compatible_roots = option_env!("MIXLIB_COMPATIBLE_ADMISSION_HASH")
+            .into_iter()
+            .flat_map(|digests| digests.split(','))
+            .map(|digest| format!("search-cache/v1/{digest}/{policy}"))
+            .collect::<Vec<_>>();
+        if mode != CacheMode::Resume {
+            let run = format!("search-bench/v1/{}", id());
+            state_root = format!("{run}/state");
+            proposal_root = format!("{run}/proposals");
+            if mode == CacheMode::WarmFacts {
+                compatible_roots.insert(0, root);
+            } else {
+                compatible_roots.clear();
+            }
+            root = format!("{run}/admission");
+        }
         Ok(Self {
-            root: format!(
-                "search-cache/v1/{}/{}",
-                env!("MIXLIB_ADMISSION_RULES_HASH"),
-                policy_key(policy)?
-            ),
-            legacy_root: format!(
-                "search-cache/v1/{}/{}",
-                env!("MIXLIB_MUSICAL_RULES_HASH"),
-                policy_key(policy)?
-            ),
+            root,
+            compatible_roots,
+            proposal_root,
+            state_root,
+            mode,
             sources: pool
                 .iter()
                 .map(|t| Ok((t.track_id.clone(), source_key(t)?)))
@@ -147,31 +210,38 @@ impl Cache {
         kind: &str,
         key: &str,
     ) -> Result<Option<T>> {
-        let path = format!("{}/{kind}/{key}.json", self.root);
-        if !store.path(&path)?.exists() {
+        let roots = std::iter::once(self.root_for(kind)).chain(self.fallbacks_for(kind));
+        let mut invalid = 0;
+        let mut found = None;
+        for root in roots {
+            let path = format!("{root}/{kind}/{key}.json");
+            if !store.path(&path)?.exists() {
+                continue;
+            }
+            let record = store.read::<Report>(&path).and_then(|r| {
+                let payload = &r.header.extensions["payload"];
+                require(
+                    r.header.extensions.get("digest") == Some(&json!(canonical_hash(payload)?)),
+                    "SEARCH_CACHE",
+                    "cache payload checksum changed",
+                )?;
+                Ok(serde_json::from_value(payload.clone())?)
+            });
+            match record {
+                Ok(value) => {
+                    found = Some(value);
+                    break;
+                }
+                Err(_) => invalid += 1,
+            }
+        }
+        self.invalid += invalid;
+        if found.is_some() {
+            self.hits += 1;
+        } else {
             self.misses += 1;
-            return Ok(None);
         }
-        let record = store.read::<Report>(&path).and_then(|r| {
-            let payload = &r.header.extensions["payload"];
-            require(
-                r.header.extensions.get("digest") == Some(&json!(canonical_hash(payload)?)),
-                "SEARCH_CACHE",
-                "cache payload checksum changed",
-            )?;
-            Ok(serde_json::from_value(payload.clone())?)
-        });
-        match record {
-            Ok(value) => {
-                self.hits += 1;
-                Ok(Some(value))
-            }
-            Err(_) => {
-                self.invalid += 1;
-                self.misses += 1;
-                Ok(None)
-            }
-        }
+        Ok(found)
     }
     pub fn write(
         &self,
@@ -187,7 +257,10 @@ impl Cache {
             .extensions
             .insert("digest".into(), json!(canonical_hash(&payload)?));
         record.header.extensions.insert("payload".into(), payload);
-        store.write(&format!("{}/{kind}/{key}.json", self.root), &record)?;
+        store.write(
+            &format!("{}/{kind}/{key}.json", self.root_for(kind)),
+            &record,
+        )?;
         Ok(())
     }
     /// Reuse a verified immutable payload instead of rewriting and fsyncing it.
@@ -205,7 +278,7 @@ impl Cache {
             "SEARCH_CACHE",
             "immutable key differs from payload",
         )?;
-        let path = format!("{}/{kind}/{key}.json", self.root);
+        let path = format!("{}/{kind}/{key}.json", self.root_for(kind));
         if store.path(&path)?.exists() {
             if let Ok(record) = store.read::<Report>(&path) {
                 if record.header.extensions.get("digest") == Some(&json!(expected))
@@ -353,23 +426,81 @@ mod tests {
         assert!(cache.saved_set(&store, &plan.policy).unwrap().is_none());
     }
     #[test]
-    fn compatible_namespace_migration_preserves_negative_measurements() {
+    fn compatible_pair_records_are_read_without_moving_the_previous_namespace() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::init_legacy(dir.path()).unwrap();
         let policy = MixingConfig::default();
         let mut legacy = Cache::open(&policy, &[]).unwrap();
-        legacy.root = legacy.legacy_root.clone();
+        legacy.root = "search-cache/v1/test-legacy".into();
         legacy
             .write(&store, "windows", "rejected", &json!({"edges":[]}))
             .unwrap();
+
         let mut current = Cache::open(&policy, &[]).unwrap();
-        current.migrate_legacy(&store).unwrap();
-        assert!(current
-            .read::<Value>(&store, "windows", "rejected")
+        current.compatible_roots = vec![legacy.root.clone()];
+        assert_eq!(current.keys(&store, "windows").unwrap(), ["rejected"]);
+        assert_eq!(
+            current
+                .read::<Value>(&store, "windows", "rejected")
+                .unwrap(),
+            Some(json!({"edges":[]}))
+        );
+        assert!(store.path(&legacy.root).unwrap().exists());
+        assert_ne!(current.root_for("windows"), current.root_for("proposals"));
+        assert_ne!(
+            current.root_for("windows"),
+            current.root_for("cp-closing-frontiers")
+        );
+    }
+
+    #[test]
+    fn benchmark_modes_isolate_winners_and_cold_pair_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(dir.path()).unwrap();
+        let mut policy = MixingConfig::default();
+        let resume = Cache::open(&policy, &[]).unwrap();
+        resume
+            .write(&store, "windows", "pair", &json!({"edges":[]}))
+            .unwrap();
+        resume
+            .write(&store, "sets", "winner", &json!({"plan_id":"earlier"}))
+            .unwrap();
+
+        policy
+            .header
+            .extensions
+            .insert(CACHE_MODE_KEY.into(), json!("warm_facts"));
+        let mut warm = Cache::open(&policy, &[]).unwrap();
+        assert!(warm
+            .read::<Value>(&store, "windows", "pair")
             .unwrap()
             .is_some());
-        assert!(!store.path(&legacy.root).unwrap().exists());
+        assert!(warm
+            .read::<Value>(&store, "sets", "winner")
+            .unwrap()
+            .is_none());
+
+        warm.write(&store, "windows", "isolated", &json!({"edges":[]}))
+            .unwrap();
+        let mut another = Cache::open(&policy, &[]).unwrap();
+        assert!(another
+            .read::<Value>(&store, "windows", "isolated")
+            .unwrap()
+            .is_none());
+
+        policy
+            .header
+            .extensions
+            .insert(CACHE_MODE_KEY.into(), json!("cold"));
+        let mut cold = Cache::open(&policy, &[]).unwrap();
+        assert!(cold.keys(&store, "windows").unwrap().is_empty());
+        assert!(cold
+            .read::<Value>(&store, "sets", "winner")
+            .unwrap()
+            .is_none());
+        assert!(cold.previous_roots(&store, 2).unwrap().is_empty());
     }
+
     #[test]
     fn source_revisions_analysis_and_corrections_invalidate_pair_keys() {
         let track = Track {
@@ -452,7 +583,11 @@ mod tests {
         b.header
             .extensions
             .insert("set_config".into(), json!({"name":"another set"}));
+        b.header
+            .extensions
+            .insert(crate::set_config::ENGINE_KEY.into(), json!("cp"));
         assert_eq!(policy_key(&a).unwrap(), policy_key(&b).unwrap());
+        assert_eq!(Cache::set_key(&a).unwrap(), Cache::set_key(&b).unwrap());
         b.max_speed_deviation = 0.1;
         assert_ne!(policy_key(&a).unwrap(), policy_key(&b).unwrap());
         b = a.clone();
@@ -506,7 +641,7 @@ mod tests {
             .write_immutable(&store, "parts", &key, &payload)
             .unwrap();
         let path = store
-            .path(&format!("{}/parts/{key}.json", cache.root))
+            .path(&format!("{}/parts/{key}.json", cache.root_for("parts")))
             .unwrap();
         let original = std::fs::read(&path).unwrap();
         let modified = path.metadata().unwrap().modified().unwrap();

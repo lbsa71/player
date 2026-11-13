@@ -12,6 +12,33 @@ public enum RecordingCatalog {
     public static let retainedMetadataLimit = 32 * 1024
     public static let boundaryToleranceSeconds = 2.0
 
+    /// Include the active folder and the recording folders created by archive cleanup.
+    public static func libraryEntries(directory: URL) throws -> [[String:Any]] {
+        let directory = directory.standardizedFileURL
+        let archive = directory.deletingLastPathComponent()
+            .appendingPathComponent(directory.lastPathComponent + " Archive", isDirectory: true)
+        let manager = FileManager.default
+        var folders = [directory]
+        if manager.fileExists(atPath: archive.path) {
+            guard try attributes(archive).st_mode & S_IFMT == S_IFDIR else {
+                throw CatalogError("Recording archive must be a real directory.")
+            }
+            let batches = try manager.contentsOfDirectory(at: archive, includingPropertiesForKeys: nil)
+            for batch in batches.sorted(by: { $0.path < $1.path }) where (try? attributes(batch).st_mode & S_IFMT) == S_IFDIR {
+                folders.append(batch.appendingPathComponent("recordings", isDirectory: true))
+            }
+        }
+        return try folders.flatMap { folder -> [[String:Any]] in
+            guard manager.fileExists(atPath: folder.path) else { return [] }
+            let result = try scan(directory: folder, verifyAudio: true)
+            return (result["entries"] as? [[String:Any]] ?? []).map { entry in
+                var entry = entry
+                entry["directory"] = folder.path
+                return entry
+            }
+        }
+    }
+
     public static func scan(directory: URL, verifyAudio: Bool = false) throws -> [String: Any] {
         let root = directory.standardizedFileURL
         let rootInfo = try attributes(root)

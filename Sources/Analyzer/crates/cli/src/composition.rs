@@ -3,6 +3,7 @@
 use super::*;
 use crate::{measured_beam::route_quality, tactics::MeasuredEdge};
 use mixlib_planner::TrackPacing;
+use mixlib_set_search::objective::{self, CompleteScore, PREFERRED_TRANSITION_FIT};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -68,7 +69,34 @@ impl Shape {
         let p = progress.clamp(0., 1.);
         let knots = self.knots();
         let w = knots.windows(2).find(|w| p <= w[1].0).unwrap();
-        w[0].1 + (w[1].1 - w[0].1) * (p - w[0].0) / (w[1].0 - w[0].0)
+        Self::target_on_segment(w, p)
+    }
+
+    fn target_on_segment(segment: &[(f64, f64)], progress: f64) -> f64 {
+        let (x0, y0) = segment[0];
+        let (x1, y1) = segment[1];
+        y0 + (y1 - y0) * (progress - x0) / (x1 - x0)
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn target_range(self, start: f64, end: f64) -> [f64; 2] {
+        let start = start.clamp(0., 1.);
+        let end = end.clamp(0., 1.);
+        let mut lower = f64::INFINITY;
+        let mut upper = f64::NEG_INFINITY;
+        for segment in self.knots().windows(2) {
+            let a = start.max(segment[0].0);
+            let b = end.min(segment[1].0);
+            if a <= b {
+                // Within a segment the floating interpolation is monotone.
+                // At a knot consider both adjacent formulas.
+                let a = Self::target_on_segment(segment, a);
+                let b = Self::target_on_segment(segment, b);
+                lower = lower.min(a.min(b));
+                upper = upper.max(a.max(b));
+            }
+        }
+        [lower, upper]
     }
 }
 impl Request {
@@ -127,6 +155,8 @@ struct Profile {
     duration: f64,
     rate: f64,
     opening: mixlib_planner::ChainOpening,
+    #[cfg(feature = "cp-search")]
+    opening_accents: Vec<u64>,
 }
 pub(super) struct Context {
     replays: crate::set_replays::ReplayCache,
@@ -212,6 +242,112 @@ struct Passage {
     energy: f64,
     development: f64,
     coverage: f64,
+}
+
+impl Passage {
+    fn dwell_penalty(&self, overlap_credit: f64) -> f64 {
+        let development = self.seconds + overlap_credit;
+        let shortage = ((self.preferred - development) / self.preferred.max(1.)).max(0.);
+        shortage * shortage * (1. + self.development)
+    }
+}
+
+#[cfg(feature = "cp-search")]
+#[derive(Clone, Copy)]
+pub(super) struct ReplayScoreBound {
+    pub(super) upper: f64,
+    pub(super) without_passage_penalties: f64,
+}
+
+const DEVELOPMENT_GRACE_SECONDS: f64 = 0.05;
+const PREFERRED_DEVELOPMENT_SECONDS: f64 = 150.;
+
+#[cfg(feature = "cp-search")]
+pub(super) fn preferred_development_floor(track_seconds: f64) -> f64 {
+    PREFERRED_DEVELOPMENT_SECONDS.min(track_seconds * 0.8)
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(super) struct DevelopmentShortfall {
+    pub track_id: String,
+    pub position: usize,
+    pub solo_seconds: f64,
+    pub overlap_credit_seconds: f64,
+    pub minimum_seconds: f64,
+}
+
+#[derive(Debug)]
+pub(super) struct PlanRejection {
+    pub reason: &'static str,
+    pub development: Option<DevelopmentShortfall>,
+}
+
+impl PlanRejection {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            development: None,
+        }
+    }
+}
+
+fn minimum_development_seconds(track_seconds: f64, development: f64) -> f64 {
+    (60. + 30. * development).min(track_seconds * 0.45)
+}
+
+/// A bridge endpoint from a pinned pair with a transition on a time-map anchor.
+#[cfg(feature = "cp-search")]
+#[derive(Clone, Copy)]
+pub(super) struct DevelopmentPort {
+    frame: u64,
+    source_rate: u32,
+    output_rate: u32,
+    speed: f64,
+    credit: f64,
+}
+
+#[cfg(feature = "cp-search")]
+pub(super) fn measured_development_ports(edge: &MeasuredEdge) -> [Option<DevelopmentPort>; 2] {
+    let pair = &edge.plan;
+    let transition = &pair.transitions[0];
+    let Some(credit) = read_tactics(pair)
+        .ok()
+        .filter(|tactics| tactics.len() == 1)
+        .map(|tactics| overlap_credits(&tactics, 2, f64::from(pair.output.sample_rate_hz)))
+    else {
+        return [None, None];
+    };
+    [0, 1].map(|placement| {
+        let map = &pair.placements[placement].time_map;
+        let slopes = map.slopes();
+        let (anchor, output, speed) = if placement == 0 {
+            (
+                map.anchors.get(1)?,
+                transition.start_output_frame,
+                *slopes.first()?,
+            )
+        } else {
+            (
+                map.anchors.iter().rev().nth(1)?,
+                transition.end_output_frame,
+                *slopes.last()?,
+            )
+        };
+        (anchor.output_frame == output
+            && anchor.source_frame < 1 << 53
+            && speed.is_finite()
+            && speed > 0.
+            && map.source_sample_rate_hz != 0
+            && map.output_sample_rate_hz == pair.output.sample_rate_hz
+            && map.output_sample_rate_hz != 0)
+            .then_some(DevelopmentPort {
+                frame: anchor.source_frame,
+                source_rate: map.source_sample_rate_hz,
+                output_rate: map.output_sample_rate_hz,
+                speed,
+                credit: credit[placement],
+            })
+    })
 }
 #[derive(Clone, Copy)]
 struct DurationEdge {
@@ -310,11 +446,18 @@ impl Context {
                 .get("segments")
                 .ok_or_else(|| Error::new("SET_ANALYSIS", "segment analysis required"))?;
             let segments: SegmentAnalysis = store.read_ref(reference)?;
+            #[cfg(feature = "cp-search")]
+            let (opening, opening_accents) =
+                mixlib_planner::ChainOpening::read_with_candidates(store, &t.track_id, cancel)?;
+            #[cfg(not(feature = "cp-search"))]
+            let opening = mixlib_planner::read_chain_opening_cue(store, &t.track_id, cancel)?;
             profiles.push(Profile {
                 tiles: segments.tiles.into_iter().filter(|t| t.bars == 1).collect(),
                 duration: t.format.frames as f64 / f64::from(t.format.sample_rate_hz),
                 rate: f64::from(t.format.sample_rate_hz),
-                opening: mixlib_planner::read_chain_opening_cue(store, &t.track_id, cancel)?,
+                opening,
+                #[cfg(feature = "cp-search")]
+                opening_accents,
             });
         }
         // A library-relative acoustic intensity proxy, not emotion recognition.
@@ -362,6 +505,25 @@ impl Context {
         end: u64,
         clock: impl Fn(f64) -> f64,
     ) -> Passage {
+        let rate = f64::from(map.output_sample_rate_hz);
+        self.passage_with_arc(index, map, begin, end, |middle, energy| {
+            (energy
+                - self
+                    .request
+                    .shape
+                    .target(clock(middle) / rate / self.request.max()))
+            .abs()
+        })
+    }
+
+    fn passage_with_arc(
+        &self,
+        index: usize,
+        map: &TimeMap,
+        begin: u64,
+        end: u64,
+        arc_error: impl Fn(f64, f64) -> f64,
+    ) -> Passage {
         let p = &self.profiles[index];
         let rate = f64::from(map.output_sample_rate_hz);
         let mut result = Passage {
@@ -384,13 +546,7 @@ impl Context {
             let weight = (next - at) as f64 / rate;
             if let Some(t) = tile {
                 let energy = t.roles["set_intensity_percentile"];
-                result.error += weight
-                    * (energy
-                        - self
-                            .request
-                            .shape
-                            .target(clock(middle) / rate / self.request.max()))
-                    .abs();
+                result.error += weight * arc_error(middle, energy);
                 result.energy += weight * energy;
                 result.development += weight
                     * t.roles
@@ -413,18 +569,96 @@ impl Context {
         result.coverage /= seconds;
         // Development-rich songs get a stronger preference for a longer stay.
         // Short recordings still get to contribute a substantial fraction.
-        result.minimum = (60. + 30. * result.development).min(p.duration * 0.45);
-        result.preferred = (150. + 120. * result.development).min(p.duration * 0.8);
+        result.minimum = minimum_development_seconds(p.duration, result.development);
+        result.preferred =
+            (PREFERRED_DEVELOPMENT_SECONDS + 120. * result.development).min(p.duration * 0.8);
         result
     }
     pub(super) fn evaluate(&self, plan: &MixPlan, complete: bool) -> Option<Value> {
         self.evaluate_diagnosed(plan, complete, &mut None)
     }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn rules_out_development(
+        &self,
+        track: usize,
+        arrival: Option<DevelopmentPort>,
+        departure: Option<DevelopmentPort>,
+    ) -> bool {
+        let (Some(a), Some(b)) = (arrival, departure) else {
+            return false;
+        };
+        if a.source_rate != b.source_rate || a.output_rate != b.output_rate {
+            return false;
+        }
+        let Some(gap) = b.frame.checked_sub(a.frame) else {
+            return true;
+        };
+        // append_pair partitions this span into three intervals, each at
+        // no less than the slower endpoint speed. Allow a full output frame
+        // per interval for the three rounded lengths and floating arithmetic.
+        let output_rate = f64::from(a.output_rate);
+        let solo_frames =
+            gap as f64 * (output_rate / f64::from(a.source_rate)) / a.speed.min(b.speed);
+        if solo_frames >= (1_u64 << 48) as f64 {
+            return false;
+        }
+        let solo_upper = (solo_frames + 3.) / output_rate;
+        // All measured development features are nonnegative. Verified overlap
+        // credits are fixed by these two tactics, and replay does not satisfy dwell.
+        solo_upper + a.credit + b.credit + DEVELOPMENT_GRACE_SECONDS
+            < minimum_development_seconds(self.profiles[track].duration, 0.)
+    }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn developed_bridge(
+        &self,
+        track: usize,
+        bridge: &chain::MeasuredBridge,
+        arrival: Option<DevelopmentPort>,
+        departure: Option<DevelopmentPort>,
+    ) -> bool {
+        let (Some(a), Some(b)) = (arrival, departure) else {
+            return false;
+        };
+        let credit = a.credit + b.credit + DEVELOPMENT_GRACE_SECONDS;
+        let solo = (bridge.solo_end - bridge.solo_start) as f64
+            / f64::from(bridge.map.output_sample_rate_hz);
+        if solo + credit >= minimum_development_seconds(self.profiles[track].duration, 1.) {
+            return true;
+        }
+        let passage = self.passage(track, &bridge.map, bridge.solo_start, bridge.solo_end);
+        solo + credit >= passage.minimum
+    }
+
     fn evaluate_diagnosed(
         &self,
         plan: &MixPlan,
         complete: bool,
         rejection: &mut Option<&'static str>,
+    ) -> Option<Value> {
+        let mut detail = None;
+        let evidence = self.evaluate_plan(plan, complete, false, &mut detail);
+        *rejection = detail.map(|d| d.reason);
+        evidence
+    }
+
+    pub(super) fn evaluate_for_save(
+        &self,
+        plan: &MixPlan,
+        replay_base: bool,
+    ) -> std::result::Result<Value, PlanRejection> {
+        let mut rejection = None;
+        self.evaluate_plan(plan, true, replay_base, &mut rejection)
+            .ok_or_else(|| rejection.unwrap_or_else(|| PlanRejection::new("invalid_evidence")))
+    }
+
+    fn evaluate_plan(
+        &self,
+        plan: &MixPlan,
+        complete: bool,
+        development_first: bool,
+        rejection: &mut Option<PlanRejection>,
     ) -> Option<Value> {
         let credits = overlap_credits(
             &read_tactics(plan).ok()?,
@@ -437,8 +671,9 @@ impl Context {
         let base_end = arrangement
             .as_ref()
             .map_or(plan.total_output_frames, |a| a.base_output_frames);
-        if complete && !self.request.accepts(duration) {
-            *rejection = Some("duration_outside_window");
+        let outside_clock = complete && !self.request.accepts(duration);
+        if outside_clock && !development_first {
+            *rejection = Some(PlanRejection::new("duration_outside_window"));
             return None;
         }
         let mut error = 0.;
@@ -459,7 +694,7 @@ impl Context {
                 .get(i)
                 .map_or(base_end, |t| t.start_output_frame);
             if end <= begin {
-                *rejection = Some("no_solo_runway");
+                *rejection = Some(PlanRejection::new("no_solo_runway"));
                 return None;
             }
             let a = p.time_map.source_at(begin as f64).round() as u64;
@@ -517,20 +752,32 @@ impl Context {
             }
             // Bookends are checked only after choosing their musical endpoints.
             let development_seconds = passage.seconds + credits[i];
-            if development_seconds + 0.05 < passage.minimum {
-                *rejection = Some("insufficient_development");
+            if development_seconds + DEVELOPMENT_GRACE_SECONDS < passage.minimum {
+                *rejection = Some(PlanRejection {
+                    reason: "insufficient_development",
+                    development: Some(DevelopmentShortfall {
+                        track_id: p.track_id.clone(),
+                        position: i + 1,
+                        solo_seconds: passage.seconds,
+                        overlap_credit_seconds: credits[i],
+                        minimum_seconds: passage.minimum,
+                    }),
+                });
                 return None;
             }
             error += passage.error * passage.seconds;
             seconds += passage.seconds;
-            let shortage =
-                ((passage.preferred - development_seconds) / passage.preferred.max(1.)).max(0.);
-            dwell += shortage * shortage * (1. + passage.development);
+            let penalty = passage.dwell_penalty(credits[i]);
+            dwell += penalty;
             rows.push(json!({"track_id":p.track_id,"solo_seconds":passage.seconds,"replay_seconds":replay_seconds,"overlap_credit_seconds":credits[i],"development_seconds":development_seconds,"minimum_seconds":passage.minimum,
-                "preferred_seconds":passage.preferred,"intensity_percentile":passage.energy,"arc_error":passage.error,"development":passage.development,"measured_coverage":passage.coverage,"cache_key":cache_key,"dwell_penalty":shortage*shortage*(1.+passage.development),
+                "preferred_seconds":passage.preferred,"intensity_percentile":passage.energy,"arc_error":passage.error,"development":passage.development,"measured_coverage":passage.coverage,"cache_key":cache_key,"dwell_penalty":penalty,
                 "source_start_seconds":a as f64/self.profiles[index].rate,"source_end_seconds":b as f64/self.profiles[index].rate}));
         }
-        let arc_error = error / seconds.max(1.);
+        if outside_clock {
+            *rejection = Some(PlanRejection::new("duration_outside_window"));
+            return None;
+        }
+        let arc_error = objective::arc_error(error, seconds);
         let dwell_penalty = dwell / count.max(1) as f64;
         let q = route_quality(plan);
         // A partial route contributes toward the full clock. Dividing by its
@@ -546,25 +793,28 @@ impl Context {
         } else {
             (seconds / horizon).clamp(0., 1.)
         };
-        let replay_fraction = arrangement.as_ref().map_or(0., |a| {
-            a.added_frames() as f64 / plan.total_output_frames as f64
-        });
-        let transition_shortfall: f64 = plan
-            .header
-            .extensions
-            .get("chain_joins")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(|j| (25. - j["score"].as_f64().unwrap_or(25.)).max(0.))
-            .sum();
+        let replay_frames = arrangement.as_ref().map_or(0, |a| a.added_frames());
+        let replay_fraction = replay_frames as f64 / plan.total_output_frames as f64;
+        let transition_shortfall = transition_shortfall(plan);
         // An admitted tactic is feasible even when its fit is below the preferred
         // score. Penalize shortfall continuously instead of deleting the route.
         let transition_fit_penalty = transition_shortfall / (horizon / 60.).max(1.);
-        let objective = q.sustained() / (horizon / 60.).max(1.)
-            - transition_fit_penalty
-            - (8. * arc_error + 2. * dwell_penalty) * heard_fraction
-            - 2. * replay_fraction;
+        let objective = if complete {
+            CompleteScore {
+                duration_seconds: duration,
+                sustained_quality_seconds: q.sustained(),
+                transition_shortfall,
+                replay_seconds: replay_frames as f64 / rate,
+                arc_error,
+                development_penalty: dwell_penalty,
+            }
+            .value()
+        } else {
+            q.sustained() / (horizon / 60.).max(1.)
+                - transition_fit_penalty
+                - (8. * arc_error + 2. * dwell_penalty) * heard_fraction
+                - 2. * replay_fraction
+        };
         Some(
             json!({"method":"set-composition/3","structure":self.request.shape.name(),"target_minutes":self.request.minutes,
             "minimum_seconds":self.request.min(),"maximum_seconds":self.request.max(),"duration_seconds":duration,
@@ -584,24 +834,69 @@ impl Context {
         entry: u64,
         pacing: &TrackPacing,
     ) -> Result<Option<MixPlan>> {
-        if edge.last_resort {
-            return Ok(None);
-        }
-        let Some(paced) = pacing.assess(entry, edge.exit) else {
+        self.extend_diagnosed(prefix, edge, from, entry, pacing, &mut None)
+    }
+
+    pub(super) fn extend_diagnosed(
+        &self,
+        prefix: Option<&MixPlan>,
+        edge: &MeasuredEdge,
+        from: usize,
+        entry: u64,
+        pacing: &TrackPacing,
+        rejection: &mut Option<String>,
+    ) -> Result<Option<MixPlan>> {
+        let Some(mut plan) = Self::append_measured(prefix, edge, entry, pacing, rejection)? else {
             return Ok(None);
         };
-        let mut plan =
-            match chain::extend_measured(prefix, &edge.plan, edge.score, edge.last_resort) {
-                Ok(p) => p,
-                Err(e) if measured_beam::route_local(&e) => return Ok(None),
-                Err(e) => return Err(e),
-            };
         if prefix.is_none() {
             let opening = self.profiles[from]
                 .opening
                 .before(plan.placements[0].source_start_frame);
             chain::open_measured(&mut plan, opening)?;
         }
+        let end = plan.transitions.last().unwrap().end_output_frame as f64
+            / f64::from(plan.output.sample_rate_hz);
+        if end >= self.request.max() {
+            *rejection = Some("join_end_at_or_after_max_duration".into());
+            return Ok(None);
+        }
+        let mut composition_rejection = None;
+        let Some(evidence) = self.evaluate_diagnosed(&plan, false, &mut composition_rejection)
+        else {
+            *rejection = Some(composition_rejection.unwrap_or("invalid_evidence").into());
+            return Ok(None);
+        };
+        plan.header
+            .extensions
+            .insert("set_composition".into(), evidence);
+        Ok(Some(plan))
+    }
+
+    pub(super) fn append_measured(
+        prefix: Option<&MixPlan>,
+        edge: &MeasuredEdge,
+        entry: u64,
+        pacing: &TrackPacing,
+        rejection: &mut Option<String>,
+    ) -> Result<Option<MixPlan>> {
+        if edge.last_resort {
+            *rejection = Some("last_resort_join".into());
+            return Ok(None);
+        }
+        let Some(paced) = pacing.assess(entry, edge.exit) else {
+            *rejection = Some("phrase_pacing".into());
+            return Ok(None);
+        };
+        let mut plan =
+            match chain::extend_measured(prefix, &edge.plan, edge.score, edge.last_resort) {
+                Ok(p) => p,
+                Err(e) if measured_beam::route_local(&e) => {
+                    *rejection = Some(e.code);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
         if let Some(j) = plan
             .header
             .extensions
@@ -611,18 +906,16 @@ impl Context {
         {
             j["pacing"] = serde_json::to_value(paced)?;
         }
-        let end = plan.transitions.last().unwrap().end_output_frame as f64
-            / f64::from(plan.output.sample_rate_hz);
-        if end >= self.request.max() {
-            return Ok(None);
-        }
-        let Some(evidence) = self.evaluate(&plan, false) else {
-            return Ok(None);
-        };
-        plan.header
-            .extensions
-            .insert("set_composition".into(), evidence);
         Ok(Some(plan))
+    }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn opening_choices(&self, plan: &MixPlan) -> Vec<u64> {
+        let first = &plan.placements[0];
+        let profile = &self.profiles[self.ids[&first.track_id]];
+        profile
+            .opening
+            .candidates_before(first.source_start_frame, &profile.opening_accents)
     }
 
     /// Closing is a real musical endpoint, optionally followed by verified loops.
@@ -632,12 +925,33 @@ impl Context {
         plan: &MixPlan,
         cancel: &Cancellation,
     ) -> Result<(Option<MixPlan>, CloseDiagnostics)> {
+        self.close_in_scope(store, plan, true, cancel)
+    }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn close_original(
+        &self,
+        store: &Store,
+        plan: &MixPlan,
+        cancel: &Cancellation,
+    ) -> Result<(Option<MixPlan>, CloseDiagnostics)> {
+        self.close_in_scope(store, plan, false, cancel)
+    }
+
+    fn close_in_scope(
+        &self,
+        store: &Store,
+        plan: &MixPlan,
+        allow_replay: bool,
+        cancel: &Cancellation,
+    ) -> Result<(Option<MixPlan>, CloseDiagnostics)> {
         let mut diagnostics = CloseDiagnostics::default();
         let mut best = None;
-        for window in [
-            self.closing_window(plan),
-            self.closing_window_from(plan, self.request.min() / (1. + MAX_REPLAY_FRACTION)),
-        ] {
+        let direct = std::iter::once(self.closing_window(plan));
+        let replay = allow_replay.then(|| {
+            self.closing_window_from(plan, self.request.min() / (1. + MAX_REPLAY_FRACTION))
+        });
+        for window in direct.chain(replay) {
             let Some(mut window) = window else {
                 diagnostics.no_duration_window += 1;
                 continue;
@@ -648,13 +962,21 @@ impl Context {
                 diagnostics.ending_retries += u64::from(attempt > 0);
                 match chain::finish_measured_in_window(store, plan.clone(), Some(window), cancel) {
                     Ok(finished) => {
-                        if let Some(mut finished) = self.replays.arrange(
-                            store,
-                            &finished,
-                            self.request.min(),
-                            self.request.max(),
-                            cancel,
-                        )? {
+                        let raw_seconds = finished.total_output_frames as f64
+                            / f64::from(finished.output.sample_rate_hz);
+                        let ending = finished.placements.last().unwrap().source_end_frame;
+                        let candidate = if allow_replay {
+                            self.replays.arrange(
+                                store,
+                                &finished,
+                                self.request.min(),
+                                self.request.max(),
+                                cancel,
+                            )?
+                        } else {
+                            self.request.accepts(raw_seconds).then_some(finished)
+                        };
+                        if let Some(mut finished) = candidate {
                             let mut rejection = None;
                             if let Some(evidence) =
                                 self.evaluate_diagnosed(&finished, true, &mut rejection)
@@ -673,28 +995,27 @@ impl Context {
                                     .entry(rejection.unwrap_or("invalid_evidence").into())
                                     .or_default() += 1;
                             }
-                        } else {
+                        } else if allow_replay {
                             diagnostics.replay_shortfall += 1;
-                            let seconds = finished.total_output_frames as f64
-                                / f64::from(finished.output.sample_rate_hz);
                             diagnostics.replay_shortfall_min_raw_seconds = Some(
                                 diagnostics
                                     .replay_shortfall_min_raw_seconds
-                                    .map_or(seconds, |old| old.min(seconds)),
+                                    .map_or(raw_seconds, |old| old.min(raw_seconds)),
                             );
                             diagnostics.replay_shortfall_max_raw_seconds = Some(
                                 diagnostics
                                     .replay_shortfall_max_raw_seconds
-                                    .map_or(seconds, |old| old.max(seconds)),
+                                    .map_or(raw_seconds, |old| old.max(raw_seconds)),
                             );
-                            if let Some(later) = later_closing_window(
-                                window,
-                                finished.placements.last().unwrap().source_end_frame,
-                                attempt,
-                            ) {
+                            if let Some(later) = later_closing_window(window, ending, attempt) {
                                 window = later;
                                 continue;
                             }
+                        } else {
+                            *diagnostics
+                                .composition_rejections
+                                .entry("duration_outside_window".into())
+                                .or_default() += 1;
                         }
                     }
                     Err(e) if measured_beam::route_local(&e) => {
@@ -711,6 +1032,299 @@ impl Context {
         }
         Ok((best, diagnostics))
     }
+    /// Bound every completion of these exact joins. Bookending and replays
+    /// preserve their fit, measured quality, and pacing charges.
+    #[cfg(all(feature = "cp-search", test))]
+    pub(super) fn closing_score_upper(&self, plan: &MixPlan, fixed_ending: bool) -> Option<f64> {
+        self.closing_score_envelope(plan, fixed_ending)
+            .upper_bound()
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn closing_score_envelope(
+        &self,
+        plan: &MixPlan,
+        fixed_ending: bool,
+    ) -> mixlib_set_search::bounds::ScoreEnvelope {
+        let mut minimum = self.request.min();
+        let mut maximum = self.request.max();
+        let mut replay_lower = 0.;
+        if fixed_ending {
+            let rate = f64::from(plan.output.sample_rate_hz);
+            let base = plan.total_output_frames;
+            let budget = (base as f64 * MAX_REPLAY_FRACTION).floor() as u64;
+            minimum = minimum.max(base as f64 / rate);
+            maximum = maximum.min(base.saturating_add(budget) as f64 / rate);
+            let required = ((self.request.min() * rate).ceil() as u64).saturating_sub(base);
+            replay_lower = required as f64 / rate;
+        }
+        mixlib_set_search::bounds::ScoreEnvelope {
+            min_duration_seconds: minimum,
+            max_duration_seconds: maximum,
+            sustained_quality_upper: route_quality(plan).sustained(),
+            transition_shortfall_lower: transition_shortfall(plan),
+            replay_seconds_lower: replay_lower,
+            arc_error_lower: 0.,
+            development_penalty_lower: 0.,
+        }
+    }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn replay_score_bound(&self, plan: &MixPlan) -> Option<ReplayScoreBound> {
+        let envelope = self.closing_score_envelope(plan, true);
+        let penalties = self.replay_passage_penalty_bounds(plan, envelope.max_duration_seconds);
+        Self::penalty_adjusted_bound(envelope, penalties)
+    }
+
+    /// Match the rounded source-to-output extension in chain::apply_bookends.
+    /// Every eligible closing cue is at or before source_frames.
+    #[cfg(feature = "cp-search")]
+    pub(super) fn latest_ending_output_frame(&self, plan: &MixPlan) -> Option<u64> {
+        let first = plan.placements.first()?;
+        let last = plan.placements.last()?;
+        if plan
+            .header
+            .extensions
+            .get("selected_opening_source_frame")?
+            .as_u64()
+            != Some(first.source_start_frame)
+            || !matches!(plan.output.sample_rate_hz, 44100 | 48000)
+            || read_arrangement(plan).ok()?.is_some()
+        {
+            return None;
+        }
+        let profile = self.profiles.get(*self.ids.get(&last.track_id)?)?;
+        let map = &last.time_map;
+        let tail = map.anchors.iter().rev().nth(1)?;
+        let speed = *map.slopes().last()?;
+        if !(0.5..=2.).contains(&speed)
+            || !(0. ..=86_400.).contains(&profile.duration)
+            || profile.rate != f64::from(map.source_sample_rate_hz)
+            || map.output_sample_rate_hz != plan.output.sample_rate_hz
+        {
+            return None;
+        }
+        let source_tail = self.source_frames(last).checked_sub(tail.source_frame)?;
+        let output_per_source = f64::from(plan.output.sample_rate_hz) / profile.rate / speed;
+        tail.output_frame
+            .checked_add((source_tail as f64 * output_per_source).round() as u64)
+    }
+
+    /// The opening and all joins are fixed. A final fade can only alter the
+    /// last song, and legal replays may shift the existing narrative clock.
+    #[cfg(feature = "cp-search")]
+    pub(super) fn fixed_opening_score_bound(
+        &self,
+        plan: &MixPlan,
+        latest_base: Option<u64>,
+    ) -> Option<ReplayScoreBound> {
+        let coarse = self.closing_score_envelope(plan, false);
+        let refine = || {
+            let latest_base = latest_base?;
+            let last_join_end = plan.transitions.last()?.end_output_frame;
+            let tail = plan
+                .placements
+                .last()?
+                .time_map
+                .anchors
+                .iter()
+                .rev()
+                .nth(1)?;
+            if tail.output_frame != last_join_end {
+                return None;
+            }
+            let rate = f64::from(plan.output.sample_rate_hz);
+            let high = (self.request.max() * rate).floor() as u64;
+            let base_cap = latest_base.min(high);
+            let replay_cap = ((base_cap as f64 * MAX_REPLAY_FRACTION).floor() as u64)
+                .min(high.checked_sub(tail.output_frame)?);
+            let mut envelope = coarse;
+            envelope.max_duration_seconds = envelope
+                .max_duration_seconds
+                .min(latest_base.checked_add(replay_cap)? as f64 / rate);
+            let minimum = (self.request.min() * rate).ceil() as u64;
+            envelope.replay_seconds_lower = minimum.saturating_sub(latest_base) as f64 / rate;
+            let penalties = self.original_passage_penalty_bounds(
+                plan,
+                None,
+                replay_cap,
+                envelope.max_duration_seconds,
+            );
+            Self::penalty_adjusted_bound(envelope, penalties)
+        };
+        let coarse_upper = coarse.upper_bound()?;
+        Some(ReplayScoreBound {
+            upper: refine().map_or(coarse_upper, |bound| bound.upper.min(coarse_upper)),
+            without_passage_penalties: coarse_upper,
+        })
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn penalty_adjusted_bound(
+        mut envelope: mixlib_set_search::bounds::ScoreEnvelope,
+        penalties: Option<(f64, f64)>,
+    ) -> Option<ReplayScoreBound> {
+        let coarse = envelope.upper_bound()?;
+        if let Some((arc, dwell)) = penalties {
+            envelope.arc_error_lower = arc;
+            envelope.development_penalty_lower = dwell;
+        }
+        Some(ReplayScoreBound {
+            upper: envelope
+                .upper_bound()
+                .map_or(coarse, |upper| upper.min(coarse)),
+            without_passage_penalties: coarse,
+        })
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn replay_passage_penalty_bounds(&self, plan: &MixPlan, maximum: f64) -> Option<(f64, f64)> {
+        let rate = f64::from(plan.output.sample_rate_hz);
+        let base = plan.total_output_frames;
+        let high = (self.request.max() * rate).floor() as u64;
+        let budget =
+            ((base as f64 * MAX_REPLAY_FRACTION).floor() as u64).min(high.checked_sub(base)?);
+        self.original_passage_penalty_bounds(plan, Some(base), budget, maximum)
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn original_passage_penalty_bounds(
+        &self,
+        plan: &MixPlan,
+        fixed_end: Option<u64>,
+        budget: u64,
+        maximum: f64,
+    ) -> Option<(f64, f64)> {
+        let count = plan.placements.len();
+        let rate = f64::from(plan.output.sample_rate_hz);
+        if !(1..=128).contains(&count)
+            || plan.transitions.len() + 1 != count
+            || !matches!(plan.output.sample_rate_hz, 44100 | 48000)
+            || maximum < self.request.min()
+            || !maximum.is_finite()
+            || read_arrangement(plan).ok()?.is_some()
+        {
+            return None;
+        }
+        let credits = overlap_credits(&read_tactics(plan).ok()?, count, rate);
+        let mut weighted_error = 0.;
+        let mut dwell = 0.;
+        let fixed_passages = if fixed_end.is_some() {
+            count
+        } else {
+            count - 1
+        };
+        for (i, placement) in plan.placements.iter().take(fixed_passages).enumerate() {
+            let begin = i
+                .checked_sub(1)
+                .map_or(0, |prev| plan.transitions[prev].end_output_frame);
+            let end = plan
+                .transitions
+                .get(i)
+                .map(|next| next.start_output_frame)
+                .or(fixed_end)?;
+            if begin >= end
+                || end as f64 / rate > maximum
+                || placement.time_map.output_sample_rate_hz != plan.output.sample_rate_hz
+            {
+                return None;
+            }
+            let index = *self.ids.get(&placement.track_id)?;
+            let passage =
+                self.passage_with_arc(index, &placement.time_map, begin, end, |middle, energy| {
+                    // The original midpoint can move by any amount from zero to
+                    // the entire remaining replay budget. Include the scorer's
+                    // integer midpoint rounding as well as the base evaluation.
+                    let rounded = middle.round() as u64;
+                    let first = middle.min(rounded as f64);
+                    let last = middle.max((rounded + budget) as f64);
+                    let [lower, upper] = self.request.shape.target_range(
+                        first / rate / self.request.max(),
+                        last / rate / self.request.max(),
+                    );
+                    (lower - energy).max(energy - upper).max(0.)
+                });
+            weighted_error += passage.error * passage.seconds;
+            dwell += passage.dwell_penalty(credits[i]);
+        }
+        // Original contributions sum in the same order as the scorer.
+        // Omitted final passages and replays contribute nonnegative error.
+        // All scored intervals fit in
+        // the output clock, with one division and addition per original or
+        // replay contribution (at most four per placement). Use an ULP at
+        // twice the maximum clock for those conversions and accumulations.
+        let headroom = 2. * maximum;
+        let ulp = headroom.next_up() - headroom;
+        let denominator = (maximum + (8 * count + 1) as f64 * ulp).next_up();
+        Some((
+            objective::arc_error(weighted_error, denominator),
+            dwell / count as f64,
+        ))
+    }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn ending_choices(
+        &self,
+        store: &Store,
+        plan: &MixPlan,
+        cancel: &Cancellation,
+    ) -> Result<(
+        Option<mixlib_planner::ChainClosingWindow>,
+        Vec<mixlib_planner::ChainBookends>,
+    )> {
+        let last = plan.placements.last().unwrap();
+        let map = &last.time_map;
+        let solo = &map.anchors[map.anchors.len() - 2];
+        let rate = f64::from(map.output_sample_rate_hz);
+        let source_per_output =
+            map.slopes().last().unwrap() * f64::from(map.source_sample_rate_hz) / rate;
+        let to_source = |output: f64| {
+            solo.source_frame as f64 + (output - solo.output_frame as f64) * source_per_output
+        };
+        // Expand past the rounding boundaries. Frame validation and musical
+        // development happen for each concrete ending after assembly.
+        let earliest_output = (self.request.min() * rate / (1. + MAX_REPLAY_FRACTION))
+            .floor()
+            .max(solo.output_frame as f64);
+        let earliest = (to_source(earliest_output - 1.).floor() as u64).max(solo.source_frame + 1);
+        let latest = to_source(self.request.max() * rate + 1.).ceil() as u64;
+        let latest = latest.min(self.source_frames(last));
+        if earliest > latest {
+            return Ok((None, Vec::new()));
+        }
+        let window = mixlib_planner::ChainClosingWindow { earliest, latest };
+        let endings = mixlib_planner::chain_ending_candidates(
+            store,
+            plan.placements[0].source_start_frame,
+            last,
+            Some(window),
+            cancel,
+        )?;
+        Ok((Some(window), endings))
+    }
+
+    #[cfg(feature = "cp-search")]
+    fn source_frames(&self, p: &Placement) -> u64 {
+        let profile = &self.profiles[self.ids[&p.track_id]];
+        (profile.rate * profile.duration).round() as u64
+    }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn prepare_replay(&self, plan: &MixPlan) -> crate::set_replays::ReplayPreparation {
+        crate::set_replays::ReplayPreparation::new(plan, self.request.min(), self.request.max())
+    }
+
+    #[cfg(feature = "cp-search")]
+    pub(super) fn advance_replay(
+        &self,
+        store: &Store,
+        plan: &MixPlan,
+        prep: &mut crate::set_replays::ReplayPreparation,
+        cancel: &Cancellation,
+    ) -> Result<Option<crate::set_replays::ReplayDomain>> {
+        self.replays.advance_preparation(store, plan, prep, cancel)
+    }
+
     fn closing_window_from(
         &self,
         plan: &MixPlan,
@@ -912,7 +1526,7 @@ impl Context {
                         for window in closing
                             .into_iter()
                             .flatten()
-                            .filter(|_| required.complete_used(route.used | (1 << to)))
+                            .filter(|_| required.satisfied(&plan))
                         {
                             stats.closing_attempts += 1;
                             // Failure to close this song must not discard a
@@ -985,6 +1599,19 @@ impl Context {
         Ok(assembly_result(best, demands, stats))
     }
 }
+fn transition_shortfall(plan: &MixPlan) -> f64 {
+    plan.header
+        .extensions
+        .get("chain_joins")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|j| {
+            objective::transition_shortfall(j["score"].as_f64().unwrap_or(PREFERRED_TRANSITION_FIT))
+        })
+        .sum()
+}
+
 fn overlap_credits(tactics: &[TacticPlan], count: usize, rate: f64) -> Vec<f64> {
     let mut credit = vec![0.; count];
     for t in tactics {
@@ -1185,6 +1812,8 @@ impl Context {
                     duration: t.format.frames as f64 / f64::from(t.format.sample_rate_hz),
                     rate: f64::from(t.format.sample_rate_hz),
                     opening: Default::default(),
+                    #[cfg(feature = "cp-search")]
+                    opening_accents: vec![],
                 })
                 .collect(),
             ids: pool
@@ -1256,6 +1885,8 @@ mod tests {
                 duration: 180.,
                 rate: rate as f64,
                 opening: Default::default(),
+                #[cfg(feature = "cp-search")]
+                opening_accents: vec![],
             });
         }
         plan.total_output_frames = (count as u64 * 170 + 10) * rate;
@@ -1286,6 +1917,258 @@ mod tests {
         assert!((acceptable["transition_shortfall"].as_f64().unwrap() - 0.72).abs() < 1e-9);
         assert!(acceptable["transition_fit_penalty"].as_f64().unwrap() < 0.02);
     }
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn development_propagation_keeps_slow_bridges_and_audible_overlap_credit() {
+        let (context, _) = long_plan(3);
+        let arrive = DevelopmentPort {
+            frame: 100_000,
+            source_rate: 1_000,
+            output_rate: 48_000,
+            speed: 1.,
+            credit: 0.,
+        };
+        let leave = DevelopmentPort {
+            frame: 150_000,
+            speed: 0.9,
+            ..arrive
+        };
+        assert!(context.rules_out_development(1, Some(arrive), Some(leave)));
+        assert!(!context.rules_out_development(
+            1,
+            Some(DevelopmentPort {
+                credit: 5.,
+                ..arrive
+            }),
+            Some(leave),
+        ));
+        assert!(!context.rules_out_development(
+            1,
+            Some(arrive),
+            Some(DevelopmentPort {
+                frame: 154_000,
+                ..leave
+            }),
+        ));
+        assert!(!context.rules_out_development(1, None, Some(leave)));
+    }
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn closing_bounds_cover_signed_scores_and_required_replay_time() {
+        let (context, mut plan) = long_plan(20);
+        let rate = u64::from(plan.output.sample_rate_hz);
+        plan.header.extensions.insert(
+            "chain_joins".into(),
+            json!(vec![
+                json!({"score": 5., "pacing": {"penalty_quality_seconds": 3.}});
+                19
+            ]),
+        );
+        let broad = context.closing_score_upper(&plan, false).unwrap();
+        let fixed = context.closing_score_upper(&plan, true).unwrap();
+        assert!(fixed < broad && broad < -6.);
+        for length in [10, 20, 60] {
+            let replay = PassageReplay {
+                placement: 0,
+                capture_start: 20 * rate,
+                capture_end: (20 + length) * rate,
+                insert_before: 90 * rate,
+                repetitions: 1,
+                bars: 8,
+                declick_frames: rate / 200,
+                evidence: json!({}),
+            };
+            let arrangement = SetArrangement {
+                version: 1,
+                base_output_frames: plan.total_output_frames,
+                replays: vec![replay],
+            };
+            let mut candidate = plan.clone();
+            candidate.total_output_frames += arrangement.added_frames();
+            candidate
+                .header
+                .extensions
+                .insert(ARRANGEMENT_EXTENSION.into(), json!(arrangement));
+            let actual = context.evaluate(&candidate, true).unwrap();
+            assert!(actual["objective"].as_f64().unwrap() <= fixed);
+        }
+        // A stronger measured join can put the numerator on the positive
+        // side, where the shortest permitted duration supplies the ceiling.
+        for row in plan
+            .header
+            .extensions
+            .get_mut("chain_joins")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+        {
+            row["dense_quality_seconds"] = json!(40.);
+        }
+        assert!(context.closing_score_upper(&plan, true).unwrap() > 0.);
+    }
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn fixed_opening_bound_covers_every_mock_ending_and_replay() {
+        let (mut context, mut plan) = long_plan(20);
+        let rate = u64::from(plan.output.sample_rate_hz);
+        let last_join_end = plan.transitions.last().unwrap().end_output_frame;
+        context.profiles.last_mut().unwrap().duration = 195.;
+        plan.placements.last_mut().unwrap().time_map.anchors.insert(
+            1,
+            Anchor {
+                source_frame: 10 * rate,
+                output_frame: last_join_end,
+            },
+        );
+        plan.header
+            .extensions
+            .insert("selected_opening_source_frame".into(), json!(0));
+
+        for fit in [5., 40.] {
+            plan.header.extensions.insert(
+                "chain_joins".into(),
+                json!(vec![json!({"score": fit, "dense_quality_seconds": 6.}); 19]),
+            );
+            for shape in [Shape::Story, Shape::Wave, Shape::Ramp, Shape::Chapters] {
+                context.request.shape = shape;
+                let bound = context
+                    .fixed_opening_score_bound(&plan, context.latest_ending_output_frame(&plan))
+                    .unwrap();
+                assert!(bound.upper < bound.without_passage_penalties - 0.5);
+                let mut valid = 0;
+                for solo in [150, 170, 185] {
+                    for repeat in [0, 40, 60] {
+                        let mut candidate = plan.clone();
+                        let base = last_join_end + solo * rate;
+                        let last = candidate.placements.last_mut().unwrap();
+                        last.source_end_frame = (10 + solo) * rate;
+                        *last.time_map.anchors.last_mut().unwrap() = Anchor {
+                            source_frame: last.source_end_frame,
+                            output_frame: base,
+                        };
+                        candidate.total_output_frames = base + repeat * rate;
+                        if repeat > 0 {
+                            let arrangement = SetArrangement {
+                                version: 1,
+                                base_output_frames: base,
+                                replays: vec![PassageReplay {
+                                    placement: 0,
+                                    capture_start: 20 * rate,
+                                    capture_end: (20 + repeat) * rate,
+                                    insert_before: 90 * rate,
+                                    repetitions: 1,
+                                    bars: 8,
+                                    declick_frames: rate / 200,
+                                    evidence: json!({}),
+                                }],
+                            };
+                            candidate
+                                .header
+                                .extensions
+                                .insert(ARRANGEMENT_EXTENSION.into(), json!(arrangement));
+                        }
+                        if let Some(actual) = context.evaluate(&candidate, true) {
+                            valid += 1;
+                            assert!(actual["objective"].as_f64().unwrap() <= bound.upper);
+                        }
+                    }
+                }
+                assert_eq!(valid, 7);
+            }
+        }
+        plan.header
+            .extensions
+            .remove("selected_opening_source_frame");
+        let bound = context
+            .fixed_opening_score_bound(&plan, context.latest_ending_output_frame(&plan))
+            .unwrap();
+        assert_eq!(bound.upper, bound.without_passage_penalties);
+    }
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn fixed_ending_bounds_arc_shifts_and_keeps_original_development_cost() {
+        let (mut context, mut plan) = long_plan(20);
+        let rate = u64::from(plan.output.sample_rate_hz);
+        for (i, profile) in context.profiles.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                continue;
+            }
+            let tile = |start, end, intensity| {
+                serde_json::from_value::<SegmentTile>(json!({
+                    "start_frame": start * rate, "end_frame": end * rate,
+                    "bars": 1, "pulses_per_bar": 4, "pulse_score_min": 1.,
+                    "local_bpm": 120., "rms": 0.1, "peak": 0.3, "crest_factor_db": 3.,
+                    "band_occupancy": [0.3, 0.3, 0.3], "onset_rate_hz": 2., "chroma": vec![0.; 12],
+                    "level_variation": 0., "harmonic_variation": 0.,
+                    "roles": {"set_intensity_percentile": intensity, "sustained_texture": 1.},
+                    "vocal_activity": null, "separation_quality": null,
+                }))
+                .unwrap()
+            };
+            profile.tiles = vec![tile(0_u64, 90_u64, 0.1), tile(90, 180, 0.95)];
+            profile.duration = 600.;
+        }
+        for fit in [5., 40.] {
+            plan.header.extensions.insert(
+                "chain_joins".into(),
+                json!(vec![
+                    json!({"score": fit, "dense_quality_seconds": 20.});
+                    19
+                ]),
+            );
+            for shape in [Shape::Story, Shape::Wave, Shape::Ramp, Shape::Chapters] {
+                context.request.shape = shape;
+                let envelope = context.closing_score_envelope(&plan, true);
+                let bound = context.replay_score_bound(&plan).unwrap();
+                let (arc, dwell) = context
+                    .replay_passage_penalty_bounds(&plan, envelope.max_duration_seconds)
+                    .unwrap();
+                assert!(arc > 0.1 && dwell > 0.1);
+                assert!(bound.upper < bound.without_passage_penalties - 1.);
+                for lengths in [[10, 10], [15, 40], [40, 25]] {
+                    let arrangement = SetArrangement {
+                        version: 1,
+                        base_output_frames: plan.total_output_frames,
+                        replays: [0, 13]
+                            .into_iter()
+                            .zip(lengths)
+                            .map(|(placement, length)| {
+                                let offset = if placement == 0 {
+                                    0
+                                } else {
+                                    plan.transitions[placement - 1].end_output_frame
+                                };
+                                PassageReplay {
+                                    placement,
+                                    capture_start: offset + 20 * rate,
+                                    capture_end: offset + (20 + length) * rate,
+                                    insert_before: offset + 90 * rate,
+                                    repetitions: 1,
+                                    bars: 8,
+                                    declick_frames: rate / 200,
+                                    evidence: json!({}),
+                                }
+                            })
+                            .collect(),
+                    };
+                    let mut candidate = plan.clone();
+                    candidate.total_output_frames += arrangement.added_frames();
+                    candidate
+                        .header
+                        .extensions
+                        .insert(ARRANGEMENT_EXTENSION.into(), json!(arrangement));
+                    let actual = context.evaluate(&candidate, true).unwrap();
+                    assert_eq!(actual["dwell_penalty"].as_f64().unwrap(), dwell);
+                    assert!(actual["arc_error"].as_f64().unwrap() >= arc);
+                    assert!(actual["objective"].as_f64().unwrap() <= bound.upper);
+                }
+            }
+        }
+    }
+
     #[test]
     fn full_sets_have_variable_counts_and_use_overlap_adjusted_output_duration() {
         for count in [21, 42] {
@@ -1326,6 +2209,131 @@ mod tests {
             .is_none());
         assert_eq!(rejection, Some("insufficient_development"));
         assert!(context.evaluate(&plan, true).is_none());
+    }
+
+    #[test]
+    fn replay_base_checks_original_development_even_below_the_duration_floor() {
+        let (context, mut plan) = long_plan(20);
+        assert_eq!(
+            context.evaluate_for_save(&plan, true).unwrap_err().reason,
+            "duration_outside_window"
+        );
+        let rate = u64::from(plan.output.sample_rate_hz);
+        plan.transitions[0].start_output_frame = 40 * rate;
+        assert_eq!(
+            context.evaluate_for_save(&plan, false).unwrap_err().reason,
+            "duration_outside_window"
+        );
+        let rejection = context.evaluate_for_save(&plan, true).unwrap_err();
+        assert_eq!(rejection.reason, "insufficient_development");
+        let shortfall = rejection.development.unwrap();
+        assert_eq!(shortfall.track_id, plan.placements[0].track_id);
+        assert_eq!(shortfall.position, 1);
+        assert_eq!(shortfall.solo_seconds, 40.);
+        assert!(
+            shortfall.solo_seconds + shortfall.overlap_credit_seconds + DEVELOPMENT_GRACE_SECONDS
+                < shortfall.minimum_seconds
+        );
+        let solo = plan.transitions[0].end_output_frame;
+        let arrangement = SetArrangement {
+            version: 1,
+            base_output_frames: plan.total_output_frames,
+            replays: vec![PassageReplay {
+                placement: 1,
+                capture_start: solo + 20 * rate,
+                capture_end: solo + 40 * rate,
+                insert_before: solo + 60 * rate,
+                repetitions: 1,
+                bars: 8,
+                declick_frames: rate / 200,
+                evidence: json!({}),
+            }],
+        };
+        plan.total_output_frames += arrangement.added_frames();
+        plan.header
+            .extensions
+            .insert(ARRANGEMENT_EXTENSION.into(), json!(arrangement));
+        let replay = context.evaluate_for_save(&plan, false).unwrap_err();
+        assert_eq!(replay.reason, "insufficient_development");
+        assert_eq!(json!(replay.development.unwrap()), json!(shortfall));
+    }
+
+    #[test]
+    fn exhaustive_mock_endings_separate_replay_clock_from_closing_track_development() {
+        let (context, mut plan) = long_plan(20);
+        let rate = u64::from(plan.output.sample_rate_hz);
+        let solo = plan.transitions[0].end_output_frame;
+        let p = &mut plan.placements[1];
+        let mut flat = p.automation[0].clone();
+        flat.output_frame = solo;
+        flat.gain_linear = 1.;
+        flat.mute = false;
+        p.automation = vec![flat.clone(), flat];
+        p.automation[1].output_frame = solo + 60 * rate;
+        let last_join = plan.transitions.last().unwrap();
+        // These are two possible endings after the same admitted route.
+        // The early ending leaves 42.6s of solo, below the 60s minimum.
+        // The later ending gives 170s of solo but needs 10s of replay to fit.
+        let expected = [
+            ["insufficient_development", "insufficient_development"],
+            ["duration_outside_window", "accepted"],
+        ];
+        for (i, solo_frames) in [426 * rate / 10, 170 * rate].into_iter().enumerate() {
+            let mut base = plan.clone();
+            base.total_output_frames = last_join.end_output_frame + solo_frames;
+            let last = base.placements.last_mut().unwrap();
+            last.source_end_frame = base.total_output_frames - last_join.start_output_frame;
+            *last.time_map.anchors.last_mut().unwrap() = Anchor {
+                source_frame: last.source_end_frame,
+                output_frame: base.total_output_frames,
+            };
+            let early = context.evaluate_for_save(&base, true).unwrap_err();
+            if i == 0 {
+                let shortfall = early.development.as_ref().unwrap();
+                assert_eq!(shortfall.position, 20);
+                assert_eq!(shortfall.solo_seconds, 42.6);
+            }
+            assert_eq!(early.reason, expected[i][0]);
+
+            for (j, replay_seconds) in [0, 144].into_iter().enumerate() {
+                let mut candidate = base.clone();
+                if replay_seconds > 0 {
+                    let arrangement = SetArrangement {
+                        version: 1,
+                        base_output_frames: base.total_output_frames,
+                        replays: vec![PassageReplay {
+                            placement: 1,
+                            capture_start: solo + 2 * rate,
+                            capture_end: solo + 50 * rate,
+                            insert_before: solo + 52 * rate,
+                            repetitions: 3,
+                            bars: 16,
+                            declick_frames: rate / 200,
+                            evidence: json!({}),
+                        }],
+                    };
+                    assert_eq!(arrangement.added_frames(), replay_seconds * rate);
+                    candidate.total_output_frames += arrangement.added_frames();
+                    candidate.renderer_version = ARRANGEMENT_RENDERER.into();
+                    arrangement.validate_for(&candidate).unwrap();
+                    candidate
+                        .header
+                        .extensions
+                        .insert(ARRANGEMENT_EXTENSION.into(), json!(arrangement));
+                    assert!(context
+                        .request
+                        .accepts(candidate.total_output_frames as f64 / rate as f64));
+                }
+                let outcome = context.evaluate_for_save(&candidate, true);
+                let status = outcome
+                    .as_ref()
+                    .map_or_else(|rejection| rejection.reason, |_| "accepted");
+                assert_eq!(status, expected[i][j]);
+                if let Some(detail) = outcome.err().and_then(|r| r.development) {
+                    assert_eq!(json!(detail), json!(early.development.as_ref().unwrap()));
+                }
+            }
+        }
     }
     #[test]
     fn replay_shortfall_keeps_later_measured_endings_inside_the_original_window() {
@@ -1722,6 +2730,8 @@ mod tests {
                 duration: 400.,
                 rate: 100.,
                 opening: Default::default(),
+                #[cfg(feature = "cp-search")]
+                opening_accents: vec![],
             }],
             ids: BTreeMap::new(),
         };

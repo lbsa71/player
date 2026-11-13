@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/types", "crates/catalog", "crates/audio", "crates/analysis", "crates/planner", "crates/cli", "crates/apple"]
+members = ["crates/types", "crates/catalog", "crates/audio", "crates/analysis", "crates/planner", "crates/cli", "crates/apple", "crates/set-search"]
 resolver = "2"
 
 [workspace.package]
@@ -14,6 +14,7 @@ mixlib-audio = { path = "crates/audio" }
 mixlib-catalog = { path = "crates/catalog" }
 mixlib-analysis = { path = "crates/analysis" }
 mixlib-planner = { path = "crates/planner" }
+mixlib-set-search = { path = "crates/set-search" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.145", features = ["float_roundtrip"] }
 serde-value = "=0.7.0"

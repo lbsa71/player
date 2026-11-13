@@ -5,12 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+cp-search = ["mixlib-set-search/scip"]
+
 [dependencies]
 mixlib-types.workspace = true
 mixlib-catalog.workspace = true
 mixlib-analysis.workspace = true
 mixlib-planner.workspace = true
 mixlib-audio.workspace = true
+mixlib-set-search.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
@@ -21,6 +25,7 @@ tempfile.workspace = true
 
 [build-dependencies]
 sha2.workspace = true
+toml = "=0.8.23"
 
 [[bin]]
 name = "mixlib"

@@ -104,6 +104,12 @@ impl RequiredPairs {
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default();
+        if raw.is_empty() {
+            return Ok(Self {
+                mode,
+                ..Self::default()
+            });
+        }
         let mut identities = BTreeMap::<String, Vec<usize>>::new();
         for (i, t) in pool.iter().enumerate() {
             if let Some(s) = store.recording_metadata(t)?["trackID"].as_str() {
@@ -137,7 +143,7 @@ impl RequiredPairs {
         }
         Self::new(mode, pairs, slots)
     }
-    fn new(mode: Mode, pairs: Vec<Pair>, slots: usize) -> Result<Self> {
+    pub(super) fn new(mode: Mode, pairs: Vec<Pair>, slots: usize) -> Result<Self> {
         let mut mask = 0u128;
         let mut outgoing = BTreeMap::<usize, BTreeSet<usize>>::new();
         let mut incoming = BTreeMap::<usize, BTreeSet<usize>>::new();
@@ -226,6 +232,15 @@ impl RequiredPairs {
             Mode::Anywhere => true,
         }
     }
+    #[cfg(feature = "cp-search")]
+    pub(super) fn finish_allowed(&self, last: usize) -> bool {
+        match self.mode {
+            Mode::Ordered => !self.pairs.iter().any(|p| p.indices[0] == last),
+            Mode::Either => self.neighbors(last).len() <= 1,
+            Mode::Anywhere => true,
+        }
+    }
+
     pub fn permits_edge(&self, from: usize, to: usize) -> bool {
         match self.mode {
             Mode::Ordered => self.pairs.iter().all(|p| {
@@ -270,6 +285,88 @@ impl RequiredPairs {
     }
     pub fn complete_used(&self, used: u128) -> bool {
         used & self.mask == self.mask
+    }
+    #[cfg(feature = "cp-search")]
+    pub(super) fn required_runway(&self) -> mixlib_set_search::coverage::RequiredRunway {
+        let mut internal = 0;
+        for track in 0..128 {
+            let bit = 1_u128 << track;
+            if self.mask & bit != 0 && !self.start_allowed(track) && !self.finish_allowed(track) {
+                internal |= bit;
+            }
+        }
+        mixlib_set_search::coverage::RequiredRunway {
+            members: self.mask,
+            internal,
+        }
+    }
+
+    /// A connected component of direct requirements is a contiguous block
+    /// in any unique-song route. Every edge must survive in one orientation.
+    #[cfg(feature = "cp-search")]
+    pub(super) fn blocked_chain(
+        &self,
+        permits: impl Fn(usize, usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        self.forced_chain_edges(permits).err()
+    }
+
+    /// Orient every either-order chain that has only one surviving direction.
+    /// An edge in the result fixes its source's successor and its target's
+    /// predecessor. An error carries a chain with neither orientation left.
+    #[cfg(feature = "cp-search")]
+    pub(super) fn forced_chain_edges(
+        &self,
+        permits: impl Fn(usize, usize) -> bool,
+    ) -> std::result::Result<Vec<(usize, usize)>, Vec<usize>> {
+        match self.mode {
+            Mode::Anywhere => Ok(vec![]),
+            Mode::Ordered => {
+                for pair in &self.pairs {
+                    let [from, to] = pair.indices;
+                    if !permits(from, to) {
+                        return Err(vec![from, to]);
+                    }
+                }
+                Ok(vec![])
+            }
+            Mode::Either => {
+                let mut forced = Vec::new();
+                let mut remaining = self.mask;
+                while remaining != 0 {
+                    let first = (0..128)
+                        .find(|&i| remaining & (1_u128 << i) != 0 && self.neighbors(i).len() == 1)
+                        .expect("validated required chain has an endpoint");
+                    let mut chain = vec![first];
+                    let mut next = first;
+                    let mut previous = None;
+                    loop {
+                        remaining &= !(1_u128 << next);
+                        let Some(neighbor) = self
+                            .neighbors(next)
+                            .into_iter()
+                            .find(|&n| Some(n) != previous)
+                        else {
+                            break;
+                        };
+                        chain.push(neighbor);
+                        previous = Some(next);
+                        next = neighbor;
+                    }
+                    let forward = chain.windows(2).all(|w| permits(w[0], w[1]));
+                    let reverse = chain.windows(2).all(|w| permits(w[1], w[0]));
+                    match (forward, reverse) {
+                        (false, false) => return Err(chain),
+                        (true, true) => {}
+                        (true, false) => forced.extend(chain.windows(2).map(|w| (w[0], w[1]))),
+                        (false, true) => {
+                            forced.extend(chain.windows(2).rev().map(|w| (w[1], w[0])))
+                        }
+                    }
+                }
+                Ok(forced)
+            }
+        }
     }
     pub fn satisfied(&self, plan: &MixPlan) -> bool {
         self.pairs.iter().all(|p| match self.mode {
@@ -320,10 +417,56 @@ impl RequiredPairs {
 
 #[cfg(test)]
 #[path = "../../../tests/support.rs"]
-mod test_support;
+pub(super) mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn required_chain_proof_matches_all_orientations_of_three_songs() {
+        let pairs = [[0, 1], [1, 2]]
+            .map(|indices| Pair {
+                spotify_ids: indices.map(|i| format!("spotify-{i}")),
+                track_ids: indices.map(|i| format!("track-{i}")),
+                indices,
+            })
+            .to_vec();
+        let orders = [[0, 1, 2], [2, 1, 0]];
+        for mode in [Mode::Ordered, Mode::Either, Mode::Anywhere] {
+            let required = RequiredPairs::new(mode, pairs.clone(), 3).unwrap();
+            for edges in 0..16 {
+                let permits = |from, to| {
+                    [(0, 1), (1, 0), (1, 2), (2, 1)]
+                        .iter()
+                        .position(|&edge| edge == (from, to))
+                        .is_some_and(|bit| edges & (1 << bit) != 0)
+                };
+                let feasible = match mode {
+                    Mode::Anywhere => true,
+                    Mode::Ordered => permits(0, 1) && permits(1, 2),
+                    Mode::Either => orders
+                        .iter()
+                        .any(|order| order.windows(2).all(|w| permits(w[0], w[1]))),
+                };
+                let result = required.forced_chain_edges(permits);
+                assert_eq!(result.is_ok(), feasible);
+                if mode == Mode::Either && feasible {
+                    let surviving = orders
+                        .iter()
+                        .filter(|order| order.windows(2).all(|w| permits(w[0], w[1])))
+                        .collect::<Vec<_>>();
+                    let expected = if let [order] = surviving.as_slice() {
+                        order.windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>()
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(result.unwrap(), expected);
+                }
+            }
+        }
+    }
+
     #[test]
     fn resolves_spotify_metadata_only_within_the_prepared_pool() {
         let dir = tempfile::tempdir().unwrap();
@@ -450,6 +593,27 @@ mod tests {
         let r = requirement(Mode::Ordered, &[[0, 1], [1, 2], [3, 4]]).unwrap();
         assert!(RequiredPairs::new(r.mode, r.pairs, 4).is_err());
     }
+
+    #[cfg(feature = "cp-search")]
+    #[test]
+    fn only_required_songs_forbidden_at_both_bookends_reserve_runway() {
+        for (mode, internal) in [
+            (Mode::Ordered, 0b10),
+            (Mode::Either, 0b10),
+            (Mode::Anywhere, 0),
+        ] {
+            let runway = requirement(mode, &[[0, 1], [1, 2], [3, 4]])
+                .unwrap()
+                .required_runway();
+            assert_eq!(runway.members, 0b11111);
+            assert_eq!(runway.internal, internal);
+        }
+        let pair = requirement(Mode::Either, &[[0, 1]])
+            .unwrap()
+            .required_runway();
+        assert_eq!(pair.members, 0b11);
+        assert_eq!(pair.internal, 0);
+    }
     #[test]
     fn prefix_pruning_matches_exhaustive_pair_semantics() {
         fn permutations(values: &mut [usize], at: usize, out: &mut Vec<Vec<usize>>) {
@@ -475,6 +639,12 @@ mod tests {
                         .windows(2)
                         .any(|w| w == p.indices || w == [p.indices[1], p.indices[0]]),
                 });
+                #[cfg(feature = "cp-search")]
+                if expected {
+                    assert!(r.start_allowed(order[0]));
+                    assert!(r.finish_allowed(*order.last().unwrap()));
+                    assert!(order.windows(2).all(|w| r.permits_edge(w[0], w[1])));
+                }
                 let mut used = 1 << order[0];
                 let mut admitted = r.start_allowed(order[0]);
                 for (i, w) in order.windows(2).enumerate() {

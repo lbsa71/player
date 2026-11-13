@@ -106,7 +106,7 @@ struct PlayerWindow: View {
                 }
             }.padding(28)
             Divider()
-            AudioBridgePanel(model:model,bridge:model.bridge,recovery:model.playlistRecording)
+            AudioBridgePanel(model:model,bridge:model.bridge,recovery:model.playlistRecording,playlistInput:playlistInput)
         }
         .frame(width: 720).background(PlayerPalette.canvas).foregroundStyle(PlayerPalette.ink)
         .tint(PlayerPalette.accent).preferredColorScheme(.light)
@@ -126,6 +126,7 @@ private struct AudioBridgePanel: View {
     @ObservedObject var model: PlayerViewModel
     @ObservedObject var bridge: AudioBridgeModel
     @ObservedObject var recovery: PlaylistRecordingModel
+    let playlistInput: String
     private var ready: Bool {
         bridge.capturing && model.endpointReady
     }
@@ -147,11 +148,15 @@ private struct AudioBridgePanel: View {
                 Spacer()
                 Button(bridge.recordingEnabled || recovery.running ? "Stop recording" : "Resume playlist recording") {
                     if bridge.recordingEnabled || recovery.running { recovery.stop() }
-                    else { recovery.start(playlist:model.spotify.playback?.context?.uri ?? UserDefaults.standard.string(forKey:"lastRecordingPlaylist") ?? "") }
+                    else { recovery.start(playlist:playlistInput.isEmpty ? (model.spotify.playback?.context?.uri ?? "") : playlistInput) }
                 }.buttonStyle(.borderedProminent)
                     .disabled(!recovery.running && !bridge.recordingEnabled && (bridge.busy || !bridge.installed || bridge.recording["finishing"] as? Bool == true))
             }
             Text(recovery.detail).font(.caption).foregroundStyle(.secondary)
+            if recovery.unavailableTracks > 0 {
+                Text("\(recovery.unavailableTracks) playlist items unavailable for recording")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if recovery.completeCount > 0 || recovery.unverifiedCount > 0 {
                 Text("\(recovery.completeCount) tracks complete · \(recovery.unverifiedCount) older files unverified")
                     .font(.caption).foregroundStyle(.secondary)
@@ -214,15 +219,16 @@ private struct SpotifySettings: View {
                 .textFieldStyle(.roundedBorder).disabled(spotify.connected || spotify.signingIn)
             Text("Registered callback: \(SpotifyAuth.redirectURI)").font(.caption).textSelection(.enabled)
             HStack {
-                if spotify.connected {
-                    Label("Connected", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                    Spacer()
-                    Button("Disconnect") { spotify.signOut() }
-                } else if spotify.signingIn {
+                if spotify.signingIn {
                     ProgressView().controlSize(.small)
                     Text("Complete sign-in in your browser…")
                     Spacer()
                     Button("Cancel") { spotify.cancelSignIn() }
+                } else if spotify.connected {
+                    Label("Connected", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    Spacer()
+                    Button("Reconnect") { spotify.signIn() }
+                    Button("Disconnect") { spotify.signOut() }
                 } else {
                     Button("Connect Spotify") { spotify.signIn() }.buttonStyle(.borderedProminent)
                         .disabled(spotify.clientID.isEmpty)

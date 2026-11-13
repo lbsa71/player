@@ -27,13 +27,14 @@ pub use tactic_evidence::{candidate_facts, CandidateEvidenceCache};
 mod cached_tactic_evidence;
 pub use cached_tactic_evidence::load_tactic_track_analysis;
 pub use stitch::{
-    automatic_cues, band_stitch, beat_return_stitch, choose_chain_bookends,
-    choose_chain_bookends_in_window, describe_bar_tiles, drum_stitch, pick_four_tracks,
-    pick_prepared_tracks, pick_tracks, preferred_band_stitch, quiet_linger_candidates,
-    quiet_linger_stitch, read_chain_opening, read_chain_opening_cue, shortlist_preparation, stitch,
-    tactic_continuations, tactic_stitch_candidates, BaselineCueIndex, BeatReturnCue,
-    ChainClosingWindow, ChainOpening, ChainPick, DrumHandoff, EventCueIndex, StitchRequest,
-    MAX_TACTIC_CONTINUATION_SECONDS,
+    automatic_cues, band_stitch, beat_return_stitch, chain_ending_candidates,
+    choose_chain_bookends, choose_chain_bookends_in_window, describe_bar_tiles, drum_stitch,
+    pick_four_tracks, pick_prepared_tracks, pick_tracks, preferred_band_stitch,
+    quiet_linger_candidates, quiet_linger_stitch, read_chain_opening, read_chain_opening_cue,
+    shortlist_preparation, stitch, tactic_continuations, tactic_stitch_candidates, BarCueDomain,
+    BarCuePage, BarCueRange, BaselineCueIndex, BeatReturnCue, ChainBookends, ChainClosingWindow,
+    ChainOpening, ChainPick, DrumHandoff, EventCueIndex, StitchRequest, StructuralCueDomain,
+    BAR_CUE_PROFILE, MAX_TACTIC_CONTINUATION_SECONDS, STRUCTURAL_CUE_PROFILE,
 };
 
 pub const PLANNER: &str = "region-beam/1";

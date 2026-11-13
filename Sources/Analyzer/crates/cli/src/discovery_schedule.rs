@@ -16,7 +16,7 @@ pub(super) struct Probe {
 
 pub(super) struct Schedule {
     pub pool_cursor: usize,
-    prefer_global: bool,
+    turn: usize,
     seen: BTreeSet<Probe>,
 }
 
@@ -27,7 +27,7 @@ impl Schedule {
     pub fn new(pool_cursor: usize) -> Self {
         Self {
             pool_cursor,
-            prefer_global: true,
+            turn: 0,
             seen: BTreeSet::new(),
         }
     }
@@ -35,8 +35,29 @@ impl Schedule {
     /// Give global coverage at least every other turn, even when new draft
     /// boundaries continuously replace the front of `targeted`.
     pub fn next(&mut self, targeted: &[Probe], frames: &[u64], minimum: &[u64]) -> Option<Probe> {
-        let prefer_global = self.prefer_global;
-        self.prefer_global = !prefer_global;
+        self.next_scheduled(targeted, frames, minimum, 2)
+    }
+
+    /// With an incumbent, prioritize promising route probes and reserve one
+    /// turn in three for the same finite global cursor.
+    pub fn next_for_improvement(
+        &mut self,
+        targeted: &[Probe],
+        frames: &[u64],
+        minimum: &[u64],
+    ) -> Option<Probe> {
+        self.next_scheduled(targeted, frames, minimum, 3)
+    }
+
+    fn next_scheduled(
+        &mut self,
+        targeted: &[Probe],
+        frames: &[u64],
+        minimum: &[u64],
+        period: usize,
+    ) -> Option<Probe> {
+        let prefer_global = self.turn % period == 0;
+        self.turn = (self.turn + 1) % period;
         if prefer_global {
             self.next_global(frames, minimum)
                 .or_else(|| self.next_targeted(targeted, frames, minimum))
@@ -67,7 +88,7 @@ impl Schedule {
         None
     }
 
-    fn next_targeted(
+    pub(super) fn next_targeted(
         &mut self,
         targeted: &[Probe],
         frames: &[u64],
@@ -155,6 +176,32 @@ mod tests {
             }
         }
         assert_eq!(sources, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn improvement_prioritizes_route_probes_without_stalling_global_coverage() {
+        let frames = [1_000; 4];
+        let minimum = [0; 4];
+        let mut schedule = Schedule::new(0);
+        let mut global = BTreeSet::new();
+        for turn in 0..36 {
+            let target = [Probe {
+                from: 0,
+                to: 1,
+                after: turn,
+                tier: 24,
+            }];
+            let found = schedule
+                .next_for_improvement(&target, &frames, &minimum)
+                .unwrap();
+            if turn % 3 == 0 {
+                assert_eq!(found.tier, 1);
+                global.insert((found.from, found.to));
+            } else {
+                assert_eq!(found, target[0]);
+            }
+        }
+        assert_eq!(global.len(), 12);
     }
 
     #[test]

@@ -19,6 +19,23 @@ final class PlaylistRecoveryTests: XCTestCase {
         guard case .stop = action else { return XCTFail("Expected stop, got \(action)",file:file,line:line) }
     }
 
+    func testPlannedRunJumpsPastSavedTracksAndRejectsUnexpectedTracks() {
+        var recovery = PlaylistRecovery()
+        recovery.start(playlistURI:playlist,deviceID:"mac",now:0,orderedTrackIDs:["first","third"])
+        XCTAssertEqual(recovery.observe(observation(),completedTrackIDs:[],now:0),.capture)
+        assertStop(recovery.observe(observation("unexpected",0),completedTrackIDs:[],now:1))
+
+        recovery.start(playlistURI:playlist,deviceID:"mac",now:2,orderedTrackIDs:["first","third"],savedTrackIDs:["second"])
+        XCTAssertEqual(recovery.observe(observation(),completedTrackIDs:[],now:2),.capture)
+        XCTAssertEqual(recovery.observe(observation("second",0),completedTrackIDs:[],now:3),.jump("third"))
+        XCTAssertEqual(recovery.observe(observation("second",1),completedTrackIDs:[],now:4),.wait)
+        XCTAssertEqual(recovery.observe(observation("third",0),completedTrackIDs:[],now:5),.capture)
+        let end = PlaylistRecovery.Observation(contextURI:playlist,deviceID:"mac",trackID:"third",
+            positionSeconds:99,isPlaying:true,shuffle:false,repeatMode:"off",durationSeconds:100)
+        XCTAssertEqual(recovery.observe(end,completedTrackIDs:[],now:104),.capture)
+        XCTAssertEqual(recovery.observe(.init(playback:nil),completedTrackIDs:[],now:105),.finish)
+    }
+
     func testIncompleteTrackCapturesAndCatalogRefreshDoesNotInterruptVisit() {
         var recovery = started()
         XCTAssertEqual(recovery.observe(observation(),completedTrackIDs:[],now:0),.capture)

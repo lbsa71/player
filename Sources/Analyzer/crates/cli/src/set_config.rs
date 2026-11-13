@@ -4,12 +4,35 @@ use crate::required_pairs::{self, Mode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub(super) const ENGINE_KEY: &str = "duration_search_engine";
+pub(super) const CACHE_MODE_KEY: &str = "duration_search_cache_mode";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheMode {
+    Cold,
+    WarmFacts,
+    #[default]
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Engine {
+    Legacy,
+    Cp,
+}
+
 fn auto() -> String {
     "auto".into()
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<Engine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_mode: Option<CacheMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measurements: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +80,8 @@ impl SetConfig {
         // Make the generated recipe's defaults explicit and easy to edit.
         let (measurements, seconds) = config.budgets();
         config.search = SearchBudget {
+            engine: None,
+            cache_mode: None,
             measurements: Some(measurements),
             seconds: Some(seconds),
         };
@@ -64,9 +89,9 @@ impl SetConfig {
     }
     pub fn normalize(&mut self) -> Result<()> {
         require(
-            self.version == 1,
+            matches!(self.version, 1 | 2),
             "SET_CONFIG_VERSION",
-            "unsupported set config version; expected 1",
+            "unsupported set config version; expected 1 or 2",
         )?;
         self.name = self.name.trim().to_owned();
         require(
@@ -82,6 +107,12 @@ impl SetConfig {
         if self.duration_minutes.is_none() && self.tracks.is_none() && self.incumbent.is_none() {
             self.duration_minutes = Some(60);
         }
+        require(
+            (self.search.engine.is_none() && self.search.cache_mode.is_none())
+                || (self.version == 2 && self.duration_minutes.is_some()),
+            "SET_CONFIG_ENGINE",
+            "search.engine and search.cache_mode require a version-2 duration set",
+        )?;
         if let Some(minutes) = self.duration_minutes {
             crate::composition::Request::new(minutes, &self.structure)?;
         } else {
@@ -149,8 +180,22 @@ impl SetConfig {
             required_pairs::KEY,
             "required_pair_mode",
             "set_config",
+            ENGINE_KEY,
+            CACHE_MODE_KEY,
         ] {
             policy.header.extensions.remove(key);
+        }
+        if let Some(engine) = self.search.engine {
+            policy
+                .header
+                .extensions
+                .insert(ENGINE_KEY.into(), json!(engine));
+        }
+        if let Some(mode) = self.search.cache_mode {
+            policy
+                .header
+                .extensions
+                .insert(CACHE_MODE_KEY.into(), json!(mode));
         }
         let (measurements, seconds) = self.budgets();
         policy
@@ -187,6 +232,8 @@ impl SetConfig {
             .insert("required_pair_mode".into(), json!(self.pair_mode));
         let mut effective = self.clone();
         effective.search = SearchBudget {
+            engine: self.search.engine,
+            cache_mode: self.search.cache_mode,
             measurements: Some(measurements),
             seconds: Some(seconds),
         };
@@ -260,7 +307,9 @@ mod tests {
     #[test]
     fn invalid_or_misspelled_config_never_silently_changes_the_request() {
         for input in [
-            json!({"version":2,"name":"Set"}),
+            json!({"version":3,"name":"Set"}),
+            json!({"version":1,"name":"Set","search":{"engine":"cp"}}),
+            json!({"version":2,"name":"Set","tracks":8,"search":{"engine":"cp"}}),
             json!({"version":1,"name":" "}),
             json!({"version":1,"name":"Set","duration_minutes":90}),
             json!({"version":1,"name":"Set","duration_minutes":60,"tracks":8}),
@@ -276,6 +325,17 @@ mod tests {
             assert!(decode(input.clone()).is_err(), "{input}");
         }
     }
+    #[test]
+    fn a_version_two_recipe_can_select_cp_without_changing_legacy_defaults() {
+        let cp = decode(json!({"version":2,"name":"CP","search":{"engine":"cp"}})).unwrap();
+        let mut policy = MixingConfig::default();
+        cp.apply(&mut policy, Path::new("cp.json")).unwrap();
+        assert_eq!(policy.header.extensions[ENGINE_KEY], "cp");
+        let legacy = decode(json!({"version":1,"name":"Legacy"})).unwrap();
+        legacy.apply(&mut policy, Path::new("legacy.json")).unwrap();
+        assert!(!policy.header.extensions.contains_key(ENGINE_KEY));
+    }
+
     #[test]
     fn each_recipe_owns_target_pairs_incumbent_and_budget_without_mutating_defaults() {
         let mut defaults = MixingConfig::default();

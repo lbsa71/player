@@ -48,6 +48,32 @@ public actor SpotifyClient {
         guard let playback = try? JSONDecoder().decode(SpotifyPlayback.self, from: data) else { throw SpotifyFailure.invalidResponse }
         return playback
     }
+    public func playlistItems(_ input: String) async throws -> [SpotifyPlaylistTrack?] {
+        let id = try SpotifyPlaylist.uri(input).split(separator: ":").last!
+        var items: [SpotifyPlaylistTrack?] = []
+        var total: Int?
+        repeat {
+            let query = [URLQueryItem(name: "limit", value: "50"),
+                         URLQueryItem(name: "offset", value: String(items.count))]
+            let data: Data?
+            do { data = try await request(path: "playlists/\(id)/items", query: query, playerEndpoint: false) }
+            catch SpotifyFailure.denied {
+                throw SpotifyFailure.setup("Connect Spotify again to grant playlist read access. Spotify permits this lookup for playlists you own or collaborate on.")
+            }
+            guard let data, let page = try? JSONDecoder().decode(SpotifyPlaylistPage.self, from: data),
+                  page.offset == items.count, page.total >= 0,
+                  total == nil || total == page.total,
+                  page.items.count <= 50, page.items.count <= page.total - page.offset,
+                  (page.next == nil) == (page.offset + page.items.count == page.total),
+                  page.next == nil || !page.items.isEmpty else {
+                throw SpotifyFailure.setup("Spotify did not return the full playlist in order. Try resuming again.")
+            }
+            total = page.total
+            items += page.items.map { $0.is_local == true ? nil : $0.item ?? $0.track }
+        } while items.count < (total ?? 0)
+        return items
+    }
+
     public func command(_ command: TransportCommand, deviceID: String) async throws {
         guard !deviceID.isEmpty else { throw SpotifyFailure.noDevice }
         var path: String
@@ -69,6 +95,18 @@ public actor SpotifyClient {
             path = "shuffle"; query.append(URLQueryItem(name: "state", value: "false"))
         case .repeatOff:
             path = "repeat"; query.append(URLQueryItem(name: "state", value: "off"))
+        case .playlistAt(let input, let position):
+            let uri = try SpotifyPlaylist.uri(input)
+            guard position >= 0 else { throw SpotifyFailure.setup("Invalid Spotify playlist position.") }
+            if try await playback()?.device?.id != deviceID {
+                try await self.command(.transfer, deviceID: deviceID)
+            }
+            try await self.command(.shuffleOff, deviceID: deviceID)
+            try await self.command(.repeatOff, deviceID: deviceID)
+            try await confirmOrderedPlaybackModes(deviceID:deviceID)
+            path = "play"
+            body = try JSONSerialization.data(withJSONObject: ["context_uri": uri,
+                "offset": ["position": position], "position_ms": 0])
         case .playlist(let input):
             let uri = try SpotifyPlaylist.uri(input)
             try await self.command(.shuffleOff, deviceID: deviceID)
@@ -103,12 +141,13 @@ public actor SpotifyClient {
         throw SpotifyFailure.setup("Shuffle/repeat changes were not confirmed on this Mac. Check Spotify, then try Play playlist again.")
     }
 
-    private func request(path: String, method: String = "GET", query: [URLQueryItem] = [], body: Data? = nil) async throws -> Data? {
+    private func request(path: String, method: String = "GET", query: [URLQueryItem] = [], body: Data? = nil, playerEndpoint: Bool = true) async throws -> Data? {
         await gate.acquire()
         defer { Task { await gate.release() } }
         try Task.checkCancellation()
         guard Date() >= retryAfter else { throw SpotifyFailure.rateLimited(retryAfter) }
-        var url = URLComponents(string: "https://api.spotify.com/v1/me/player" + (path.isEmpty ? "" : "/\(path)"))!
+        let base = playerEndpoint ? "https://api.spotify.com/v1/me/player" : "https://api.spotify.com/v1"
+        var url = URLComponents(string: base + (path.isEmpty ? "" : "/\(path)"))!
         url.queryItems = query.isEmpty ? nil : query
         var token = try await auth.accessToken(rejectedToken: nil)
         for attempt in 0...1 {
@@ -126,7 +165,7 @@ public actor SpotifyClient {
             case 200...299: return response.statusCode == 204 || data.isEmpty ? nil : data
             case 401: throw SpotifyFailure.signedOut
             case 403: throw SpotifyFailure.denied
-            case 404: throw SpotifyFailure.noDevice
+            case 404: throw playerEndpoint ? SpotifyFailure.noDevice : SpotifyFailure.setup("Spotify could not find the playlist.")
             case 429:
                 retryAfter = Self.retryDate(response)
                 throw SpotifyFailure.rateLimited(retryAfter)

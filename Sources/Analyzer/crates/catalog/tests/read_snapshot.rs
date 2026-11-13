@@ -66,6 +66,45 @@ fn one_sidecar_decode_serves_many_hashed_logical_records() {
 }
 
 #[test]
+fn song_identity_and_analysis_share_one_pinned_sidecar() {
+    let (_dir, store, track) = setup();
+    let path = store.sidecar_for_track(&track.track_id).unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    document["trackID"] = "original-song".into();
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    let snapshot = store.read_snapshot();
+    assert_eq!(snapshot.tracks().unwrap()[0].track_id, track.track_id);
+    let metadata = snapshot.recording_metadata(&track).unwrap();
+    assert_eq!(metadata["trackID"], "original-song");
+    assert!(metadata.get("analyzer").is_none());
+    assert_eq!(
+        snapshot
+            .read_snapshot_stats()
+            .unwrap()
+            .unwrap()
+            .sidecar_bundles,
+        1
+    );
+
+    document["trackID"] = "changed-song".into();
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(snapshot.recording_metadata(&track).unwrap(), metadata);
+    assert_eq!(
+        snapshot
+            .verify_read_snapshot(&Cancellation::default())
+            .unwrap_err()
+            .code,
+        "READ_SNAPSHOT_CHANGED"
+    );
+    assert_eq!(
+        store.read_snapshot().recording_metadata(&track).unwrap()["trackID"],
+        "changed-song"
+    );
+}
+
+#[test]
 fn corrections_changed_during_search_are_rejected_and_a_new_scope_is_fresh() {
     let (_dir, store, mut track) = setup();
     let snapshot = store.read_snapshot();

@@ -64,6 +64,19 @@ impl TrackPacing {
         }
     }
 
+    /// Every internal arrival (a nonzero entry) admitted by `assess` must
+    /// leave this much source runway. A complete phrase allows one frame of
+    /// slack at either end. The elapsed-time fallback has no cue slack.
+    pub fn minimum_internal_source_frames(&self, sample_rate: u32) -> Option<u64> {
+        if sample_rate == 0 || sample_rate != self.sample_rate {
+            return None;
+        }
+        let fallback = UNKNOWN_SOLO_SECONDS * u64::from(sample_rate);
+        Some(self.phrases.iter().fold(fallback, |minimum, phrase| {
+            minimum.min(phrase.end.saturating_sub(phrase.start).saturating_sub(2))
+        }))
+    }
+
     /// An optimistic lower bound. The actual exit still needs assess(): a
     /// timestamp after this bound is not automatically a musical endpoint.
     pub fn earliest_exit(&self, entry_end: u64) -> u64 {
@@ -193,5 +206,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn internal_runway_covers_phrase_tolerance_and_elapsed_fallback() {
+        let p = grid(8);
+        let floor = p.minimum_internal_source_frames(100).unwrap();
+        assert_eq!(floor, 798);
+        assert_eq!(p.minimum_internal_source_frames(101), None);
+        assert!(p.assess(101, 899).is_some());
+        assert!(p.assess(101, 898).is_none());
+        for entry in [1, 99, 100, 101, 102, 901, 902] {
+            for exit in entry..entry + 4600 {
+                if p.assess(entry, exit).is_some() {
+                    assert!(exit - entry >= floor);
+                }
+            }
+        }
+        let unknown = TrackPacing::unknown(100);
+        assert_eq!(unknown.minimum_internal_source_frames(100), Some(4500));
+        assert!(unknown.assess(101, 4600).is_none());
+        assert!(unknown.assess(101, 4601).is_some());
     }
 }

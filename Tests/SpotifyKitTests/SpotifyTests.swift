@@ -43,6 +43,58 @@ final class SpotifyTests: XCTestCase {
         SpotifyClient(auth:TestTokens(),http:http,modeConfirmationAttempts:attempts,
                       modeConfirmationDelay:{ try Task.checkCancellation() })
     }
+    func testRecoveryReadsEveryPageAndPlaysOnlyMissingTracksInOrder() async throws {
+        let saved = String(repeating:"a",count:22), first = String(repeating:"b",count:22)
+        let second = String(repeating:"c",count:22), playlist = String(repeating:"d",count:22)
+        func track(_ id: String) -> String {
+            #"{"id":"\#(id)","uri":"spotify:track:\#(id)","type":"track"}"#
+        }
+        let page1 = #"{"offset":0,"total":5,"next":"https://api.spotify.com/next","items":[{"item":\#(track(saved))},{"item":null},{"item":\#(track(first))}]}"#
+        let page2 = #"{"offset":3,"total":5,"next":null,"items":[{"track":\#(track(first))},{"item":\#(track(second))}]}"#
+        let http = ScriptedHTTP([.init(code:200,body:page1),.init(code:200,body:page2),
+                                .init(code:200,body:playbackModes()),.init(code:204),.init(code:204),
+                                .init(code:200,body:playbackModes()),.init(code:204)])
+        let client = pollingClient(http)
+        let items = try await client.playlistItems("spotify:playlist:" + playlist)
+        let plan = PlaylistRecordingPlan(items:items,completedTrackIDs:[saved])
+        XCTAssertEqual(plan.trackIDs,[first,second])
+        XCTAssertEqual(plan.skipped,1)
+        XCTAssertEqual(plan.unavailable,1)
+        try await client.command(.playlistAt("spotify:playlist:" + playlist,position:XCTUnwrap(plan.positions[first])),deviceID:"local")
+        let requests = await http.requests
+        XCTAssertEqual(requests.prefix(2).map { $0.url?.path },Array(repeating:"/v1/playlists/\(playlist)/items",count:2))
+        XCTAssertEqual(requests[1].url?.query,"limit=50&offset=3")
+        let play = try XCTUnwrap(requests.last)
+        XCTAssertEqual(play.url?.path,"/v1/me/player/play")
+        let body = try XCTUnwrap(try JSONSerialization.jsonObject(with:XCTUnwrap(play.httpBody)) as? [String:Any])
+        XCTAssertEqual(body["context_uri"] as? String,"spotify:playlist:" + playlist)
+        XCTAssertEqual((body["offset"] as? [String:Int])?["position"],2)
+        XCTAssertEqual(body["position_ms"] as? Int,0)
+    }
+
+    func testSavedAudioEditionMatchesPlaylistVideoAndDifferentEditsRemainPending() throws {
+        let playlistID = String(repeating:"a",count:22)
+        let audioID = String(repeating:"b",count:22)
+        let json = #"{"id":"\#(playlistID)","uri":"spotify:track:\#(playlistID)","type":"track","name":"Top","album":{"name":"Time"},"artists":[{"name":"Dirk Maassen"}],"duration_ms":220417}"#
+        let item = try JSONDecoder().decode(SpotifyPlaylistTrack.self,from:Data(json.utf8))
+        let signature = try XCTUnwrap(RecordingTrackSignature(title:"Top",artist:"Dirk Maassen",album:"Time",durationMs:220417))
+        XCTAssertTrue(PlaylistRecordingPlan(items:[item],completedTrackIDs:[audioID],completedSignatures:[signature]).trackIDs.isEmpty)
+        let otherEdit = try XCTUnwrap(RecordingTrackSignature(title:"Top",artist:"Dirk Maassen",album:"Time",durationMs:220000))
+        XCTAssertEqual(PlaylistRecordingPlan(items:[item],completedTrackIDs:[audioID],completedSignatures:[otherEdit]).trackIDs,[playlistID])
+        let actual = try JSONDecoder().decode(SpotifyItem.self,from:Data(json.replacingOccurrences(of:playlistID,with:audioID).utf8))
+        XCTAssertEqual(PlaylistRecordingPlan(items:[item],completedTrackIDs:[]).plannedID(for:actual),playlistID)
+        let videoJSON = json.replacingOccurrences(of:#""album":{"name":"Time"},"#,with:"")
+            .replacingOccurrences(of:"220417",with:"231000")
+        let video = try JSONDecoder().decode(SpotifyPlaylistTrack.self,from:Data(videoJSON.utf8))
+        let pending = PlaylistRecordingPlan(items:[video],completedTrackIDs:[audioID])
+        XCTAssertEqual(pending.plannedID(for:actual,verifiedRecording:true),playlistID)
+        XCTAssertEqual(pending.plannedID(for:actual),audioID)
+        let otherID = String(repeating:"c",count:22)
+        let other = try JSONDecoder().decode(SpotifyPlaylistTrack.self,from:Data(videoJSON.replacingOccurrences(of:playlistID,with:otherID).utf8))
+        let ambiguous = PlaylistRecordingPlan(items:[video,other],completedTrackIDs:[audioID])
+        XCTAssertEqual(ambiguous.plannedID(for:actual,verifiedRecording:true),audioID)
+    }
+
     func testPlaylistLinksAreNormalizedAndRejectOtherDestinations() throws {
         let id = "37i9dQZF1DXcBWIGoYBM5M"
         XCTAssertEqual(try SpotifyPlaylist.uri("https://open.spotify.com/playlist/\(id)?si=test"), "spotify:playlist:\(id)")
