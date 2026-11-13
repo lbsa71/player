@@ -103,9 +103,20 @@ struct QualityProposal {
     #[serde(skip_serializing_if = "Option::is_none")]
     continuation_after_rejected_ending: Option<ClosingContinuation>,
     stop: &'static str,
+    capacity_filter: CapacityFilterEvidence,
     unresolved_joins: Option<usize>,
     verification: Option<QualityVerification>,
     cue_repair: Option<CueRepairEvidence>,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct CapacityFilterEvidence {
+    measured_scope_tracks: Option<u32>,
+    measured_scope_pairs: Option<u32>,
+    excluded_measured_choices: usize,
+    short_measured_windows: usize,
+    short_adjacent_combinations: usize,
+    measured_clock_row: bool,
 }
 
 #[derive(Serialize)]
@@ -141,6 +152,10 @@ struct CueChange {
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum QualityVerification {
+    DurationCapacityConflict {
+        measured_joins: usize,
+        upper_seconds: f64,
+    },
     JoinedSpeedConflict {
         track_id: String,
         incoming_end_frame: u64,
@@ -179,6 +194,8 @@ struct ProposalModel {
 struct SavedConflicts {
     prefixes: Vec<Vec<String>>,
     joined_speeds: Vec<[String; 2]>,
+    #[serde(default)]
+    capacity_subpaths: Vec<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -191,9 +208,11 @@ pub(super) struct CpSearch {
     timing: TimingScans,
     recent_routes: VecDeque<Vec<Choice>>,
     rejected_prefixes: BTreeSet<Vec<usize>>,
+    capacity_subpaths: BTreeSet<Vec<usize>>,
     conflict_checkpoint_key: Option<String>,
     restored_prefixes: usize,
     restored_joined_speeds: usize,
+    restored_capacity_subpaths: usize,
     demands: Vec<Probe>,
     proposal_turns: usize,
     attempts: usize,
@@ -201,7 +220,8 @@ pub(super) struct CpSearch {
     measured_routes: usize,
     measured_route_rejections: BTreeMap<String, usize>,
     development_conflicts: usize,
-    adjacent_capacity_conflicts: usize,
+    capacity_filter: CapacityFilterEvidence,
+    capacity_rejected_proposals: usize,
     joined_speed_conflicts: usize,
     joined_speed_rejected_proposals: usize,
     joined_speed_checks: BTreeMap<(usize, usize), bool>,
@@ -375,7 +395,11 @@ impl CpSearch {
             "restored_measured_prefix_conflicts": self.restored_prefixes,
             "restored_joined_speed_conflicts": self.restored_joined_speeds,
             "measured_development_conflicts_in_latest_model": self.development_conflicts,
-            "measured_adjacent_capacity_conflicts_in_latest_model": self.adjacent_capacity_conflicts,
+            "duration_capacity_filter_in_latest_model": self.capacity_filter,
+            "measured_adjacent_capacity_conflicts_in_latest_model": self.capacity_filter.short_adjacent_combinations,
+            "learned_measured_capacity_subpaths": self.capacity_subpaths.len(),
+            "restored_measured_capacity_subpaths": self.restored_capacity_subpaths,
+            "measured_capacity_rejected_proposals": self.capacity_rejected_proposals,
             "measured_joined_speed_conflicts_in_latest_model": self.joined_speed_conflicts,
             "joined_speed_rejected_proposals": self.joined_speed_rejected_proposals,
             "measured_only_attempts": self.measured_only_attempts,
@@ -570,6 +594,23 @@ impl CpSearch {
                     }
                 }
             }
+            for subpath in saved.capacity_subpaths {
+                cancel.check()?;
+                if !refiner.search.budget_open() {
+                    return Ok(());
+                }
+                let Some(edges) = subpath
+                    .iter()
+                    .map(|key| lookup.get(key).copied())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                if Self::short_subpath_ceiling(refiner, &edges).is_some() {
+                    self.restored_capacity_subpaths +=
+                        usize::from(self.capacity_subpaths.insert(edges));
+                }
+            }
         }
         self.conflict_checkpoint_key = Some(key);
         Ok(())
@@ -588,7 +629,12 @@ impl CpSearch {
                 .filter(|(_, rejected)| **rejected)
                 .map(|(&(a, b), _)| Ok([refiner.persistent_key(a)?, refiner.persistent_key(b)?]))
                 .collect::<Result<Vec<_>>>()?;
-            if !prefixes.is_empty() || !joined_speeds.is_empty() {
+            let capacity_subpaths = self
+                .capacity_subpaths
+                .iter()
+                .map(|edges| refiner.closing_route_keys(edges))
+                .collect::<Result<Vec<_>>>()?;
+            if !prefixes.is_empty() || !joined_speeds.is_empty() || !capacity_subpaths.is_empty() {
                 refiner.search.cache.write(
                     refiner.search.store,
                     "cp-measured-conflicts",
@@ -596,6 +642,7 @@ impl CpSearch {
                     &SavedConflicts {
                         prefixes,
                         joined_speeds,
+                        capacity_subpaths,
                     },
                 )?;
             }
@@ -852,6 +899,103 @@ impl CpSearch {
         }
     }
 
+    fn short_subpath_ceiling(r: &Refiner<'_>, edges: &[usize]) -> Option<f64> {
+        // Single windows and adjacent pairs already have their own model rows.
+        if edges.len() < 3 {
+            return None;
+        }
+        let proof = r.search.capacity_proof.as_ref()?;
+        let windows = edges.iter().map(|&edge| {
+            let (from, to) = r.ends(edge);
+            (from, to, &r.edges[edge].plan)
+        });
+        r.search
+            .committed_windows_capacity_upper(windows, proof)
+            .filter(|&upper| upper < r.search.request.min())
+    }
+
+    fn learn_short_subpath(
+        &mut self,
+        r: &Refiner<'_>,
+        choices: &[Option<usize>],
+    ) -> Option<(usize, f64)> {
+        for run in choices.split(Option::is_none).filter(|run| run.len() >= 3) {
+            let edges = run.iter().flatten().copied().collect::<Vec<_>>();
+            if let Some(upper) = Self::short_subpath_ceiling(r, &edges) {
+                let len = edges.len();
+                self.capacity_subpaths.insert(edges);
+                self.capacity_rejected_proposals += 1;
+                return Some((len, upper));
+            }
+        }
+        None
+    }
+
+    /// A measured bridge uses its two boundary speeds and their mean.
+    /// Allow each song its slowest measured boundary speed, then remove
+    /// both source overlaps and credit their one fixed output overlap.
+    fn measured_clock_terms(r: &Refiner<'_>, choices: &[Choice]) -> Option<Vec<(usize, f64)>> {
+        let n = r.search.pool.len();
+        let rate = r.rate();
+        let mut speeds = vec![f64::INFINITY; n];
+        let mut trims = Vec::with_capacity(choices.len());
+        for &choice in choices {
+            let Choice::Measured(edge) = choice else {
+                return None;
+            };
+            let (from, to) = r.ends(edge);
+            let plan = &r.edges[edge].plan;
+            let (_, _, overlap) = r.search.window_span(plan, from, to)?;
+            let departure = &plan.placements[0].time_map;
+            let arrival = &plan.placements[1].time_map;
+            let transition = &plan.transitions[0];
+            let exit = departure.anchors.get(1)?;
+            let entry_end = arrival.anchors.iter().rev().nth(1)?;
+            if departure.anchors.first()?.output_frame != 0
+                || departure.anchors.first()?.source_frame != plan.placements[0].source_start_frame
+                || exit.output_frame != transition.start_output_frame
+                || entry_end.output_frame != transition.end_output_frame
+                || entry_end.source_frame > r.search.pool[to].format.frames
+            {
+                return None;
+            }
+            for (track, speed) in [
+                (from, *departure.slopes().first()?),
+                (to, *arrival.slopes().last()?),
+            ] {
+                if !(0.5..=2.).contains(&speed) {
+                    return None;
+                }
+                speeds[track] = speeds[track].min(speed);
+            }
+            let tail = r.search.pool[from]
+                .format
+                .frames
+                .checked_sub(exit.source_frame)?;
+            trims.push((from, to, tail, entry_end.source_frame, overlap));
+        }
+        let output = |track: usize, frames: u64| {
+            let source = seconds(&r.search.pool[track], frames);
+            (0. ..=86_400.)
+                .contains(&source)
+                .then_some(source * rate / speeds[track])
+        };
+        let mut terms = Vec::with_capacity(n + choices.len());
+        for (track, source) in r.search.pool.iter().enumerate() {
+            if speeds[track].is_finite() {
+                // Three rounded bridge intervals, or a rounded opening and
+                // its measured lead. Leave additional conversion slack.
+                terms.push((track, output(track, source.format.frames)?.ceil() + 8.));
+            }
+        }
+        for (join, (from, to, tail, head, overlap)) in trims.into_iter().enumerate() {
+            let removed = (output(from, tail)?.floor() - 1.).max(0.)
+                + (output(to, head)?.floor() - 1.).max(0.);
+            terms.push((n + join, overlap as f64 - removed));
+        }
+        Some(terms)
+    }
+
     fn proposal_model(
         &mut self,
         r: &Refiner<'_>,
@@ -865,7 +1009,42 @@ impl CpSearch {
             .is_none()
             .then(|| r.search.directed_capacity())
             .flatten();
-        let capacity_proof = r.search.capacity_proof.as_ref().or(computed.as_ref());
+        let full_capacity = r.search.capacity_proof.as_ref().or(computed.as_ref());
+        // Only use this smaller graph for models without unresolved joins.
+        // Rebuild it from the currently admitted choices on every solve, so
+        // newly measured bridges can restore an otherwise excluded route.
+        let measured_capacity = if proposal.allows_unresolved() {
+            None
+        } else if let Some(capacities) = r.search.track_duration_capacities() {
+            let mut adjacent = vec![0_u128; n];
+            for edge in 0..r.edges.len() {
+                let (from, to) = r.ends(edge);
+                if full_capacity.map_or_else(
+                    || r.search.permits_transition(from, to),
+                    |proof| proof.permits_pair(from, to),
+                ) {
+                    adjacent[from] |= 1_u128 << to;
+                }
+            }
+            mixlib_set_search::coverage::directed_capacity(
+                r.search.request.min(),
+                &capacities,
+                r.search.required.required_runway().members,
+                |from, to| adjacent[from] & (1_u128 << to) != 0,
+            )
+        } else {
+            None
+        };
+        self.capacity_filter = CapacityFilterEvidence {
+            measured_scope_tracks: measured_capacity
+                .as_ref()
+                .map(|proof| proof.viable_tracks.count_ones()),
+            measured_scope_pairs: measured_capacity
+                .as_ref()
+                .map(|proof| proof.retained_pairs()),
+            ..Default::default()
+        };
+        let capacity_proof = measured_capacity.as_ref().or(full_capacity);
         let viable = capacity_proof.map_or(u128::MAX, |proof| proof.viable_tracks);
         let retained = |track| viable & (1_u128 << track) != 0;
         let minimum_speed = r
@@ -1026,6 +1205,21 @@ impl CpSearch {
         let mut master = domain
             .master_with_restrictions(&conflicts, &exclusions)
             .map_err(|_| Error::new("CP_MODEL", "invalid route domain"))?;
+        for subpath in &self.capacity_subpaths {
+            let Some(terms) = subpath
+                .iter()
+                .map(|&edge| Some((n + join_for_edge[edge]?, 1.)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            // The proof already grants every reachable bookend extension.
+            master.rows.push(Row {
+                terms,
+                lower: None,
+                upper: Some((subpath.len() - 1) as f64),
+            });
+        }
         for track in (0..n).filter(|&track| !retained(track)) {
             master.rows.push(Row {
                 terms: vec![(track, 1.)],
@@ -1037,15 +1231,19 @@ impl CpSearch {
             for (join, choice) in ids.iter().enumerate() {
                 if let Choice::Measured(edge) = *choice {
                     let (from, to) = r.ends(edge);
-                    if !proof.permits_pair(from, to)
-                        || r.search
-                            .window_cannot_fit(&r.edges[edge].plan, proof, from, to)
-                    {
+                    let pair_excluded = !proof.permits_pair(from, to);
+                    let window_excluded = !pair_excluded
+                        && r.search
+                            .window_cannot_fit(&r.edges[edge].plan, proof, from, to);
+                    if pair_excluded || window_excluded {
                         master.rows.push(Row {
                             terms: vec![(n + join, 1.)],
                             lower: None,
                             upper: Some(0.),
                         });
+                        self.capacity_filter.excluded_measured_choices +=
+                            usize::from(pair_excluded);
+                        self.capacity_filter.short_measured_windows += usize::from(window_excluded);
                     }
                 }
             }
@@ -1099,6 +1297,16 @@ impl CpSearch {
             lower: Some(clock.min as f64),
             upper: None,
         });
+        if !proposal.allows_unresolved() {
+            if let Some(terms) = Self::measured_clock_terms(r, &ids) {
+                self.capacity_filter.measured_clock_row = true;
+                master.rows.push(Row {
+                    terms,
+                    lower: Some(clock.min as f64),
+                    upper: None,
+                });
+            }
+        }
         if let Some(terms) = original_capacity {
             master.rows.push(Row {
                 terms,
@@ -1112,7 +1320,6 @@ impl CpSearch {
             .map(|edge| crate::composition::measured_development_ports(edge))
             .collect::<Vec<_>>();
         self.development_conflicts = 0;
-        self.adjacent_capacity_conflicts = 0;
         self.joined_speed_conflicts = 0;
         for track in 0..n {
             for &(leave, leave_var) in &outgoing[track] {
@@ -1131,17 +1338,18 @@ impl CpSearch {
                         if let Some(proof) = capacity_proof {
                             let from = domain.joins[enter_var].from_passage;
                             let to = domain.joins[leave_var].to_passage;
-                            let too_short = r
-                                .search
-                                .adjacent_windows_capacity_upper(
-                                    &r.edges[enter].plan,
-                                    &r.edges[leave].plan,
-                                    proof,
-                                    [from, track, to],
-                                )
-                                .is_some_and(|upper| upper < r.search.request.min());
+                            let too_short = proof.permits_pair(from, track)
+                                && proof.permits_pair(track, to)
+                                && r.search
+                                    .adjacent_windows_capacity_upper(
+                                        &r.edges[enter].plan,
+                                        &r.edges[leave].plan,
+                                        proof,
+                                        [from, track, to],
+                                    )
+                                    .is_some_and(|upper| upper < r.search.request.min());
                             if too_short {
-                                self.adjacent_capacity_conflicts += 1;
+                                self.capacity_filter.short_adjacent_combinations += 1;
                                 return true;
                             }
                         }
@@ -1272,6 +1480,7 @@ impl CpSearch {
                     _ => None,
                 },
                 stop,
+                capacity_filter: self.capacity_filter,
                 unresolved_joins: solved.candidate.as_ref().map(|candidate| {
                     candidate
                         .selected
@@ -1336,6 +1545,16 @@ impl CpSearch {
                 return Ok(None);
             };
             order = candidate;
+        }
+        if let Some((measured_joins, upper_seconds)) = self.learn_short_subpath(r, &order.1) {
+            self.note_quality_verification(
+                proposal,
+                QualityVerification::DurationCapacityConflict {
+                    measured_joins,
+                    upper_seconds,
+                },
+            );
+            return Ok(None);
         }
         self.recent_routes.push_back(
             order
@@ -2177,6 +2396,64 @@ mod tests {
     }
 
     #[test]
+    fn measured_clock_rejects_only_the_route_that_cannot_reach_the_replay_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = super::super::tests::fixture(&store, &policy, &[1200; 3]);
+        let short = clock_edge(&mut r, 0, 1, 1180, 645);
+        let long = clock_edge(&mut r, 0, 1, 1180, 500);
+        let departure = clock_edge(&mut r, 1, 2, 1180, 0);
+        for edge in [short, long, departure] {
+            let plan = &mut Arc::make_mut(&mut r.edges[edge]).plan;
+            plan.policy = policy.clone();
+            plan.transitions.truncate(1);
+            plan.transitions[0].from_track_id = plan.placements[0].track_id.clone();
+            plan.transitions[0].to_track_id = plan.placements[1].track_id.clone();
+            let outgoing = &mut plan.placements[0];
+            outgoing.source_end_frame = outgoing.time_map.anchors.last().unwrap().source_frame;
+        }
+        // The fixed maps play at native speed. Charge both overlaps once.
+        let max_clock = |entry| (3600. - entry - 40.) * (1. + MAX_REPLAY_FRACTION);
+        assert!(max_clock(645.) < r.search.request.min());
+        assert!(max_clock(500.) > r.search.request.min());
+
+        let mut cp = CpSearch::default();
+        let mut model = cp
+            .proposal_model(&r, ProposalDomain::MeasuredWithReplay)
+            .unwrap();
+        assert!(cp.capacity_filter.measured_clock_row);
+        assert_eq!(cp.capacity_filter.short_adjacent_combinations, 0);
+        let cancel = Cancellation::default();
+        for (edge, expected) in [(short, scip::Stop::Infeasible), (long, scip::Stop::Optimal)] {
+            let join = model
+                .choices
+                .iter()
+                .position(|&choice| choice == Choice::Measured(edge))
+                .unwrap();
+            model.master.rows.push(Row {
+                terms: vec![(r.search.pool.len() + join, 1.)],
+                lower: Some(1.),
+                upper: Some(1.),
+            });
+            let result = scip::solve(&model.master, Duration::from_secs(2), &cancel.0).unwrap();
+            assert_eq!(result.stop, expected);
+            model.master.rows.pop();
+        }
+
+        cp.proposal_model(&r, ProposalDomain::WithUnresolved)
+            .unwrap();
+        assert!(!cp.capacity_filter.measured_clock_row);
+        Arc::make_mut(&mut r.edges[short]).plan.placements[1]
+            .time_map
+            .anchors[1]
+            .output_frame -= 1;
+        cp.proposal_model(&r, ProposalDomain::MeasuredWithReplay)
+            .unwrap();
+        assert!(!cp.capacity_filter.measured_clock_row);
+    }
+
+    #[test]
     fn phrase_filter_checks_the_selected_arrival_against_the_selected_departure() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::init_legacy(directory.path()).unwrap();
@@ -2800,7 +3077,7 @@ mod tests {
         let model = cp
             .proposal_model(&r, ProposalDomain::WithUnresolved)
             .unwrap();
-        assert_eq!(cp.adjacent_capacity_conflicts, 1);
+        assert_eq!(cp.capacity_filter.short_adjacent_combinations, 1);
         let has_conflict = |exit| {
             let variable = |choice| 3 + model.choices.iter().position(|&id| id == choice).unwrap();
             let terms = [
@@ -2827,6 +3104,252 @@ mod tests {
                 [0, 1, 2]
             )
             .is_none());
+    }
+
+    #[test]
+    fn adjacent_capacity_allows_the_same_cues_when_a_successor_can_supply_the_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = super::super::tests::fixture(&store, &policy, &[1100, 1100, 1100, 1000]);
+        let arrival = clock_edge(&mut r, 0, 1, 1080, 350);
+        let departure = clock_edge(&mut r, 1, 2, 730, 0);
+        let successor = clock_edge(&mut r, 2, 3, 1080, 0);
+        for id in [arrival, departure, successor] {
+            let plan = &mut Arc::make_mut(&mut r.edges[id]).plan;
+            plan.policy = policy.clone();
+            plan.transitions.truncate(1);
+            plan.transitions[0].from_track_id = plan.placements[0].track_id.clone();
+            plan.transitions[0].to_track_id = plan.placements[1].track_id.clone();
+            let outgoing = &mut plan.placements[0];
+            outgoing.source_end_frame = outgoing.time_map.anchors.last().unwrap().source_frame;
+        }
+        r.search.excluded_transitions = (0..4)
+            .flat_map(|from| (0..4).map(move |to| (from, to)))
+            .filter(|pair| !matches!(pair, (0, 1) | (1, 2)))
+            .collect();
+
+        // At native speed, the pinned three-track route plays 2,560 seconds.
+        // A 6% slowdown and 15% replay still put it below 57 minutes. The
+        // successor contributes 980 new seconds after its overlap.
+        let native_clock = 1100. + (750. - 350.) + 1100. - 2. * 20.;
+        assert!(native_clock / 0.94 * 1.15 < r.search.request.min());
+        let extended_clock = native_clock + 1000. - 20.;
+        assert!((r.search.request.min()..=r.search.request.max()).contains(&extended_clock));
+
+        let cancel = Cancellation::default();
+        for (can_extend, expected_stop) in
+            [(false, scip::Stop::Infeasible), (true, scip::Stop::Optimal)]
+        {
+            if can_extend {
+                r.search.excluded_transitions.remove(&(2, 3));
+            }
+            r.search.capacity_proof = r.search.directed_capacity();
+            let mut cp = CpSearch::default();
+            let mut model = cp
+                .proposal_model(&r, ProposalDomain::MeasuredWithReplay)
+                .unwrap();
+            let terms = [arrival, departure]
+                .map(|edge| {
+                    let join = model
+                        .choices
+                        .iter()
+                        .position(|choice| *choice == Choice::Measured(edge))
+                        .unwrap();
+                    (r.search.pool.len() + join, 1.)
+                })
+                .to_vec();
+            assert_eq!(
+                model
+                    .master
+                    .rows
+                    .iter()
+                    .any(|row| row.terms == terms && row.upper == Some(1.)),
+                !can_extend
+            );
+            model.master.rows.push(Row {
+                terms,
+                lower: Some(2.),
+                upper: Some(2.),
+            });
+            let solved = scip::solve(&model.master, Duration::from_secs(1), &cancel.0).unwrap();
+            assert_eq!(solved.stop, expected_stop);
+            if can_extend {
+                let selected = solved.candidate.unwrap().selected;
+                let join = model
+                    .choices
+                    .iter()
+                    .position(|choice| *choice == Choice::Measured(successor))
+                    .unwrap();
+                assert!(selected.contains(&(r.search.pool.len() + join)));
+            }
+        }
+        assert_eq!(r.search.stats.measured_windows, 0);
+    }
+
+    #[test]
+    fn measured_only_capacity_reopens_cues_when_a_successor_is_admitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = super::super::tests::fixture(&store, &policy, &[1100, 1100, 1100, 1000]);
+        let add = |r: &mut Refiner<'_>, from, to, exit, entry| {
+            let id = clock_edge(r, from, to, exit, entry);
+            let plan = &mut Arc::make_mut(&mut r.edges[id]).plan;
+            plan.policy = policy.clone();
+            plan.transitions.truncate(1);
+            plan.transitions[0].from_track_id = plan.placements[0].track_id.clone();
+            plan.transitions[0].to_track_id = plan.placements[1].track_id.clone();
+            let outgoing = &mut plan.placements[0];
+            outgoing.source_end_frame = outgoing.time_map.anchors.last().unwrap().source_frame;
+            id
+        };
+        let arrival = add(&mut r, 0, 1, 1080, 350);
+        let departure = add(&mut r, 1, 2, 730, 0);
+        r.search.capacity_proof = r.search.directed_capacity();
+        let solve_with_cues = |mut model: ProposalModel| {
+            let variable = |choice| 4 + model.choices.iter().position(|&id| id == choice).unwrap();
+            let terms = [arrival, departure].map(|edge| (variable(Choice::Measured(edge)), 1.));
+            model.master.rows.push(Row {
+                terms: terms.to_vec(),
+                lower: Some(2.),
+                upper: Some(2.),
+            });
+            let result = scip::solve(
+                &model.master,
+                Duration::from_secs(1),
+                &Cancellation::default().0,
+            )
+            .unwrap();
+            (
+                result.stop,
+                result.candidate.map(|candidate| {
+                    candidate
+                        .selected
+                        .into_iter()
+                        .filter_map(|i| {
+                            i.checked_sub(4).and_then(|j| model.choices.get(j)).copied()
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+        };
+        let mut cp = CpSearch::default();
+        let measured = cp
+            .proposal_model(&r, ProposalDomain::MeasuredWithReplay)
+            .unwrap();
+        assert_eq!(cp.capacity_filter.measured_scope_pairs, Some(2));
+        assert_eq!(cp.capacity_filter.excluded_measured_choices, 0);
+        assert_eq!(cp.capacity_filter.short_measured_windows, 0);
+        assert_eq!(cp.capacity_filter.short_adjacent_combinations, 1);
+        assert_eq!(solve_with_cues(measured).0, scip::Stop::Infeasible);
+
+        let mixed = cp
+            .proposal_model(&r, ProposalDomain::WithUnresolved)
+            .unwrap();
+        assert_eq!(cp.capacity_filter.measured_scope_pairs, None);
+        assert_eq!(cp.capacity_filter.short_adjacent_combinations, 0);
+        let (stop, choices) = solve_with_cues(mixed);
+        assert_eq!(stop, scip::Stop::Optimal);
+        assert!(choices
+            .unwrap()
+            .iter()
+            .any(|choice| matches!(choice, Choice::Unresolved(..))));
+
+        let successor = add(&mut r, 2, 3, 1080, 0);
+        let measured = cp
+            .proposal_model(&r, ProposalDomain::MeasuredWithReplay)
+            .unwrap();
+        assert_eq!(cp.capacity_filter.measured_scope_pairs, Some(3));
+        assert_eq!(cp.capacity_filter.short_adjacent_combinations, 0);
+        let (stop, choices) = solve_with_cues(measured);
+        assert_eq!(stop, scip::Stop::Optimal);
+        assert!(choices.unwrap().contains(&Choice::Measured(successor)));
+        assert_eq!(r.search.stats.measured_windows, 0);
+    }
+
+    #[test]
+    fn measured_capacity_conflict_survives_resume_and_keeps_extendable_cues() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init_legacy(directory.path()).unwrap();
+        let policy = MixingConfig::default();
+        let mut r = super::super::tests::fixture(&store, &policy, &[1000, 910, 910, 910, 30, 260]);
+        let early = clock_edge(&mut r, 0, 1, 60, 0);
+        let late = clock_edge(&mut r, 0, 1, 980, 0);
+        let middle = clock_edge(&mut r, 1, 2, 890, 0);
+        let last = clock_edge(&mut r, 2, 3, 890, 0);
+        for id in [early, late, middle, last] {
+            let plan = &mut Arc::make_mut(&mut r.edges[id]).plan;
+            plan.policy = policy.clone();
+            plan.transitions.truncate(1);
+            plan.transitions[0].from_track_id = plan.placements[0].track_id.clone();
+            plan.transitions[0].to_track_id = plan.placements[1].track_id.clone();
+            let outgoing = &mut plan.placements[0];
+            outgoing.source_end_frame = outgoing.time_map.anchors.last().unwrap().source_frame;
+        }
+        r.search.excluded_transitions = (0..6)
+            .flat_map(|from| (0..6).map(move |to| (from, to)))
+            .filter(|pair| !matches!(pair, (4, 0) | (0, 1) | (1, 2) | (2, 3)))
+            .collect();
+        r.search.capacity_proof = r.search.directed_capacity();
+
+        // The 30-second predecessor cannot rescue the early run even
+        // before charging its overlap. A later cue leaves 3,670 seconds
+        // and can reach the hour window with a musical bookend trim.
+        let native = 80. + 3. * 910. - 3. * 20.;
+        assert!((native + 30.) / 0.94 * 1.15 < r.search.request.min());
+        let trimmed_late = native + (980. - 60.) - 90.;
+        assert!((r.search.request.min()..=r.search.request.max()).contains(&trimmed_late));
+        let cancel = Cancellation::default();
+        let mut cp = CpSearch::default();
+        cp.restore_conflicts(&mut r, &cancel).unwrap();
+        cp.proposal_model(&r, ProposalDomain::WithUnresolved)
+            .unwrap();
+        assert_eq!(cp.capacity_filter.short_adjacent_combinations, 0);
+        assert!(cp
+            .learn_short_subpath(&r, &[Some(late), Some(middle), Some(last)])
+            .is_none());
+        assert!(cp
+            .learn_short_subpath(&r, &[Some(early), None, Some(last)])
+            .is_none());
+        let (len, upper) = cp
+            .learn_short_subpath(&r, &[None, Some(early), Some(middle), Some(last)])
+            .unwrap();
+        assert_eq!(len, 3);
+        assert!(upper < r.search.request.min());
+        cp.save_conflicts(&r).unwrap();
+
+        let mut resumed = CpSearch::default();
+        resumed.restore_conflicts(&mut r, &cancel).unwrap();
+        assert_eq!(resumed.restored_capacity_subpaths, 1);
+        assert_eq!(
+            resumed.capacity_subpaths,
+            BTreeSet::from([vec![early, middle, last]])
+        );
+        let model = resumed
+            .proposal_model(&r, ProposalDomain::WithUnresolved)
+            .unwrap();
+        let variable = |choice| {
+            r.search.pool.len() + model.choices.iter().position(|&id| id == choice).unwrap()
+        };
+        assert!(model.choices.contains(&Choice::Unresolved(4, 0)));
+        assert!(model.master.rows.iter().any(|row| row.terms
+            == [early, middle, last].map(|edge| (variable(Choice::Measured(edge)), 1.))
+            && row.upper == Some(2.)));
+        let solved = scip::solve(&model.master, Duration::from_secs(1), &cancel.0).unwrap();
+        let selected = solved.candidate.unwrap().selected;
+        for edge in [late, middle, last] {
+            assert!(selected.contains(&variable(Choice::Measured(edge))));
+        }
+
+        // With another possible successor, the old row has no duration
+        // witness. A restore must recheck the proof before using that row.
+        r.search.excluded_transitions.remove(&(3, 5));
+        r.search.capacity_proof = r.search.directed_capacity();
+        let mut expanded = CpSearch::default();
+        expanded.restore_conflicts(&mut r, &cancel).unwrap();
+        assert!(expanded.capacity_subpaths.is_empty());
+        assert_eq!(r.search.stats.measured_windows, 0);
     }
 
     #[test]
@@ -3036,6 +3559,7 @@ mod tests {
                 &SavedConflicts {
                     prefixes: vec![vec![edge], vec!["stale-edge".to_string()], vec![]],
                     joined_speeds: vec![],
+                    capacity_subpaths: vec![],
                 },
             )
             .unwrap();

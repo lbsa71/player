@@ -793,6 +793,42 @@ departure or are reachable from its arrival. The assignment relaxation
 uses the surviving joins and capacities. A duration-empty measured
 region skips the native measured-only turn even before the first
 incumbent. Reports count those skips separately from score-bound skips.
+
+The measured-only SCIP model also builds a reachability proof from its
+current admitted choices. It applies that proof to individual measured
+windows and adjacent cue combinations using the pinned source trims and
+overlaps. Mixed models still allow all permitted unmeasured bridges.
+This proof is rebuilt for each model, so its exclusions cannot persist
+after a new measured bridge makes the route feasible. The report records
+the surviving measured tracks and directed pairs, along with exclusions
+from pair reachability, individual window clocks, and adjacent clocks.
+Anchored attempts carry their own counters.
+
+`cargo test -p mixlib-cli --features cp-search measured_only_capacity_reopens_cues`
+pins the same measured cues in three native solves. The initial
+measured-only model excludes the combination. The mixed model can
+extend it through an unresolved join. Once that successor is measured,
+the measured-only model selects the complete route.
+
+With pinned splice anchors, the measured-only model adds a second
+duration row. For each selected track it grants the slowest measured
+boundary speed available to that track, removes source material outside
+the selected solo interval, and adds each measured output overlap once.
+The renderer's three solo intervals use the two boundary speeds and
+their mean. The row rounds outward and allows the full replay budget.
+Unconfirmed geometry leaves the broader duration row in effect.
+`cargo test -p mixlib-cli --features cp-search measured_clock_rejects_only`
+checks the floor against two native-speed routes and verifies the
+fallback for unresolved joins and an unconfirmed splice anchor.
+
+In the 35-second resume over 73 tracks, the first two anchored
+measured-only models each retained 65 directed pairs across 27 tracks.
+Each excluded one measured choice by pair capacity and 11 adjacent cue
+combinations by their pinned clocks. Both produced a complete measured
+proposal for closing. The mixed model excluded zero by these checks.
+The run reused 35 windows, measured 11, and retained the 58:53.717
+incumbent at −4.6551.
+
 Mixed proposals retain their unresolved bridges and their own ceiling.
 
 The four-track fixture gives two outgoing and two incoming owners more
@@ -2011,6 +2047,29 @@ retains two cues that separately have enough material, then rejects
 their combination. A later departure and an unmeasured alternative
 remain eligible.
 
+For a fast check of why the same cue pair can survive in a larger pool,
+run `cargo test -p mixlib-cli --features cp-search adjacent_capacity_allows_the_same_cues`.
+The four-track fixture pins the same two measured cues in both solves.
+They leave 42:40 at native speed and stay below 57 minutes even with the
+full stretch and replay allowance. With a permitted successor the route
+can play 59:00 at native speed. SCIP rejects the pinned combination in
+the first solve and selects the successor in the second. The fixture
+uses no PCM or catalog data.
+
+The saved 35-second successor-clock run illustrates the larger-pool
+case. Its all-choice capacity proof retained all 5,256 directed pairs,
+so even the smallest allowance from the other 71 songs was 18,955.69
+source seconds before stretch and replay. The single-window capacity
+filter excluded zero of 177 measured choices and the final native
+model reported zero adjacent capacity conflicts. The measured-only
+graph had just 64 retained directed pairs across 27 tracks. Two
+bar-cue pairs and zero structural-cue pairs completed discovery. The
+solver stopped on time after six new measurements and 46 cache hits.
+One fully measured M01 proposal reached closing, where all three
+openings had a clock ceiling of 54:51.587, including replay. That is
+a tighter result for a fixed route than for the same cues in the full
+graph. The incumbent remained 58:53.717.
+
 In a bounded warm-cache run over all 73 tracks, the same filter checked all
 145 admitted choices and excluded zero. Every pair had at least 18,955.69
 native source seconds available from the other 71 tracks alone. The filter
@@ -2598,6 +2657,23 @@ route returns to ordinary discovery. It may work with a different
 arrival or yield a later endpoint. Fixtures exercise two prefixes that
 share the same arrival but differ in duration, and a mismatched splice
 anchor that leaves the clock unconfirmed.
+
+SCIP checks each contiguous run of three or more measured joins in its
+proposals, including proposals with unresolved joins on either side.
+When the duration proof covers all permitted predecessors and successors
+and still falls short, the next model forbids selecting that exact group
+of joins together. The row needs no fixed opening or ending. The solver
+saves these conflicts by measured join identity and recomputes the bound
+before restoring them. The mock
+`measured_capacity_conflict_survives_resume_and_keeps_extendable_cues`
+checks that no adjacent pair alone is too short, a later measured exit
+still works, and a newly permitted successor invalidates the old conflict.
+
+The follow-up 35-second resume over 73 tracks retained the 58:53.717
+incumbent at −4.6551. It recorded three SCIP candidates and zero new
+subpath conflicts. Four windows were measured and 44 were reused. The
+fixture demonstrates pruning and restoration. The real run establishes
+that the added check left those proposals eligible.
 
 The same continuation lane handles a route whose every opening falls below
 the duration floor even with its full final source tail and replay allowance.
